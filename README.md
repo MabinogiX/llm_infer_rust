@@ -83,6 +83,10 @@ cargo test --lib
 
 `BatchContext::prepare_prefill` 会把 scheduler 请求的未缓存 token 拼接为 `Batch`，并生成 `write_loc`、`cu_seqlens_q`、`prefix_lens`、`block_table`、`req_to_token` 与 `logits_indices`。这部分不依赖模型结构，已使用 libtorch Tensor 实现。
 
+## Scheduler 接口
+
+`scheduler::Scheduler` 现已提供请求提交、取消、空闲判断和 `step` 接口，以及请求状态、输出 token 和终止原因类型。它从模型配置按 generation、tokenizer、model 的顺序加载 EOS ID。超长 prompt 会在 `step` 返回 `Abort` 结果；普通请求保留在等待队列。Prefill/Decode 管理器尚未迁移，因此有等待请求时 `step` 返回 `ExecutionNotAvailable`，不会消耗请求。
+
 `load_hf_safetensors` 支持读取 `model.safetensors` 或 `model.safetensors.index.json` 所列的 shards。`Engine::build_model(&factory)` 通过模型层提供的 `ModelFactory` 创建 Rust 模型，随后 `Engine::load_model_weights()` 把实际读取到的具名 Tensor 交给 `ModelExecutor::load_weights` 绑定；未实现绑定的模型会明确报错。
 
 ## Qwen3（dense）
