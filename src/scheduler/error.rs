@@ -9,9 +9,9 @@ use crate::engine::{BatchContextError, EngineError};
 pub enum SchedulerError {
     InvalidModelConfig { path: PathBuf, message: String },
     RequestIdExhausted,
-    ExecutionNotAvailable,
     Cache(KVCacheError),
     Batch(BatchContextError),
+    InvalidDecode(String),
     Engine(EngineError),
 }
 
@@ -22,11 +22,9 @@ impl fmt::Display for SchedulerError {
                 write!(f, "invalid model config {}: {message}", path.display())
             }
             Self::RequestIdExhausted => write!(f, "scheduler request ID space exhausted"),
-            Self::ExecutionNotAvailable => {
-                write!(f, "decode scheduling is not connected yet")
-            }
             Self::Cache(error) => write!(f, "KV cache scheduling failed: {error}"),
             Self::Batch(error) => write!(f, "prefill batch preparation failed: {error}"),
+            Self::InvalidDecode(message) => write!(f, "decode batch preparation failed: {message}"),
             Self::Engine(error) => write!(f, "engine scheduling failed: {error}"),
         }
     }

@@ -56,6 +56,10 @@ impl PrefillManager {
         self.running.len()
     }
 
+    pub fn running_requests(&self) -> &[Request] {
+        &self.running
+    }
+
     pub fn has_aborted(&self) -> bool {
         !self.aborted.is_empty()
     }

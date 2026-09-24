@@ -8,11 +8,13 @@ use std::{
 use serde_json::Value;
 
 use crate::engine::kvcache::{CacheManager, NaiveCacheManager, RadixCacheManager};
-use crate::engine::{BatchContext, Engine, EngineError, SamplingParams, ServerArgs};
+use crate::engine::{
+    Batch, BatchContext, BatchPhase, Engine, EngineError, SamplingParams, ServerArgs,
+};
 
 use super::{
-    FinishReason, OutputToken, PrefillManager, Request, RequestId, Result, SchedulerError,
-    SequenceStatus,
+    DecodeManager, FinishReason, OutputToken, PrefillManager, Request, RequestId, Result,
+    SchedulerError, SequenceStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,7 @@ pub struct Scheduler {
     eos_token_ids: BTreeSet<i64>,
     next_uid: RequestId,
     prefill: PrefillManager,
+    decode: DecodeManager,
     aborted: VecDeque<OutputToken>,
     last_step_error: Option<EngineError>,
 }
@@ -52,6 +55,7 @@ impl Scheduler {
             engine.device(),
         )?;
         let prefill = PrefillManager::new(&args, pool, cache, batch_context);
+        let decode = DecodeManager::new(&args, engine.device())?;
         Ok(Self {
             engine,
             args,
@@ -59,6 +63,7 @@ impl Scheduler {
             eos_token_ids,
             next_uid: 0,
             prefill,
+            decode,
             aborted: VecDeque::new(),
             last_step_error: None,
         })
@@ -132,71 +137,18 @@ impl Scheduler {
             && self.aborted.is_empty()
     }
 
-    /// Runs one prefill batch. Decode is connected in a later migration.
+    /// Runs prefill followed by decode for every request still running.
     pub fn step(&mut self) -> Result<Vec<OutputToken>> {
         self.last_step_error = None;
         let batch = self.prefill.schedule_prefill()?;
         let mut results: Vec<_> = self.aborted.drain(..).collect();
         if let Some(batch) = batch {
-            let params = batch
-                .request_ids
-                .iter()
-                .map(|uid| {
-                    self.prefill
-                        .running_request(*uid)
-                        .expect("scheduled request is running")
-                        .sampling_params
-                })
-                .collect::<Vec<_>>();
-            let sampled = self
-                .engine
-                .forward(&batch.model_batch)
-                .and_then(|logits| self.engine.sample(&logits, &params));
-            match sampled {
-                Ok(tokens) => {
-                    let mut finished = Vec::new();
-                    for (uid, token_id) in batch.request_ids.into_iter().zip(tokens) {
-                        let request = self
-                            .prefill
-                            .running_request_mut(uid)
-                            .expect("scheduled request is running");
-                        request.append_token(token_id);
-                        let reason = if self.eos_token_ids.contains(&token_id)
-                            && !request.sampling_params.ignore_eos
-                        {
-                            Some(FinishReason::Stop)
-                        } else if request.output_len >= request.sampling_params.max_tokens
-                            || request.input_ids.len() >= self.args.max_seq_len
-                        {
-                            Some(FinishReason::Length)
-                        } else {
-                            None
-                        };
-                        if reason.is_some() {
-                            request.status = SequenceStatus::Finished;
-                            finished.push(uid);
-                        }
-                        results.push(OutputToken {
-                            uid,
-                            token_id,
-                            finished: reason.is_some(),
-                            finish_reason: reason,
-                        });
-                    }
-                    self.prefill.remove_finished_batch(&finished)?;
-                }
-                Err(error) => {
-                    self.last_step_error = Some(error);
-                    self.prefill
-                        .remove_failed_prefill_batch(&batch.request_ids)?;
-                    results.extend(
-                        batch
-                            .request_ids
-                            .into_iter()
-                            .map(|uid| self.terminal_result(uid, FinishReason::Error)),
-                    );
-                }
-            }
+            self.run_phase(
+                batch.request_ids,
+                batch.model_batch,
+                BatchPhase::Prefill,
+                &mut results,
+            )?;
         }
         results.extend(
             self.prefill
@@ -204,10 +156,89 @@ impl Scheduler {
                 .into_iter()
                 .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
         );
-        if results.is_empty() && self.prefill.running_len() > 0 {
-            return Err(SchedulerError::ExecutionNotAvailable);
+        if let Some(batch) = self
+            .decode
+            .schedule_decode(self.prefill.running_requests())?
+        {
+            self.run_phase(
+                batch.request_ids,
+                batch.model_batch,
+                BatchPhase::Decode,
+                &mut results,
+            )?;
         }
         Ok(results)
+    }
+
+    fn run_phase(
+        &mut self,
+        request_ids: Vec<RequestId>,
+        model_batch: Batch,
+        phase: BatchPhase,
+        results: &mut Vec<OutputToken>,
+    ) -> Result<()> {
+        let params = request_ids
+            .iter()
+            .map(|uid| {
+                self.prefill
+                    .running_request(*uid)
+                    .expect("scheduled request is running")
+                    .sampling_params
+            })
+            .collect::<Vec<_>>();
+        let sampled = self
+            .engine
+            .forward(&model_batch)
+            .and_then(|logits| self.engine.sample(&logits, &params));
+        match sampled {
+            Ok(tokens) => {
+                let mut finished = Vec::new();
+                for (uid, token_id) in request_ids.into_iter().zip(tokens) {
+                    let request = self
+                        .prefill
+                        .running_request_mut(uid)
+                        .expect("scheduled request is running");
+                    request.append_token(token_id);
+                    let reason = if self.eos_token_ids.contains(&token_id)
+                        && !request.sampling_params.ignore_eos
+                    {
+                        Some(FinishReason::Stop)
+                    } else if request.output_len >= request.sampling_params.max_tokens
+                        || request.input_ids.len() >= self.args.max_seq_len
+                    {
+                        Some(FinishReason::Length)
+                    } else {
+                        None
+                    };
+                    if reason.is_some() {
+                        request.status = SequenceStatus::Finished;
+                        finished.push(uid);
+                    }
+                    results.push(OutputToken {
+                        uid,
+                        token_id,
+                        finished: reason.is_some(),
+                        finish_reason: reason,
+                    });
+                }
+                self.prefill.remove_finished_batch(&finished)?;
+            }
+            Err(error) => {
+                self.last_step_error = Some(error);
+                match phase {
+                    BatchPhase::Prefill => {
+                        self.prefill.remove_failed_prefill_batch(&request_ids)?
+                    }
+                    BatchPhase::Decode => self.prefill.remove_finished_batch(&request_ids)?,
+                }
+                results.extend(
+                    request_ids
+                        .into_iter()
+                        .map(|uid| self.terminal_result(uid, FinishReason::Error)),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn terminal_result(&self, uid: RequestId, reason: FinishReason) -> OutputToken {
@@ -286,6 +317,7 @@ fn normalize_eos(raw: &Value) -> BTreeSet<i64> {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         fs,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -303,10 +335,17 @@ mod tests {
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn scheduler() -> (Scheduler, PathBuf) {
-        scheduler_with_strategy(CacheStrategy::Radix)
+        scheduler_with_strategy_and_capacity(CacheStrategy::Radix, 1)
     }
 
     fn scheduler_with_strategy(strategy: CacheStrategy) -> (Scheduler, PathBuf) {
+        scheduler_with_strategy_and_capacity(strategy, 1)
+    }
+
+    fn scheduler_with_strategy_and_capacity(
+        strategy: CacheStrategy,
+        max_running_req: usize,
+    ) -> (Scheduler, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -323,7 +362,7 @@ mod tests {
         )
         .unwrap();
         let mut args = ServerArgs::new(&path);
-        args.max_running_req = 1;
+        args.max_running_req = max_running_req;
         args.max_seq_len = 4;
         args.page_size = 2;
         let engine = Engine::new(
@@ -401,14 +440,14 @@ mod tests {
     impl ModelExecutor for FixedTokenModel {
         fn forward(
             &self,
-            _input_ids: &Tensor,
+            input_ids: &Tensor,
             _positions: &Tensor,
             _attention_metadata: Option<&AttentionMetadata>,
             logits_indices: Option<&Tensor>,
         ) -> std::result::Result<Tensor, ModelRunnerError> {
             let rows = logits_indices
-                .expect("prefill passes logits indices")
-                .size()[0];
+                .map(|indices| indices.size()[0])
+                .unwrap_or_else(|| input_ids.size()[0]);
             let mut logits = vec![0f32; rows as usize * 9];
             for row in 0..rows as usize {
                 logits[row * 9 + self.0 as usize] = 1.0;
@@ -417,8 +456,66 @@ mod tests {
         }
     }
 
+    struct DecodeFailModel;
+
+    impl ModelExecutor for DecodeFailModel {
+        fn forward(
+            &self,
+            _input_ids: &Tensor,
+            _positions: &Tensor,
+            attention_metadata: Option<&AttentionMetadata>,
+            logits_indices: Option<&Tensor>,
+        ) -> std::result::Result<Tensor, ModelRunnerError> {
+            if attention_metadata
+                .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Decode)
+            {
+                return Err(ModelRunnerError::Model("decode failed".to_owned()));
+            }
+            let rows = logits_indices
+                .expect("prefill passes logits indices")
+                .size()[0];
+            let mut logits = vec![0f32; rows as usize * 9];
+            for row in 0..rows as usize {
+                logits[row * 9 + 3] = 1.0;
+            }
+            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+        }
+    }
+
+    struct FailSecondPrefillModel {
+        prefill_calls: Cell<usize>,
+    }
+
+    impl ModelExecutor for FailSecondPrefillModel {
+        fn forward(
+            &self,
+            input_ids: &Tensor,
+            _positions: &Tensor,
+            attention_metadata: Option<&AttentionMetadata>,
+            logits_indices: Option<&Tensor>,
+        ) -> std::result::Result<Tensor, ModelRunnerError> {
+            let is_prefill = attention_metadata
+                .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Prefill);
+            if is_prefill {
+                let count = self.prefill_calls.get() + 1;
+                self.prefill_calls.set(count);
+                if count == 2 {
+                    return Err(ModelRunnerError::Model("second prefill failed".to_owned()));
+                }
+            }
+            let rows = logits_indices
+                .map(|indices| indices.size()[0])
+                .unwrap_or_else(|| input_ids.size()[0]);
+            let mut logits = vec![0f32; rows as usize * 9];
+            for row in 0..rows as usize {
+                logits[row * 9 + 3] = 1.0;
+            }
+            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+        }
+    }
+
     #[test]
-    fn prefill_produces_token_and_leaves_nonterminal_request_running() {
+    fn prefill_and_decode_run_in_the_same_step() {
         let (mut scheduler, path) = scheduler();
         scheduler
             .engine_mut()
@@ -429,19 +526,107 @@ mod tests {
             .unwrap();
         assert_eq!(
             scheduler.step().unwrap(),
+            vec![
+                OutputToken {
+                    uid,
+                    token_id: 3,
+                    finished: false,
+                    finish_reason: None
+                },
+                OutputToken {
+                    uid,
+                    token_id: 3,
+                    finished: false,
+                    finish_reason: None
+                },
+            ]
+        );
+        assert_eq!(scheduler.running_len(), 1);
+        assert_eq!(
+            scheduler.step().unwrap(),
             vec![OutputToken {
                 uid,
                 token_id: 3,
-                finished: false,
-                finish_reason: None,
-            }]
+                finished: true,
+                finish_reason: Some(FinishReason::Length)
+            },]
         );
-        assert_eq!(scheduler.running_len(), 1);
+        assert!(scheduler.is_idle());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn decode_failure_preserves_prefill_output_and_finishes_request() {
+        let (mut scheduler, path) = scheduler();
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(DecodeFailModel), Device::Cpu))
+            .unwrap();
+        let uid = scheduler
+            .add_request(vec![1], SamplingParams::default())
+            .unwrap();
+        assert_eq!(
+            scheduler.step().unwrap(),
+            vec![
+                OutputToken {
+                    uid,
+                    token_id: 3,
+                    finished: false,
+                    finish_reason: None
+                },
+                OutputToken {
+                    uid,
+                    token_id: 7,
+                    finished: true,
+                    finish_reason: Some(FinishReason::Error)
+                },
+            ]
+        );
         assert!(matches!(
-            scheduler.step(),
-            Err(SchedulerError::ExecutionNotAvailable)
+            scheduler.last_step_error(),
+            Some(EngineError::ModelRunner(_))
         ));
-        assert!(scheduler.abort_request(uid));
+        assert!(scheduler.is_idle());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn prefill_failure_does_not_stop_existing_decode() {
+        let (mut scheduler, path) = scheduler_with_strategy_and_capacity(CacheStrategy::Radix, 2);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(
+                Box::new(FailSecondPrefillModel {
+                    prefill_calls: Cell::new(0),
+                }),
+                Device::Cpu,
+            ))
+            .unwrap();
+        let first = scheduler
+            .add_request(vec![1], SamplingParams::default())
+            .unwrap();
+        assert_eq!(scheduler.step().unwrap().len(), 2);
+        let second = scheduler
+            .add_request(vec![2], SamplingParams::default())
+            .unwrap();
+        let results = scheduler.step().unwrap();
+        assert_eq!(
+            results,
+            vec![
+                OutputToken {
+                    uid: second,
+                    token_id: 7,
+                    finished: true,
+                    finish_reason: Some(FinishReason::Error)
+                },
+                OutputToken {
+                    uid: first,
+                    token_id: 3,
+                    finished: true,
+                    finish_reason: Some(FinishReason::Length)
+                },
+            ]
+        );
         assert!(scheduler.is_idle());
         fs::remove_dir_all(path).unwrap();
     }
