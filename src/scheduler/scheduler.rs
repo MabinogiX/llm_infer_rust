@@ -3,15 +3,16 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     fs,
-    path::PathBuf,
 };
 
 use serde_json::Value;
 
-use crate::engine::{Engine, SamplingParams, ServerArgs};
+use crate::engine::kvcache::{CacheManager, NaiveCacheManager, RadixCacheManager};
+use crate::engine::{BatchContext, Engine, EngineError, SamplingParams, ServerArgs};
 
 use super::{
-    FinishReason, OutputToken, Request, RequestId, Result, SchedulerError, SequenceStatus,
+    FinishReason, OutputToken, PrefillManager, Request, RequestId, Result, SchedulerError,
+    SequenceStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,8 +27,9 @@ pub struct Scheduler {
     cache_strategy: CacheStrategy,
     eos_token_ids: BTreeSet<i64>,
     next_uid: RequestId,
-    pending: VecDeque<Request>,
+    prefill: PrefillManager,
     aborted: VecDeque<OutputToken>,
+    last_step_error: Option<EngineError>,
 }
 
 impl Scheduler {
@@ -38,14 +40,27 @@ impl Scheduler {
     pub fn with_cache_strategy(engine: Engine, cache_strategy: CacheStrategy) -> Result<Self> {
         let args = engine.server_args().clone();
         let eos_token_ids = load_eos_token_ids(&args.model_path)?;
+        let pool = engine.shared_kv_cache_pool()?;
+        let cache: Box<dyn CacheManager> = match cache_strategy {
+            CacheStrategy::Radix => Box::new(RadixCacheManager::new(pool.clone(), args.page_size)?),
+            CacheStrategy::Naive => Box::new(NaiveCacheManager::new(pool.clone())),
+        };
+        let batch_context = BatchContext::new(
+            args.max_running_req,
+            args.max_seq_len,
+            args.page_size,
+            engine.device(),
+        )?;
+        let prefill = PrefillManager::new(&args, pool, cache, batch_context);
         Ok(Self {
             engine,
             args,
             cache_strategy,
             eos_token_ids,
             next_uid: 0,
-            pending: VecDeque::new(),
+            prefill,
             aborted: VecDeque::new(),
+            last_step_error: None,
         })
     }
 
@@ -66,7 +81,15 @@ impl Scheduler {
     }
 
     pub fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.prefill.pending_len()
+    }
+
+    pub fn running_len(&self) -> usize {
+        self.prefill.running_len()
+    }
+
+    pub fn last_step_error(&self) -> Option<&EngineError> {
+        self.last_step_error.as_ref()
     }
 
     /// Assigns a UID and queues a request. Oversized prompts yield an abort
@@ -84,43 +107,107 @@ impl Scheduler {
             self.aborted
                 .push_back(self.terminal_result(uid, FinishReason::Abort));
         } else {
-            self.pending.push_back(Request {
+            self.prefill.add_request(Request {
                 uid,
                 input_ids,
                 sampling_params: sampling_params.normalized(),
                 cached_len: 0,
                 output_len: 0,
+                cache_handle: None,
                 status: SequenceStatus::Waiting,
             });
         }
         Ok(uid)
     }
 
-    /// Removes a waiting request. Running requests become abortable when the
-    /// prefill manager is connected.
+    /// Removes a waiting or running request and releases its cache references.
     pub fn abort_request(&mut self, uid: RequestId) -> bool {
-        if let Some(index) = self.pending.iter().position(|request| request.uid == uid) {
-            self.pending.remove(index);
-            return true;
-        }
-        false
+        self.prefill.abort(uid)
     }
 
     pub fn is_idle(&self) -> bool {
-        self.pending.is_empty() && self.aborted.is_empty()
+        self.prefill.pending_len() == 0
+            && self.prefill.running_len() == 0
+            && !self.prefill.has_aborted()
+            && self.aborted.is_empty()
     }
 
-    /// Delivers queued terminal results first. Once only waiting requests
-    /// remain, returns an explicit error until prefill/decode is migrated.
-    /// Waiting requests are retained on error.
+    /// Runs one prefill batch. Decode is connected in a later migration.
     pub fn step(&mut self) -> Result<Vec<OutputToken>> {
-        if !self.aborted.is_empty() {
-            return Ok(self.aborted.drain(..).collect());
+        self.last_step_error = None;
+        let batch = self.prefill.schedule_prefill()?;
+        let mut results: Vec<_> = self.aborted.drain(..).collect();
+        if let Some(batch) = batch {
+            let params = batch
+                .request_ids
+                .iter()
+                .map(|uid| {
+                    self.prefill
+                        .running_request(*uid)
+                        .expect("scheduled request is running")
+                        .sampling_params
+                })
+                .collect::<Vec<_>>();
+            let sampled = self
+                .engine
+                .forward(&batch.model_batch)
+                .and_then(|logits| self.engine.sample(&logits, &params));
+            match sampled {
+                Ok(tokens) => {
+                    let mut finished = Vec::new();
+                    for (uid, token_id) in batch.request_ids.into_iter().zip(tokens) {
+                        let request = self
+                            .prefill
+                            .running_request_mut(uid)
+                            .expect("scheduled request is running");
+                        request.append_token(token_id);
+                        let reason = if self.eos_token_ids.contains(&token_id)
+                            && !request.sampling_params.ignore_eos
+                        {
+                            Some(FinishReason::Stop)
+                        } else if request.output_len >= request.sampling_params.max_tokens
+                            || request.input_ids.len() >= self.args.max_seq_len
+                        {
+                            Some(FinishReason::Length)
+                        } else {
+                            None
+                        };
+                        if reason.is_some() {
+                            request.status = SequenceStatus::Finished;
+                            finished.push(uid);
+                        }
+                        results.push(OutputToken {
+                            uid,
+                            token_id,
+                            finished: reason.is_some(),
+                            finish_reason: reason,
+                        });
+                    }
+                    self.prefill.remove_finished_batch(&finished)?;
+                }
+                Err(error) => {
+                    self.last_step_error = Some(error);
+                    self.prefill
+                        .remove_failed_prefill_batch(&batch.request_ids)?;
+                    results.extend(
+                        batch
+                            .request_ids
+                            .into_iter()
+                            .map(|uid| self.terminal_result(uid, FinishReason::Error)),
+                    );
+                }
+            }
         }
-        if !self.pending.is_empty() {
+        results.extend(
+            self.prefill
+                .drain_aborted()
+                .into_iter()
+                .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
+        );
+        if results.is_empty() && self.prefill.running_len() > 0 {
             return Err(SchedulerError::ExecutionNotAvailable);
         }
-        Ok(Vec::new())
+        Ok(results)
     }
 
     fn terminal_result(&self, uid: RequestId, reason: FinishReason) -> OutputToken {
@@ -200,17 +287,26 @@ fn normalize_eos(raw: &Value) -> BTreeSet<i64> {
 mod tests {
     use std::{
         fs,
+        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::engine::ModelArgs;
+    use tch::{Device, Tensor};
+
+    use crate::engine::{
+        AttentionMetadata, ModelArgs, ModelExecutor, ModelRunner, ModelRunnerError,
+    };
 
     use super::*;
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn scheduler() -> (Scheduler, PathBuf) {
+        scheduler_with_strategy(CacheStrategy::Radix)
+    }
+
+    fn scheduler_with_strategy(strategy: CacheStrategy) -> (Scheduler, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -242,7 +338,10 @@ mod tests {
             0,
         )
         .unwrap();
-        (Scheduler::new(engine).unwrap(), path)
+        (
+            Scheduler::with_cache_strategy(engine, strategy).unwrap(),
+            path,
+        )
     }
 
     #[test]
@@ -268,24 +367,127 @@ mod tests {
     }
 
     #[test]
-    fn pending_request_survives_unavailable_step_and_can_be_aborted() {
+    fn prefill_failure_rolls_back_and_keeps_other_abort_results() {
         let (mut scheduler, path) = scheduler();
         let uid = scheduler
             .add_request(vec![1], SamplingParams::default())
             .unwrap();
+        let free_before = scheduler.engine().kv_cache_pool().unwrap().free_count();
         let rejected = scheduler
             .add_request(vec![1, 2, 3, 4, 5], SamplingParams::default())
             .unwrap();
-        assert_eq!(scheduler.step().unwrap()[0].uid, rejected);
+        let results = scheduler.step().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].uid, rejected);
+        assert_eq!(results[0].finish_reason, Some(FinishReason::Abort));
+        assert_eq!(results[1].uid, uid);
+        assert_eq!(results[1].finish_reason, Some(FinishReason::Error));
+        assert!(matches!(
+            scheduler.last_step_error(),
+            Some(EngineError::ModelRunnerNotAttached)
+        ));
+        assert_eq!(
+            scheduler.engine().kv_cache_pool().unwrap().free_count(),
+            free_before
+        );
+        assert!(!scheduler.abort_request(uid));
+        assert!(scheduler.is_idle());
+        assert!(scheduler.step().unwrap().is_empty());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    struct FixedTokenModel(i64);
+
+    impl ModelExecutor for FixedTokenModel {
+        fn forward(
+            &self,
+            _input_ids: &Tensor,
+            _positions: &Tensor,
+            _attention_metadata: Option<&AttentionMetadata>,
+            logits_indices: Option<&Tensor>,
+        ) -> std::result::Result<Tensor, ModelRunnerError> {
+            let rows = logits_indices
+                .expect("prefill passes logits indices")
+                .size()[0];
+            let mut logits = vec![0f32; rows as usize * 9];
+            for row in 0..rows as usize {
+                logits[row * 9 + self.0 as usize] = 1.0;
+            }
+            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+        }
+    }
+
+    #[test]
+    fn prefill_produces_token_and_leaves_nonterminal_request_running() {
+        let (mut scheduler, path) = scheduler();
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), Device::Cpu))
+            .unwrap();
+        let uid = scheduler
+            .add_request(vec![1], SamplingParams::default())
+            .unwrap();
+        assert_eq!(
+            scheduler.step().unwrap(),
+            vec![OutputToken {
+                uid,
+                token_id: 3,
+                finished: false,
+                finish_reason: None,
+            }]
+        );
+        assert_eq!(scheduler.running_len(), 1);
         assert!(matches!(
             scheduler.step(),
             Err(SchedulerError::ExecutionNotAvailable)
         ));
-        assert_eq!(scheduler.pending_len(), 1);
         assert!(scheduler.abort_request(uid));
-        assert!(!scheduler.abort_request(uid));
         assert!(scheduler.is_idle());
-        assert!(scheduler.step().unwrap().is_empty());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn prefill_finishes_on_eos_and_releases_running_slot() {
+        let (mut scheduler, path) = scheduler();
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(7)), Device::Cpu))
+            .unwrap();
+        let uid = scheduler
+            .add_request(vec![1], SamplingParams::default())
+            .unwrap();
+        assert_eq!(
+            scheduler.step().unwrap(),
+            vec![OutputToken {
+                uid,
+                token_id: 7,
+                finished: true,
+                finish_reason: Some(FinishReason::Stop),
+            }]
+        );
+        assert!(scheduler.is_idle());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn naive_prefill_returns_pages_when_request_finishes() {
+        let (mut scheduler, path) = scheduler_with_strategy(CacheStrategy::Naive);
+        let free_before = scheduler.engine().kv_cache_pool().unwrap().free_count();
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(7)), Device::Cpu))
+            .unwrap();
+        scheduler
+            .add_request(vec![1], SamplingParams::default())
+            .unwrap();
+        assert_eq!(
+            scheduler.step().unwrap()[0].finish_reason,
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(
+            scheduler.engine().kv_cache_pool().unwrap().free_count(),
+            free_before
+        );
         fs::remove_dir_all(path).unwrap();
     }
 

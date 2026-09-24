@@ -1,6 +1,7 @@
 //! Request and output values exposed by the scheduler.
 
 use crate::engine::SamplingParams;
+use crate::engine::kvcache::BaseCacheHandle;
 
 pub type RequestId = u64;
 
@@ -35,6 +36,7 @@ pub struct Request {
     pub sampling_params: SamplingParams,
     pub cached_len: usize,
     pub output_len: usize,
+    pub cache_handle: Option<BaseCacheHandle>,
     pub status: SequenceStatus,
 }
 
@@ -50,5 +52,12 @@ impl Request {
     pub fn append_token(&mut self, token_id: i64) {
         self.input_ids.push(token_id);
         self.output_len += 1;
+    }
+
+    /// The most recently sampled token has not entered the model's KV cache
+    /// until a following decode forward consumes it.
+    pub fn written_input_ids(&self) -> &[i64] {
+        let unwritten = usize::from(self.output_len > 0);
+        &self.input_ids[..self.input_ids.len().saturating_sub(unwritten)]
     }
 }

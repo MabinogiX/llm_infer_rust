@@ -1,13 +1,13 @@
 //! Engine orchestration for the Rust migration.
 //!
-//! Model assembly, scheduling, graph execution, and sampling have not yet
-//! moved out of Python.  This module nevertheless owns the work that already
-//! has Rust implementations: validating model input, normalizing configuration,
-//! and allocating/releasing the paged KV cache.
+//! Owns model execution, sampling, configuration, and the paged KV cache.
+//! The scheduler shares the pool's page allocator with the cache managers.
 
 use std::{
+    cell::{Ref, RefCell, RefMut},
     fmt,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use tch::{Device, Kind, Tensor};
@@ -241,7 +241,7 @@ pub struct Engine {
     tp_rank: usize,
     device: Device,
     kind: Kind,
-    kv_cache_pool: Option<KVCachePool>,
+    kv_cache_pool: Option<Rc<RefCell<KVCachePool>>>,
     model_runner: Option<ModelRunner>,
     sampler: Sampler,
 }
@@ -289,7 +289,7 @@ impl Engine {
             tp_rank,
             device,
             kind,
-            kv_cache_pool: Some(kv_cache_pool),
+            kv_cache_pool: Some(Rc::new(RefCell::new(kv_cache_pool))),
             model_runner: None,
             sampler: Sampler,
         })
@@ -315,12 +315,25 @@ impl Engine {
         self.kind
     }
 
-    pub fn kv_cache_pool(&self) -> Result<&KVCachePool> {
-        self.kv_cache_pool.as_ref().ok_or(EngineError::Released)
+    pub fn kv_cache_pool(&self) -> Result<Ref<'_, KVCachePool>> {
+        Ok(self
+            .kv_cache_pool
+            .as_ref()
+            .ok_or(EngineError::Released)?
+            .borrow())
     }
 
-    pub fn kv_cache_pool_mut(&mut self) -> Result<&mut KVCachePool> {
-        self.kv_cache_pool.as_mut().ok_or(EngineError::Released)
+    pub fn kv_cache_pool_mut(&mut self) -> Result<RefMut<'_, KVCachePool>> {
+        Ok(self
+            .kv_cache_pool
+            .as_ref()
+            .ok_or(EngineError::Released)?
+            .borrow_mut())
+    }
+
+    /// Shares the pool's page allocator with the scheduler's cache manager.
+    pub fn shared_kv_cache_pool(&self) -> Result<Rc<RefCell<KVCachePool>>> {
+        self.kv_cache_pool.clone().ok_or(EngineError::Released)
     }
 
     /// Binds the migrated eager execution path after the Rust model is built.

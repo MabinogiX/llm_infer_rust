@@ -19,9 +19,7 @@ impl BaseCacheHandle {
     }
 }
 
-/// Interface that future naive/radix cache managers must implement.
-///
-/// The concrete cache managers are intentionally not migrated in this step.
+/// Interface shared by naive and radix cache managers.
 pub trait CacheManager {
     fn match_prefix(&self, input_ids: &[i64]) -> Result<(usize, Vec<usize>)>;
     fn insert(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()>;

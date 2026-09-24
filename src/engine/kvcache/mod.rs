@@ -5,6 +5,7 @@
 
 mod allocator;
 mod error;
+mod naive;
 mod pool;
 mod radix;
 
@@ -12,6 +13,7 @@ pub use allocator::{
     KVCacheAllocationConfig, KVCacheAllocator, KVCacheModelConfig, KVCacheServerConfig,
 };
 pub use error::{KVCacheError, Result};
+pub use naive::NaiveCacheManager;
 pub use pool::{BaseCacheHandle, CacheManager, KVCacheLayout, KVCachePool};
 pub use radix::{RadixCacheManager, RadixNode};
 pub use tch::{Device, Kind, Tensor};

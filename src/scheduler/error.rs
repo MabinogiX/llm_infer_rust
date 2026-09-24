@@ -2,11 +2,17 @@
 
 use std::{fmt, path::PathBuf};
 
+use crate::engine::kvcache::KVCacheError;
+use crate::engine::{BatchContextError, EngineError};
+
 #[derive(Debug)]
 pub enum SchedulerError {
     InvalidModelConfig { path: PathBuf, message: String },
     RequestIdExhausted,
     ExecutionNotAvailable,
+    Cache(KVCacheError),
+    Batch(BatchContextError),
+    Engine(EngineError),
 }
 
 impl fmt::Display for SchedulerError {
@@ -17,12 +23,33 @@ impl fmt::Display for SchedulerError {
             }
             Self::RequestIdExhausted => write!(f, "scheduler request ID space exhausted"),
             Self::ExecutionNotAvailable => {
-                write!(f, "prefill/decode scheduling is not connected yet")
+                write!(f, "decode scheduling is not connected yet")
             }
+            Self::Cache(error) => write!(f, "KV cache scheduling failed: {error}"),
+            Self::Batch(error) => write!(f, "prefill batch preparation failed: {error}"),
+            Self::Engine(error) => write!(f, "engine scheduling failed: {error}"),
         }
     }
 }
 
 impl std::error::Error for SchedulerError {}
+
+impl From<KVCacheError> for SchedulerError {
+    fn from(error: KVCacheError) -> Self {
+        Self::Cache(error)
+    }
+}
+
+impl From<BatchContextError> for SchedulerError {
+    fn from(error: BatchContextError) -> Self {
+        Self::Batch(error)
+    }
+}
+
+impl From<EngineError> for SchedulerError {
+    fn from(error: EngineError) -> Self {
+        Self::Engine(error)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, SchedulerError>;
