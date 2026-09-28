@@ -68,6 +68,7 @@ impl FrontendManager {
             .spawn(move || match build_components(&args) {
                 Ok(components) => {
                     let tokenizer = components.tokenizer;
+                    tracing::info!("scheduler and model initialized");
                     if ready_tx.send(Ok(tokenizer.clone())).is_ok() {
                         run_scheduler(components.scheduler, command_rx);
                     }
@@ -145,6 +146,7 @@ impl Drop for RequestHandle {
 
 fn run_scheduler(mut scheduler: Scheduler, commands: mpsc::Receiver<Command>) {
     let mut results: HashMap<RequestId, async_mpsc::UnboundedSender<OutputToken>> = HashMap::new();
+    tracing::info!("scheduler event loop started");
     loop {
         if scheduler.is_idle() {
             match commands.recv_timeout(Duration::from_millis(10)) {
@@ -165,6 +167,9 @@ fn run_scheduler(mut scheduler: Scheduler, commands: mpsc::Receiver<Command>) {
         }
         match scheduler.step() {
             Ok(outputs) => {
+                if let Some(error) = scheduler.last_step_error() {
+                    tracing::error!(error = %error, "model forward or sampling failed");
+                }
                 for output in outputs {
                     let uid = output.uid;
                     if let Some(sender) = results.get(&uid) {
@@ -179,7 +184,7 @@ fn run_scheduler(mut scheduler: Scheduler, commands: mpsc::Receiver<Command>) {
                 }
             }
             Err(error) => {
-                eprintln!("Scheduler step error: {error}");
+                tracing::error!(error = %error, "scheduler step failed");
                 for (uid, sender) in results.drain() {
                     let _ = sender.send(OutputToken {
                         uid,
@@ -192,6 +197,7 @@ fn run_scheduler(mut scheduler: Scheduler, commands: mpsc::Receiver<Command>) {
             }
         }
     }
+    tracing::info!("scheduler event loop stopped");
 }
 
 fn handle_command(

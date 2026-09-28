@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::engine::ServerArgs;
+use crate::logging::LoggingConfig;
 
 use super::ServeArgs;
 
@@ -22,6 +23,8 @@ Options:\n\
   --dtype NAME              Model dtype (currently CPU float32)\n\
   --device NAME             Device (currently cpu/auto)\n\
   --trust-remote-code       Request Hugging Face remote code\n\
+  --log-dir PATH            Log directory (default logs)\n\
+  --log-level LEVEL         trace/debug/info/warn/error (default info)\n\
   -h, --help                Show this help";
 
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, String> {
@@ -30,6 +33,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
     let mut host: IpAddr = "127.0.0.1".parse().expect("literal IP");
     let mut port = 8000;
     let mut engine = ServerArgs::new("");
+    let mut logging = LoggingConfig::default();
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} 缺少参数"));
         match flag.as_str() {
@@ -60,6 +64,15 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
                 }
             }
             "--trust-remote-code" => engine.trust_remote_code = true,
+            "--log-dir" => logging.directory = PathBuf::from(value()?),
+            "--log-level" => {
+                let level = value()?.to_ascii_lowercase();
+                logging.level = Some(match level.as_str() {
+                    "trace" | "debug" | "info" | "warn" | "error" => level,
+                    "warning" => "warn".to_owned(),
+                    _ => return Err(format!("无效的 --log-level: {level}")),
+                });
+            }
             _ => return Err(format!("未知参数: {flag}")),
         }
     }
@@ -70,6 +83,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
     Ok(ServeArgs {
         engine,
         bind: SocketAddr::new(host, port),
+        logging,
     })
 }
 
@@ -87,6 +101,23 @@ mod tests {
             .unwrap();
         assert_eq!(args.bind.port(), 9001);
         assert_eq!(args.engine.model_path, PathBuf::from("/tmp/model"));
+        let logging_args = parse_args(
+            [
+                "--model-path",
+                "/tmp/model",
+                "--log-dir",
+                "/tmp/minisgl-logs",
+                "--log-level",
+                "DEBUG",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            logging_args.logging.directory,
+            PathBuf::from("/tmp/minisgl-logs")
+        );
+        assert_eq!(logging_args.logging.level.as_deref(), Some("debug"));
         assert!(
             parse_args(["--model-path", "/tmp/model", "--device", "cuda"].map(str::to_owned))
                 .is_err()

@@ -47,6 +47,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        tracing::warn!(status = self.status.as_u16(), detail = %self.detail, "request rejected");
         (self.status, Json(json!({"detail": self.detail}))).into_response()
     }
 }
@@ -84,6 +85,13 @@ async fn chat_completions(
         request.ignore_eos,
     );
     let handle = submit(&frontend, input_ids, params).await?;
+    tracing::info!(
+        uid = handle.uid(),
+        endpoint = "chat.completions",
+        prompt_tokens,
+        stream = request.stream,
+        "generation request submitted"
+    );
     if request.stream {
         return Ok(stream_response(
             &frontend,
@@ -95,6 +103,12 @@ async fn chat_completions(
     }
     let uid = handle.uid();
     let (token_ids, reason) = collect_all(handle).await?;
+    tracing::info!(
+        uid,
+        completion_tokens = token_ids.len(),
+        finish_reason = streaming::reason(reason),
+        "generation request completed"
+    );
     let text = frontend
         .tokenizer()
         .decode(&token_ids, true)
@@ -127,6 +141,13 @@ async fn completions(
         request.ignore_eos,
     );
     let handle = submit(&frontend, input_ids, params).await?;
+    tracing::info!(
+        uid = handle.uid(),
+        endpoint = "completions",
+        prompt_tokens,
+        stream = request.stream,
+        "generation request submitted"
+    );
     if request.stream {
         return Ok(stream_response(
             &frontend,
@@ -138,6 +159,12 @@ async fn completions(
     }
     let uid = handle.uid();
     let (token_ids, reason) = collect_all(handle).await?;
+    tracing::info!(
+        uid,
+        completion_tokens = token_ids.len(),
+        finish_reason = streaming::reason(reason),
+        "generation request completed"
+    );
     let text = frontend
         .tokenizer()
         .decode(&token_ids, true)

@@ -161,10 +161,18 @@ pub fn response_stream(
             let token = match next {
                 Ok(Some(token)) => token,
                 Ok(None) => {
+                    tracing::warn!(
+                        uid = state.handle.uid(),
+                        "stream ended because scheduler closed"
+                    );
                     state.phase = StreamPhase::DonePending;
                     return Some((Ok(event(error_chunk("Scheduler closed"))), state));
                 }
                 Err(_) => {
+                    tracing::warn!(
+                        uid = state.handle.uid(),
+                        "stream timed out waiting for a token"
+                    );
                     state.phase = StreamPhase::DonePending;
                     return Some((
                         Ok(event(error_chunk("Timed out waiting for the next token"))),
@@ -174,6 +182,7 @@ pub fn response_stream(
             };
             match token.finish_reason {
                 Some(FinishReason::Abort) => {
+                    tracing::warn!(uid = state.handle.uid(), "stream request aborted");
                     state.phase = StreamPhase::DonePending;
                     return Some((
                         Ok(event(error_chunk("Request aborted by the scheduler"))),
@@ -181,6 +190,7 @@ pub fn response_stream(
                     ));
                 }
                 Some(FinishReason::Error) => {
+                    tracing::error!(uid = state.handle.uid(), "stream generation failed");
                     state.phase = StreamPhase::DonePending;
                     return Some((
                         Ok(event(error_chunk("Request failed during generation"))),
@@ -199,6 +209,12 @@ pub fn response_stream(
             };
             if token.finished {
                 let finish_reason = token.finish_reason.unwrap_or(FinishReason::Stop);
+                tracing::info!(
+                    uid = state.handle.uid(),
+                    completion_tokens = state.completion_tokens,
+                    finish_reason = reason(finish_reason),
+                    "stream generation completed"
+                );
                 // Emit the final text delta before the terminal chunk.
                 if !content.is_empty() {
                     let item = event(content_chunk(

@@ -38,6 +38,22 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 `server/manager.rs` 在专用线程中运行 Scheduler，通过通道收发请求和 token；`server/api.rs` 提供普通 JSON 和 SSE 响应。流式连接中断时会取消对应请求。
 
+## 日志
+
+服务使用 `tracing` / `tracing-subscriber`，同时输出到终端和按 UTC 日期滚动的 `logs/llm-infer-rust.YYYY-MM-DD.log`。终端输出保留 ANSI 样式，日志文件仅保存纯文本。每行包含 UTC 时间、`service=llm-infer-rust`、`level`、消息及结构化字段，例如：
+
+```text
+2026-09-28T06:46:40.039232Z service=llm-infer-rust level=INFO starting model server model_path=/path/to/model log_dir=logs
+```
+
+可通过启动参数设置目录和等级：
+
+```bash
+./scripts/run-debug.sh --log-dir ./logs --log-level debug
+```
+
+日志等级优先级为 `--log-level`、`RUST_LOG`、默认 `info`。例如 `RUST_LOG=sglang_rust=debug,info ./scripts/run-debug.sh` 可按模块过滤。文件由后台线程写入；队列满时对产生日志的线程施加反压，而非丢弃日志。正常退出时会刷新缓冲；旧日期文件不会自动删除。
+
 ## 已迁移的 KV Cache 基础模块
 
 `src/engine/kvcache/` 已包含 Rust 版本的 `BaseCacheHandle`、`CacheManager` trait、`KVCachePool` 与 `KVCacheAllocator`：

@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 
 use crate::{
     engine::{Engine, EngineError, ModelArgs, ServerArgs},
+    logging::LoggingConfig,
     models::Qwen3Factory,
     scheduler::{Scheduler, SchedulerError},
     tokenizer::{TokenizerWorker, TokenizerWorkerError},
@@ -21,6 +22,7 @@ use super::{
 pub struct ServeArgs {
     pub engine: ServerArgs,
     pub bind: SocketAddr,
+    pub logging: LoggingConfig,
 }
 
 impl ServeArgs {
@@ -28,6 +30,7 @@ impl ServeArgs {
         Self {
             engine,
             bind: SocketAddr::from(([127, 0, 0, 1], 8000)),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -84,9 +87,14 @@ pub async fn serve(args: ServeArgs) -> Result<(), ServeError> {
     let frontend = FrontendManager::start(args.clone()).map_err(ServeError::Frontend)?;
     let app = api::router(frontend);
     let listener = TcpListener::bind(args.bind).await.map_err(ServeError::Io)?;
-    println!(
-        "Mini-SGLang listening on http://{}",
-        listener.local_addr().map_err(ServeError::Io)?
-    );
-    axum::serve(listener, app).await.map_err(ServeError::Io)
+    tracing::info!(address = %listener.local_addr().map_err(ServeError::Io)?, "HTTP server listening");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => tracing::info!("shutdown requested"),
+                Err(error) => tracing::error!(error = %error, "unable to listen for Ctrl+C"),
+            }
+        })
+        .await
+        .map_err(ServeError::Io)
 }
