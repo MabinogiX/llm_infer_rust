@@ -3,6 +3,7 @@
 mod api;
 mod cli;
 mod manager;
+pub mod output;
 mod schemas;
 mod serve;
 mod streaming;

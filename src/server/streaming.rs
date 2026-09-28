@@ -1,6 +1,6 @@
 //! OpenAI-compatible streaming response construction.
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{collections::VecDeque, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::response::sse::Event;
 use futures_util::stream;
@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 
 use crate::{scheduler::FinishReason, tokenizer::TokenizerWorker};
 
-use super::manager::{IncrementalDetokenizer, RequestHandle};
+use super::{
+    manager::{IncrementalDetokenizer, RequestHandle},
+    output::ChatOutputParser,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -44,6 +47,14 @@ pub fn reason(reason: FinishReason) -> &'static str {
     }
 }
 
+pub fn chat_reason(reason: FinishReason, has_tool_calls: bool) -> &'static str {
+    if has_tool_calls && reason == FinishReason::Stop {
+        "tool_calls"
+    } else {
+        self::reason(reason)
+    }
+}
+
 pub fn created() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -59,17 +70,23 @@ pub fn usage(prompt_tokens: usize, completion_tokens: usize) -> Value {
     })
 }
 
-fn content_chunk(kind: ApiKind, uid: u64, model: &str, content: &str) -> Value {
-    let choice = match kind {
-        ApiKind::Chat => json!({"index": 0, "delta": {"content": content}, "finish_reason": null}),
-        ApiKind::Completion => json!({"index": 0, "text": content, "finish_reason": null}),
-    };
+fn chat_delta_chunk(uid: u64, model: &str, delta: Value) -> Value {
     json!({
-        "id": kind.id(uid),
-        "object": kind.object(true),
+        "id": ApiKind::Chat.id(uid),
+        "object": ApiKind::Chat.object(true),
         "created": created(),
         "model": model,
-        "choices": [choice],
+        "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+    })
+}
+
+fn completion_chunk(uid: u64, model: &str, content: &str) -> Value {
+    json!({
+        "id": ApiKind::Completion.id(uid),
+        "object": ApiKind::Completion.object(true),
+        "created": created(),
+        "model": model,
+        "choices": [{"index": 0, "text": content, "finish_reason": null}],
     })
 }
 
@@ -77,14 +94,14 @@ fn finish_chunk(
     kind: ApiKind,
     uid: u64,
     model: &str,
-    finish_reason: FinishReason,
+    finish_reason: &str,
     prompt_tokens: usize,
     completion_tokens: usize,
 ) -> Value {
     let choice = match kind {
-        ApiKind::Chat => json!({"index": 0, "delta": {}, "finish_reason": reason(finish_reason)}),
+        ApiKind::Chat => json!({"index": 0, "delta": {}, "finish_reason": finish_reason}),
         ApiKind::Completion => {
-            json!({"index": 0, "text": "", "finish_reason": reason(finish_reason)})
+            json!({"index": 0, "text": "", "finish_reason": finish_reason})
         }
     };
     json!({
@@ -108,14 +125,9 @@ struct StreamState {
     model: String,
     prompt_tokens: usize,
     completion_tokens: usize,
-    phase: StreamPhase,
-}
-
-enum StreamPhase {
-    Running,
-    FinishPending(FinishReason),
-    DonePending,
-    Complete,
+    chat_output: Option<Box<dyn ChatOutputParser>>,
+    events: VecDeque<Event>,
+    done: bool,
 }
 
 /// Streaming state is dropped on client disconnect; `RequestHandle` aborts it.
@@ -125,36 +137,33 @@ pub fn response_stream(
     kind: ApiKind,
     model: String,
     prompt_tokens: usize,
+    chat_output: Option<Box<dyn ChatOutputParser>>,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static {
+    let mut events = VecDeque::new();
+    if matches!(kind, ApiKind::Chat) {
+        events.push_back(event(chat_delta_chunk(
+            handle.uid(),
+            &model,
+            json!({"role": "assistant"}),
+        )));
+    }
     let state = StreamState {
+        chat_output,
         handle,
         detokenizer: IncrementalDetokenizer::new(tokenizer),
         kind,
         model,
         prompt_tokens,
         completion_tokens: 0,
-        phase: StreamPhase::Running,
+        events,
+        done: false,
     };
     stream::unfold(state, |mut state| async move {
-        match state.phase {
-            StreamPhase::FinishPending(reason) => {
-                state.phase = StreamPhase::DonePending;
-                let item = finish_chunk(
-                    state.kind,
-                    state.handle.uid(),
-                    &state.model,
-                    reason,
-                    state.prompt_tokens,
-                    state.completion_tokens,
-                );
-                return Some((Ok(event(item)), state));
-            }
-            StreamPhase::DonePending => {
-                state.phase = StreamPhase::Complete;
-                return Some((Ok(Event::default().data("[DONE]")), state));
-            }
-            StreamPhase::Complete => return None,
-            StreamPhase::Running => {}
+        if let Some(next) = state.events.pop_front() {
+            return Some((Ok(next), state));
+        }
+        if state.done {
+            return None;
         }
         loop {
             let next = tokio::time::timeout(REQUEST_TIMEOUT, state.handle.recv()).await;
@@ -165,37 +174,40 @@ pub fn response_stream(
                         uid = state.handle.uid(),
                         "stream ended because scheduler closed"
                     );
-                    state.phase = StreamPhase::DonePending;
-                    return Some((Ok(event(error_chunk("Scheduler closed"))), state));
+                    state
+                        .events
+                        .push_back(event(error_chunk("Scheduler closed")));
+                    state.done = true;
+                    break;
                 }
                 Err(_) => {
                     tracing::warn!(
                         uid = state.handle.uid(),
                         "stream timed out waiting for a token"
                     );
-                    state.phase = StreamPhase::DonePending;
-                    return Some((
-                        Ok(event(error_chunk("Timed out waiting for the next token"))),
-                        state,
-                    ));
+                    state
+                        .events
+                        .push_back(event(error_chunk("Timed out waiting for the next token")));
+                    state.done = true;
+                    break;
                 }
             };
             match token.finish_reason {
                 Some(FinishReason::Abort) => {
                     tracing::warn!(uid = state.handle.uid(), "stream request aborted");
-                    state.phase = StreamPhase::DonePending;
-                    return Some((
-                        Ok(event(error_chunk("Request aborted by the scheduler"))),
-                        state,
-                    ));
+                    state
+                        .events
+                        .push_back(event(error_chunk("Request aborted by the scheduler")));
+                    state.done = true;
+                    break;
                 }
                 Some(FinishReason::Error) => {
                     tracing::error!(uid = state.handle.uid(), "stream generation failed");
-                    state.phase = StreamPhase::DonePending;
-                    return Some((
-                        Ok(event(error_chunk("Request failed during generation"))),
-                        state,
-                    ));
+                    state
+                        .events
+                        .push_back(event(error_chunk("Request failed during generation")));
+                    state.done = true;
+                    break;
                 }
                 _ => {}
             }
@@ -203,10 +215,28 @@ pub fn response_stream(
             let content = match state.detokenizer.add_token(token.token_id) {
                 Ok(content) => content,
                 Err(error) => {
-                    state.phase = StreamPhase::DonePending;
-                    return Some((Ok(event(error_chunk(&error.to_string()))), state));
+                    state
+                        .events
+                        .push_back(event(error_chunk(&error.to_string())));
+                    state.done = true;
+                    break;
                 }
             };
+            if let Some(output) = &mut state.chat_output {
+                for delta in output.push(&content) {
+                    state.events.push_back(event(chat_delta_chunk(
+                        state.handle.uid(),
+                        &state.model,
+                        delta,
+                    )));
+                }
+            } else if !content.is_empty() {
+                state.events.push_back(event(completion_chunk(
+                    state.handle.uid(),
+                    &state.model,
+                    &content,
+                )));
+            }
             if token.finished {
                 let finish_reason = token.finish_reason.unwrap_or(FinishReason::Stop);
                 tracing::info!(
@@ -215,42 +245,36 @@ pub fn response_stream(
                     finish_reason = reason(finish_reason),
                     "stream generation completed"
                 );
-                // Emit the final text delta before the terminal chunk.
-                if !content.is_empty() {
-                    let item = event(content_chunk(
-                        state.kind,
-                        state.handle.uid(),
-                        &state.model,
-                        &content,
-                    ));
-                    state.phase = StreamPhase::FinishPending(finish_reason);
-                    return Some((Ok(item), state));
-                }
-                state.phase = StreamPhase::DonePending;
-                return Some((
-                    Ok(event(finish_chunk(
-                        state.kind,
-                        state.handle.uid(),
-                        &state.model,
-                        finish_reason,
-                        state.prompt_tokens,
-                        state.completion_tokens,
-                    ))),
-                    state,
-                ));
+                let finish_reason = if let Some(output) = &mut state.chat_output {
+                    for delta in output.finish() {
+                        state.events.push_back(event(chat_delta_chunk(
+                            state.handle.uid(),
+                            &state.model,
+                            delta,
+                        )));
+                    }
+                    chat_reason(finish_reason, output.has_tool_calls())
+                } else {
+                    reason(finish_reason)
+                };
+                state.events.push_back(event(finish_chunk(
+                    state.kind,
+                    state.handle.uid(),
+                    &state.model,
+                    finish_reason,
+                    state.prompt_tokens,
+                    state.completion_tokens,
+                )));
+                state.done = true;
             }
-            if !content.is_empty() {
-                return Some((
-                    Ok(event(content_chunk(
-                        state.kind,
-                        state.handle.uid(),
-                        &state.model,
-                        &content,
-                    ))),
-                    state,
-                ));
+            if !state.events.is_empty() {
+                break;
             }
         }
+        if state.done {
+            state.events.push_back(Event::default().data("[DONE]"));
+        }
+        Some((Ok(state.events.pop_front().unwrap()), state))
     })
 }
 

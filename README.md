@@ -52,7 +52,7 @@ SGLANG_E2E_BASE_URL=http://127.0.0.1:8000/v1 \
   uv run --locked python -m unittest discover -s tests -p test_api_e2e.py -v
 ```
 
-可通过 `SGLANG_E2E_MODEL` 指定请求中的模型名。测试需要 Qwen3 tokenizer；它覆盖 `max_tokens`、`stream`、用量统计、`enable_thinking`、错误请求，并复用 `tests/fixtures/qwen3_chat_golden.json` 对照聊天模板。当前接口返回生成文本，不将模型输出解析为结构化 `tool_calls` 或 `reasoning_content`。
+可通过 `SGLANG_E2E_MODEL` 指定请求中的模型名。测试需要 Qwen3 tokenizer；它覆盖 `max_tokens`、`stream`、用量统计、`enable_thinking`、错误请求、思考内容和工具调用，并复用 `tests/fixtures/qwen3_chat_golden.json` 对照聊天模板。
 
 ## 日志
 
@@ -134,7 +134,11 @@ Attention 通过 `ServerArgs::attention_backend` 选择后端，当前默认且�
 
 `src/tokenizer.rs` 使用 Hugging Face 的原生 Rust `tokenizers` crate 加载模型目录中的 `tokenizer.json`，不需要 Python 或 `transformers` 运行时：
 
-Qwen3 聊天模板支持请求中的 `tools` 完整 JSON 定义、消息的 `tool_calls`（OpenAI 嵌套结构或直接结构）、`reasoning_content`、可为空的 `content`、连续 `tool` 响应，以及 `enable_thinking` / `chat_template_kwargs.enable_thinking`。其他消息扩展字段会保留并传给通用 Jinja 模板。当前生成响应仍返回文本，不解析模型输出为结构化 `tool_calls`。
+Qwen3 聊天模板支持请求中的 `tools` 完整 JSON 定义、消息的 `tool_calls`（OpenAI 嵌套结构或直接结构）、`reasoning_content`、可为空的 `content`、连续 `tool` 响应，以及 `enable_thinking` / `chat_template_kwargs.enable_thinking`。其他消息扩展字段会保留并传给通用 Jinja 模板。
+
+聊天响应会把模型生成的 `<think>...</think>` 解析为 `reasoning_content`，把完整且合法的 `<tool_call>...</tool_call>` JSON 解析为 `tool_calls`。纯工具调用的 `content` 为 `null`；正常停止且包含工具调用时，`finish_reason` 为 `tool_calls`。SSE 将思考、正文和完整工具调用分别放在 `delta` 中，工具调用的 `function.arguments` 是 JSON 字符串。未闭合或无效的工具调用标签保留为正文。`/v1/completions` 继续返回原始生成文本。
+
+输出解析器位于 `src/server/output/`：`ChatOutputParser` 保存单个请求的解析状态。服务启动时在 `build_components` 中选择一次解析器构造函数；当前选择 `new_qwen3_output_parser`。每个请求调用这个固定函数创建独立状态，因此并发流不会混用尚未闭合的标签。新增模型时，实现解析器并在模型初始化分支中选择其构造函数，API 和 SSE 路径无需改动。
 
 ```rust
 use sglang_rust::tokenizer::{ChatMessage, TokenizerWorker};

@@ -113,12 +113,16 @@ async fn chat_completions(
         .tokenizer()
         .decode(&token_ids, true)
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let mut output = frontend.new_chat_output_parser(uid);
+    output.push(&text);
+    output.finish();
+    let finish_reason = streaming::chat_reason(reason, output.has_tool_calls());
     Ok(Json(json!({
         "id": ApiKind::Chat.id(uid),
         "object": ApiKind::Chat.object(false),
         "created": streaming::created(),
         "model": request.model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": streaming::reason(reason)}],
+        "choices": [{"index": 0, "message": output.message(), "finish_reason": finish_reason}],
         "usage": streaming::usage(prompt_tokens, token_ids.len()),
     }))
     .into_response())
@@ -231,12 +235,15 @@ fn stream_response(
     prompt_tokens: usize,
 ) -> Response {
     let tokenizer = frontend.shared_tokenizer();
+    let output_parser =
+        matches!(kind, ApiKind::Chat).then(|| frontend.new_chat_output_parser(handle.uid()));
     Sse::new(streaming::response_stream(
         handle,
         tokenizer,
         kind,
         model,
         prompt_tokens,
+        output_parser,
     ))
     .into_response()
 }

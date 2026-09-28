@@ -15,6 +15,7 @@ use crate::{
 use super::{
     api,
     manager::{FrontendManager, ManagerError},
+    output::{ChatOutputParserConstructor, new_qwen3_output_parser},
 };
 
 /// HTTP binding and engine settings for one model server.
@@ -39,6 +40,7 @@ impl ServeArgs {
 pub struct ServeComponents {
     pub scheduler: Scheduler,
     pub tokenizer: TokenizerWorker,
+    pub output_parser_constructor: ChatOutputParserConstructor,
 }
 
 #[derive(Debug)]
@@ -79,6 +81,7 @@ pub fn build_components(args: &ServeArgs) -> Result<ServeComponents, ServeError>
     Ok(ServeComponents {
         scheduler,
         tokenizer,
+        output_parser_constructor: new_qwen3_output_parser,
     })
 }
 

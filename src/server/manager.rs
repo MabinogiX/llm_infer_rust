@@ -16,7 +16,10 @@ use crate::{
     tokenizer::{TokenizerWorker, TokenizerWorkerError},
 };
 
-use super::{ServeArgs, build_components};
+use super::{
+    ServeArgs, build_components,
+    output::{ChatOutputParser, ChatOutputParserConstructor},
+};
 
 #[derive(Debug)]
 pub enum ManagerError {
@@ -56,6 +59,7 @@ struct Submission {
 pub struct FrontendManager {
     commands: mpsc::Sender<Command>,
     tokenizer: Arc<TokenizerWorker>,
+    output_parser_constructor: ChatOutputParserConstructor,
 }
 
 impl FrontendManager {
@@ -69,7 +73,13 @@ impl FrontendManager {
                 Ok(components) => {
                     let tokenizer = components.tokenizer;
                     tracing::info!("scheduler and model initialized");
-                    if ready_tx.send(Ok(tokenizer.clone())).is_ok() {
+                    if ready_tx
+                        .send(Ok((
+                            tokenizer.clone(),
+                            components.output_parser_constructor,
+                        )))
+                        .is_ok()
+                    {
                         run_scheduler(components.scheduler, command_rx);
                     }
                 }
@@ -78,13 +88,14 @@ impl FrontendManager {
                 }
             })
             .map_err(|error| ManagerError::Startup(error.to_string()))?;
-        let tokenizer = ready_rx
+        let (tokenizer, output_parser_constructor) = ready_rx
             .recv()
             .map_err(|_| ManagerError::Startup("scheduler 线程启动失败".to_owned()))?
             .map_err(ManagerError::Startup)?;
         Ok(Self {
             commands,
             tokenizer: Arc::new(tokenizer),
+            output_parser_constructor,
         })
     }
 
@@ -94,6 +105,10 @@ impl FrontendManager {
 
     pub fn shared_tokenizer(&self) -> Arc<TokenizerWorker> {
         self.tokenizer.clone()
+    }
+
+    pub fn new_chat_output_parser(&self, uid: RequestId) -> Box<dyn ChatOutputParser> {
+        (self.output_parser_constructor)(uid)
     }
 
     pub async fn submit_request(

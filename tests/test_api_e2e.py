@@ -73,7 +73,14 @@ class ApiE2ETest(unittest.TestCase):
         self.assertEqual(chunks[-1].usage.prompt_tokens, full.usage.prompt_tokens)
         self.assertEqual(
             "".join(chunk.choices[0].delta.content or "" for chunk in chunks),
-            full.choices[0].message.content,
+            full.choices[0].message.content or "",
+        )
+        self.assertEqual(
+            "".join(
+                getattr(chunk.choices[0].delta, "reasoning_content", None) or ""
+                for chunk in chunks
+            ),
+            getattr(full.choices[0].message, "reasoning_content", None) or "",
         )
 
     def test_completion_stream_matches_non_stream(self):
@@ -126,7 +133,8 @@ class ApiE2ETest(unittest.TestCase):
                 self.assertEqual(chat.choices[0].message.role, "assistant")
                 self.assertEqual(chat.choices[0].finish_reason, "length")
                 self.assertEqual(chat.usage.prompt_tokens, raw.usage.prompt_tokens)
-                self.assertEqual(chat.choices[0].message.content, raw.choices[0].text)
+                if "<think>" not in raw.choices[0].text and "<tool_call>" not in raw.choices[0].text:
+                    self.assertEqual(chat.choices[0].message.content, raw.choices[0].text)
 
     def test_enable_thinking_in_template_kwargs(self):
         messages = [{"role": "user", "content": "Say hi"}]
@@ -151,6 +159,75 @@ class ApiE2ETest(unittest.TestCase):
         )
         self.assertEqual(top_level.usage.prompt_tokens, top_level_wins.usage.prompt_tokens)
         self.assertNotEqual(top_level.usage.prompt_tokens, thinking_enabled.usage.prompt_tokens)
+
+    def test_reasoning_content_in_full_and_streamed_chat(self):
+        messages = [{"role": "user", "content": "What is 1 + 1?"}]
+        kwargs = {"max_tokens": 48, "extra_body": {"enable_thinking": True}}
+        full = self.chat(messages, **kwargs)
+        chunks = list(self.chat(messages, stream=True, **kwargs))
+
+        reasoning = getattr(full.choices[0].message, "reasoning_content", None)
+        self.assertTrue(reasoning)
+        self.assertNotIn("<think>", reasoning)
+        self.assertNotIn("</think>", reasoning)
+        self.assertEqual(
+            "".join(
+                getattr(chunk.choices[0].delta, "reasoning_content", None) or ""
+                for chunk in chunks
+            ),
+            reasoning,
+        )
+        self.assertEqual(
+            "".join(chunk.choices[0].delta.content or "" for chunk in chunks),
+            full.choices[0].message.content or "",
+        )
+        self.assertEqual(chunks[-1].choices[0].finish_reason, full.choices[0].finish_reason)
+
+    def test_tool_calls_in_full_and_streamed_chat(self):
+        messages = [{
+            "role": "user",
+            "content": "What is the weather in Beijing? Call get_weather with city Beijing. "
+            "Do not answer from memory.",
+        }]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+        kwargs = {
+            "tools": tools,
+            "max_tokens": 160,
+            "extra_body": {"enable_thinking": False, "ignore_eos": False},
+        }
+        full = self.chat(messages, **kwargs)
+        chunks = list(self.chat(messages, stream=True, **kwargs))
+
+        self.assertEqual(full.choices[0].finish_reason, "tool_calls")
+        self.assertIsNone(full.choices[0].message.content)
+        self.assertEqual(len(full.choices[0].message.tool_calls), 1)
+        call = full.choices[0].message.tool_calls[0]
+        self.assertEqual(call.type, "function")
+        self.assertEqual(call.function.name, "get_weather")
+        self.assertEqual(json.loads(call.function.arguments)["city"].lower(), "beijing")
+
+        streamed_calls = [
+            delta_call
+            for chunk in chunks
+            for delta_call in (chunk.choices[0].delta.tool_calls or [])
+        ]
+        self.assertEqual(chunks[-1].choices[0].finish_reason, "tool_calls")
+        self.assertEqual(len(streamed_calls), 1)
+        self.assertEqual(streamed_calls[0].index, 0)
+        self.assertEqual(streamed_calls[0].function.name, call.function.name)
+        self.assertEqual(streamed_calls[0].function.arguments, call.function.arguments)
+        self.assertFalse(any(chunk.choices[0].delta.content for chunk in chunks))
 
     def test_malformed_tool_call_returns_bad_request(self):
         with self.assertRaises(BadRequestError) as caught:
