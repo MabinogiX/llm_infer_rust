@@ -38,6 +38,22 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 `server/manager.rs` 在专用线程中运行 Scheduler，通过通道收发请求和 token；`server/api.rs` 提供普通 JSON 和 SSE 响应。流式连接中断时会取消对应请求。
 
+## 端到端接口测试
+
+先启动默认 Qwen3 模型服务，再在另一个终端安装测试依赖并运行：
+
+```bash
+./scripts/run-debug.sh --port 8000
+```
+
+```bash
+uv sync --locked --group dev
+SGLANG_E2E_BASE_URL=http://127.0.0.1:8000/v1 \
+  uv run --locked python -m unittest discover -s tests -p test_api_e2e.py -v
+```
+
+可通过 `SGLANG_E2E_MODEL` 指定请求中的模型名。测试需要 Qwen3 tokenizer；它覆盖 `max_tokens`、`stream`、用量统计、`enable_thinking`、错误请求，并复用 `tests/fixtures/qwen3_chat_golden.json` 对照聊天模板。当前接口返回生成文本，不将模型输出解析为结构化 `tool_calls` 或 `reasoning_content`。
+
 ## 日志
 
 服务使用 `tracing` / `tracing-subscriber`，同时输出到终端和按 UTC 日期滚动的 `logs/llm-infer-rust.YYYY-MM-DD.log`。终端输出保留 ANSI 样式，日志文件仅保存纯文本。每行包含 UTC 时间、`service=llm-infer-rust`、`level`、消息及结构化字段，例如：
