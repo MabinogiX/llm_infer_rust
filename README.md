@@ -4,7 +4,19 @@ Rust 版本的 mini-sglang 推理服务。目前支持本地 dense Qwen3 模型�
 
 ## 运行
 
-先按下文配置 libtorch 环境，然后运行：
+本机可以用脚本编译 debug 版本并启动服务，默认读取相邻 `mini-sglang/Qwen/Qwen3-0.6B` 模型：
+
+```bash
+./scripts/run-debug.sh
+```
+
+指定其他模型或端口时，直接传入服务参数；脚本默认设置 `max-running-req=4` 和 `max-seq-len=512`，也可在命令行覆盖：
+
+```bash
+./scripts/run-debug.sh --model-path /path/to/Qwen3-0.6B --port 8001 --max-seq-len 1024
+```
+
+脚本使用项目的 `.venv` 查找 PyTorch/libtorch；需要使用其他虚拟环境时设置 `VENV_DIR`。也可以手动配置下文的 libtorch 环境后运行：
 
 ```bash
 cargo run -- --model-path /path/to/Qwen3-0.6B --port 8000
