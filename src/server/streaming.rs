@@ -1,12 +1,17 @@
 //! OpenAI-compatible streaming response construction.
 
-use std::{collections::VecDeque, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::response::sse::Event;
 use futures_util::stream;
 use serde_json::{Value, json};
 
-use crate::{scheduler::FinishReason, tokenizer::TokenizerWorker};
+use crate::{logging::format_duration, scheduler::FinishReason, tokenizer::TokenizerWorker};
 
 use super::{
     manager::{IncrementalDetokenizer, RequestHandle},
@@ -125,9 +130,22 @@ struct StreamState {
     model: String,
     prompt_tokens: usize,
     completion_tokens: usize,
+    started_at: Instant,
     chat_output: Option<Box<dyn ChatOutputParser>>,
     events: VecDeque<Event>,
     done: bool,
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if !self.done {
+            tracing::warn!(
+                uid = self.handle.uid(),
+                duration_ms = %format_duration(self.started_at.elapsed()),
+                "stream disconnected before completion"
+            );
+        }
+    }
 }
 
 /// Streaming state is dropped on client disconnect; `RequestHandle` aborts it.
@@ -138,6 +156,7 @@ pub fn response_stream(
     model: String,
     prompt_tokens: usize,
     chat_output: Option<Box<dyn ChatOutputParser>>,
+    started_at: Instant,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     let mut events = VecDeque::new();
     if matches!(kind, ApiKind::Chat) {
@@ -155,6 +174,7 @@ pub fn response_stream(
         model,
         prompt_tokens,
         completion_tokens: 0,
+        started_at,
         events,
         done: false,
     };
@@ -172,6 +192,7 @@ pub fn response_stream(
                 Ok(None) => {
                     tracing::warn!(
                         uid = state.handle.uid(),
+                        duration_ms = %format_duration(state.started_at.elapsed()),
                         "stream ended because scheduler closed"
                     );
                     state
@@ -183,6 +204,7 @@ pub fn response_stream(
                 Err(_) => {
                     tracing::warn!(
                         uid = state.handle.uid(),
+                        duration_ms = %format_duration(state.started_at.elapsed()),
                         "stream timed out waiting for a token"
                     );
                     state
@@ -194,7 +216,11 @@ pub fn response_stream(
             };
             match token.finish_reason {
                 Some(FinishReason::Abort) => {
-                    tracing::warn!(uid = state.handle.uid(), "stream request aborted");
+                    tracing::warn!(
+                        uid = state.handle.uid(),
+                        duration_ms = %format_duration(state.started_at.elapsed()),
+                        "stream request aborted"
+                    );
                     state
                         .events
                         .push_back(event(error_chunk("Request aborted by the scheduler")));
@@ -202,7 +228,11 @@ pub fn response_stream(
                     break;
                 }
                 Some(FinishReason::Error) => {
-                    tracing::error!(uid = state.handle.uid(), "stream generation failed");
+                    tracing::error!(
+                        uid = state.handle.uid(),
+                        duration_ms = %format_duration(state.started_at.elapsed()),
+                        "stream generation failed"
+                    );
                     state
                         .events
                         .push_back(event(error_chunk("Request failed during generation")));
@@ -215,6 +245,12 @@ pub fn response_stream(
             let content = match state.detokenizer.add_token(token.token_id) {
                 Ok(content) => content,
                 Err(error) => {
+                    tracing::error!(
+                        uid = state.handle.uid(),
+                        duration_ms = %format_duration(state.started_at.elapsed()),
+                        error = %error,
+                        "stream detokenization failed"
+                    );
                     state
                         .events
                         .push_back(event(error_chunk(&error.to_string())));
@@ -239,12 +275,6 @@ pub fn response_stream(
             }
             if token.finished {
                 let finish_reason = token.finish_reason.unwrap_or(FinishReason::Stop);
-                tracing::info!(
-                    uid = state.handle.uid(),
-                    completion_tokens = state.completion_tokens,
-                    finish_reason = reason(finish_reason),
-                    "stream generation completed"
-                );
                 let finish_reason = if let Some(output) = &mut state.chat_output {
                     for delta in output.finish() {
                         state.events.push_back(event(chat_delta_chunk(
@@ -257,6 +287,13 @@ pub fn response_stream(
                 } else {
                     reason(finish_reason)
                 };
+                tracing::info!(
+                    uid = state.handle.uid(),
+                    completion_tokens = state.completion_tokens,
+                    finish_reason,
+                    duration_ms = %format_duration(state.started_at.elapsed()),
+                    "stream generation completed"
+                );
                 state.events.push_back(event(finish_chunk(
                     state.kind,
                     state.handle.uid(),

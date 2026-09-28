@@ -1,6 +1,6 @@
 //! Application-wide tracing setup with daily file rotation.
 
-use std::{error::Error, fmt, fs, path::PathBuf};
+use std::{error::Error, fmt, fs, path::PathBuf, time::Duration};
 
 use tracing::{Event, Subscriber};
 use tracing_appender::{
@@ -19,6 +19,10 @@ use tracing_subscriber::{
 };
 
 pub const SERVICE_NAME: &str = "llm-infer-rust";
+
+pub(crate) fn format_duration(duration: Duration) -> String {
+    format!("{:.3} s", duration.as_secs_f64())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggingConfig {
@@ -84,7 +88,7 @@ where
         SystemTime.format_time(&mut writer)?;
         write!(
             writer,
-            " service={} level={} ",
+            " | {} | {} | ",
             SERVICE_NAME,
             event.metadata().level()
         )?;
@@ -98,6 +102,12 @@ mod tests {
     use std::time::{SystemTime as StdSystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn formats_duration_in_seconds_with_millisecond_precision() {
+        assert_eq!(format_duration(Duration::from_millis(157)), "0.157 s");
+        assert_eq!(format_duration(Duration::from_millis(1234)), "1.234 s");
+    }
 
     #[test]
     fn writes_plain_file_and_ansi_terminal_logs() {
@@ -134,16 +144,19 @@ mod tests {
             .with(file_layer)
             .with(terminal_layer);
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(request_id = 7, "request accepted");
+            tracing::info!(request_id = 7, duration_ms = %format_duration(Duration::from_millis(157)), "request accepted");
         });
         drop(guard);
 
         let contents = fs::read_to_string(directory.join("file.log")).unwrap();
         let line = contents.lines().next().unwrap();
         assert!(line.split_whitespace().next().unwrap().contains('T'));
-        assert!(line.contains("service=llm-infer-rust level=INFO"));
+        assert!(line.contains(" | llm-infer-rust | INFO | request accepted request_id=7"));
+        assert!(!line.contains("service="));
+        assert!(!line.contains("level="));
         assert!(line.contains("request accepted"));
         assert!(line.contains("request_id=7"));
+        assert!(line.contains("duration_ms=0.157 s"));
         assert!(!line.contains('\u{1b}'));
 
         let terminal = fs::read_to_string(directory.join("terminal.log")).unwrap();
