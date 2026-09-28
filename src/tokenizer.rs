@@ -99,6 +99,24 @@ impl std::error::Error for TokenizerWorkerError {}
 
 pub type Result<T> = std::result::Result<T, TokenizerWorkerError>;
 
+/// Selects the chat renderer when the model's tokenizer is initialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplateKind {
+    /// Preserve standalone `TokenizerWorker::new` behavior.
+    Auto,
+    /// Render `tokenizer_config.json` with Minijinja when present.
+    Generic,
+    /// Use Qwen3's dedicated tool and reasoning template renderer.
+    Qwen3,
+}
+
+#[derive(Clone, Debug)]
+enum ChatTemplateRenderer {
+    Fallback,
+    Generic(Environment<'static>),
+    Qwen3,
+}
+
 /// Rust equivalent of mini-sglang's in-process tokenizer worker.
 ///
 /// `model_path` may point to a Hugging Face model directory (containing
@@ -106,7 +124,7 @@ pub type Result<T> = std::result::Result<T, TokenizerWorkerError>;
 #[derive(Clone, Debug)]
 pub struct TokenizerWorker {
     tokenizer: Tokenizer,
-    chat_template: Option<String>,
+    chat_template_renderer: ChatTemplateRenderer,
 }
 
 impl TokenizerWorker {
@@ -116,6 +134,15 @@ impl TokenizerWorker {
     /// safely reproduce Python's `trust_remote_code` extension mechanism, so
     /// requesting it returns an explicit error instead of silently ignoring it.
     pub fn new(model_path: impl AsRef<Path>, trust_remote_code: bool) -> Result<Self> {
+        Self::new_with_chat_template_kind(model_path, trust_remote_code, ChatTemplateKind::Auto)
+    }
+
+    /// Loads a tokenizer with a renderer chosen by the model assembly path.
+    pub fn new_with_chat_template_kind(
+        model_path: impl AsRef<Path>,
+        trust_remote_code: bool,
+        kind: ChatTemplateKind,
+    ) -> Result<Self> {
         if trust_remote_code {
             return Err(TokenizerWorkerError::UnsupportedRemoteCode);
         }
@@ -128,10 +155,14 @@ impl TokenizerWorker {
             }
         })?;
 
-        let chat_template = load_chat_template(&model_dir)?;
+        let chat_template = match kind {
+            ChatTemplateKind::Qwen3 => None,
+            ChatTemplateKind::Auto | ChatTemplateKind::Generic => load_chat_template(&model_dir)?,
+        };
+        let chat_template_renderer = choose_chat_template_renderer(chat_template, kind)?;
         Ok(Self {
             tokenizer,
-            chat_template,
+            chat_template_renderer,
         })
     }
 
@@ -189,8 +220,8 @@ impl TokenizerWorker {
         messages: &[ChatMessage],
         options: ChatTemplateOptions<'_>,
     ) -> Result<String> {
-        let Some(template_source) = &self.chat_template else {
-            return Ok(messages
+        match &self.chat_template_renderer {
+            ChatTemplateRenderer::Fallback => Ok(messages
                 .iter()
                 .filter_map(|message| {
                     message
@@ -199,42 +230,62 @@ impl TokenizerWorker {
                         .filter(|content| !content.is_empty())
                 })
                 .collect::<Vec<_>>()
-                .join("\n\n"));
-        };
-
-        // Qwen3's Hugging Face template uses Python string methods and a
-        // mutable Jinja namespace, neither of which Minijinja implements.
-        // Render Qwen3's full tool and reasoning branches directly.
-        if template_source.contains("namespace(multi_step_tool=true")
-            && template_source.contains("<|im_start|>")
-        {
-            return qwen3_template::render(messages, options);
+                .join("\n\n")),
+            ChatTemplateRenderer::Qwen3 => qwen3_template::render(messages, options),
+            ChatTemplateRenderer::Generic(environment) => {
+                render_generic_chat_template(environment, messages, options)
+            }
         }
-
-        let mut environment = Environment::new();
-        environment
-            .add_template("chat", template_source)
-            .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?;
-        let mut template_context = options.kwargs.cloned().unwrap_or_default();
-        template_context.insert(
-            "messages".to_owned(),
-            serde_json::to_value(messages)
-                .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?,
-        );
-        template_context.insert("tools".to_owned(), Value::Array(options.tools.to_vec()));
-        template_context.insert(
-            "add_generation_prompt".to_owned(),
-            Value::Bool(options.add_generation_prompt),
-        );
-        if let Some(enable_thinking) = options.effective_enable_thinking() {
-            template_context.insert("enable_thinking".to_owned(), Value::Bool(enable_thinking));
-        }
-        environment
-            .get_template("chat")
-            .expect("template was added immediately before lookup")
-            .render(template_context)
-            .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))
     }
+}
+
+fn choose_chat_template_renderer(
+    chat_template: Option<String>,
+    kind: ChatTemplateKind,
+) -> Result<ChatTemplateRenderer> {
+    if kind == ChatTemplateKind::Qwen3 {
+        return Ok(ChatTemplateRenderer::Qwen3);
+    }
+    let Some(template_source) = chat_template else {
+        return Ok(ChatTemplateRenderer::Fallback);
+    };
+    if kind == ChatTemplateKind::Auto
+        && template_source.contains("namespace(multi_step_tool=true")
+        && template_source.contains("<|im_start|>")
+    {
+        return Ok(ChatTemplateRenderer::Qwen3);
+    }
+    let mut environment = Environment::new();
+    environment
+        .add_template_owned("chat".to_owned(), template_source)
+        .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?;
+    Ok(ChatTemplateRenderer::Generic(environment))
+}
+
+fn render_generic_chat_template(
+    environment: &Environment<'_>,
+    messages: &[ChatMessage],
+    options: ChatTemplateOptions<'_>,
+) -> Result<String> {
+    let mut template_context = options.kwargs.cloned().unwrap_or_default();
+    template_context.insert(
+        "messages".to_owned(),
+        serde_json::to_value(messages)
+            .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?,
+    );
+    template_context.insert("tools".to_owned(), Value::Array(options.tools.to_vec()));
+    template_context.insert(
+        "add_generation_prompt".to_owned(),
+        Value::Bool(options.add_generation_prompt),
+    );
+    if let Some(enable_thinking) = options.effective_enable_thinking() {
+        template_context.insert("enable_thinking".to_owned(), Value::Bool(enable_thinking));
+    }
+    environment
+        .get_template("chat")
+        .expect("template was compiled during tokenizer initialization")
+        .render(template_context)
+        .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))
 }
 
 fn resolve_tokenizer_path(model_path: &Path) -> (PathBuf, PathBuf) {
@@ -294,7 +345,11 @@ mod tests {
         .expect("test tokenizer must deserialize");
         TokenizerWorker {
             tokenizer,
-            chat_template: chat_template.map(str::to_owned),
+            chat_template_renderer: choose_chat_template_renderer(
+                chat_template.map(str::to_owned),
+                ChatTemplateKind::Auto,
+            )
+            .unwrap(),
         }
     }
 
@@ -354,6 +409,29 @@ mod tests {
             worker.apply_chat_template(&messages, true).unwrap(),
             "<|im_start|>system\nHelpful.<|im_end|>\n<|im_start|>user\nSay hi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn explicit_qwen3_selection_does_not_depend_on_template_text() {
+        let mut worker = worker(None);
+        worker.chat_template_renderer =
+            choose_chat_template_renderer(Some("{% if".to_owned()), ChatTemplateKind::Qwen3)
+                .unwrap();
+        let rendered = worker
+            .apply_chat_template(&[ChatMessage::new("user", "Say hi")], true)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nSay hi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn generic_template_is_compiled_during_initialization() {
+        let error =
+            choose_chat_template_renderer(Some("{% if".to_owned()), ChatTemplateKind::Generic)
+                .unwrap_err();
+        assert!(matches!(error, TokenizerWorkerError::RenderChatTemplate(_)));
     }
 
     #[test]

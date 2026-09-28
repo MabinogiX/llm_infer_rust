@@ -2,6 +2,7 @@
 
 mod api;
 mod cli;
+mod components;
 mod manager;
 pub mod output;
 mod schemas;
@@ -10,6 +11,7 @@ mod streaming;
 
 pub use api::router;
 pub use cli::{USAGE, parse_args};
+pub use components::{ServeComponents, build_components};
 pub use manager::{FrontendManager, IncrementalDetokenizer, ManagerError, RequestHandle};
 pub use schemas::{ChatCompletionRequest, CompletionRequest};
-pub use serve::{ServeArgs, ServeComponents, ServeError, build_components, serve};
+pub use serve::{ServeArgs, ServeError, serve};

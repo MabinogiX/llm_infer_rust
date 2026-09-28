@@ -5,17 +5,15 @@ use std::{fmt, io, net::SocketAddr};
 use tokio::net::TcpListener;
 
 use crate::{
-    engine::{Engine, EngineError, ModelArgs, ServerArgs},
+    engine::{EngineError, ServerArgs},
     logging::LoggingConfig,
-    models::Qwen3Factory,
-    scheduler::{Scheduler, SchedulerError},
-    tokenizer::{TokenizerWorker, TokenizerWorkerError},
+    scheduler::SchedulerError,
+    tokenizer::TokenizerWorkerError,
 };
 
 use super::{
     api,
     manager::{FrontendManager, ManagerError},
-    output::{ChatOutputParserConstructor, new_qwen3_output_parser},
 };
 
 /// HTTP binding and engine settings for one model server.
@@ -36,13 +34,6 @@ impl ServeArgs {
     }
 }
 
-/// The initialized components handed to the HTTP frontend.
-pub struct ServeComponents {
-    pub scheduler: Scheduler,
-    pub tokenizer: TokenizerWorker,
-    pub output_parser_constructor: ChatOutputParserConstructor,
-}
-
 #[derive(Debug)]
 pub enum ServeError {
     Engine(EngineError),
@@ -50,6 +41,10 @@ pub enum ServeError {
     Tokenizer(TokenizerWorkerError),
     Io(io::Error),
     Frontend(ManagerError),
+    UnsupportedModel {
+        model_type: String,
+        architectures: Vec<String>,
+    },
 }
 
 impl fmt::Display for ServeError {
@@ -60,30 +55,18 @@ impl fmt::Display for ServeError {
             Self::Tokenizer(error) => write!(f, "tokenizer 初始化失败: {error}"),
             Self::Io(error) => write!(f, "HTTP 服务失败: {error}"),
             Self::Frontend(error) => write!(f, "frontend 启动失败: {error}"),
+            Self::UnsupportedModel {
+                model_type,
+                architectures,
+            } => write!(
+                f,
+                "不支持的模型: model_type={model_type}, architectures={architectures:?}"
+            ),
         }
     }
 }
 
 impl std::error::Error for ServeError {}
-
-/// Load model metadata, tokenizer and weights, then create the scheduler.
-pub fn build_components(args: &ServeArgs) -> Result<ServeComponents, ServeError> {
-    let model_args =
-        ModelArgs::from_pretrained(&args.engine.model_path).map_err(ServeError::Engine)?;
-    let tokenizer = TokenizerWorker::new(&args.engine.model_path, args.engine.trust_remote_code)
-        .map_err(ServeError::Tokenizer)?;
-    let mut engine = Engine::new(args.engine.clone(), model_args, 0).map_err(ServeError::Engine)?;
-    engine
-        .build_model(&Qwen3Factory)
-        .map_err(ServeError::Engine)?;
-    engine.load_model_weights().map_err(ServeError::Engine)?;
-    let scheduler = Scheduler::new(engine).map_err(ServeError::Scheduler)?;
-    Ok(ServeComponents {
-        scheduler,
-        tokenizer,
-        output_parser_constructor: new_qwen3_output_parser,
-    })
-}
 
 /// Initialize the model on the scheduler thread, then serve the inference API.
 pub async fn serve(args: ServeArgs) -> Result<(), ServeError> {

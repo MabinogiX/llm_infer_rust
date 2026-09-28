@@ -24,6 +24,8 @@ cargo run -- --model-path /path/to/Qwen3-0.6B --port 8000
 
 `main.rs` 解析模型路径和服务参数，调用 `server::serve`。默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 修改。服务启动时加载模型与 tokenizer；加载失败会退出并显示原因。当前仅支持 CPU float32、`pt` attention 和 `tp-size 1`。
 
+模型组件统一放在 `src/server/components/`。启动时，`builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，只选择一次对应模型的组装模块；目前 `qwen3.rs` 组装 dense Qwen3 的 tokenizer、engine、scheduler 和输出解析器。不支持的模型会在加载权重前报错。接入新模型时，在该目录增加组装文件，并在 `builder.rs` 增加识别与分发分支；请求处理过程不切换模型。
+
 ```bash
 curl http://127.0.0.1:8000/health
 
@@ -153,4 +155,4 @@ let prompt = worker.apply_chat_template(
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-模型目录中的 `tokenizer_config.json` 若包含字符串形式的 `chat_template`，通用模板会以 Jinja 语法渲染，并提供 `messages`、`tools`、`add_generation_prompt` 及 `chat_template_kwargs`。Qwen3 模板使用与 Hugging Face 输出对照验证的 Rust 渲染器。没有模板时，保持 mini-sglang 原始实现的回退行为：以空行拼接非空消息内容。`trust_remote_code=true` 和非字符串模板配置会明确返回 `未实现` 错误；原生 Rust 加载器不会执行 Python 远程代码。
+模型目录中的 `tokenizer_config.json` 若包含字符串形式的 `chat_template`，通用模板会在初始化时编译为 Jinja 模板，并提供 `messages`、`tools`、`add_generation_prompt` 及 `chat_template_kwargs`。Qwen3 组件在启动时显式选择与 Hugging Face 输出对照验证的 Rust 渲染器；独立调用 `TokenizerWorker::new` 时保留一次性的模板自动识别。没有模板时，通用路径以空行拼接非空消息内容。`trust_remote_code=true` 不受支持；通用路径遇到非字符串模板配置会明确报错。原生 Rust 加载器不会执行 Python 远程代码。
