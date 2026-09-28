@@ -14,8 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
-mod qwen3_template;
-
 /// A chat message accepted by [`TokenizerWorker::apply_chat_template`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -52,7 +50,7 @@ pub struct ChatTemplateOptions<'a> {
 }
 
 impl ChatTemplateOptions<'_> {
-    fn effective_enable_thinking(self) -> Option<bool> {
+    pub(crate) fn effective_enable_thinking(self) -> Option<bool> {
         self.enable_thinking.or_else(|| {
             self.kwargs
                 .and_then(|kwargs| kwargs.get("enable_thinking"))
@@ -99,22 +97,26 @@ impl std::error::Error for TokenizerWorkerError {}
 
 pub type Result<T> = std::result::Result<T, TokenizerWorkerError>;
 
+/// Renderer supplied by a model implementation at startup.
+pub type ChatTemplateRenderFn =
+    for<'a> fn(&[ChatMessage], ChatTemplateOptions<'a>) -> Result<String>;
+
 /// Selects the chat renderer when the model's tokenizer is initialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum ChatTemplateKind {
     /// Preserve standalone `TokenizerWorker::new` behavior.
     Auto,
     /// Render `tokenizer_config.json` with Minijinja when present.
     Generic,
-    /// Use Qwen3's dedicated tool and reasoning template renderer.
-    Qwen3,
+    /// Use a renderer supplied by the selected model.
+    Custom(ChatTemplateRenderFn),
 }
 
 #[derive(Clone, Debug)]
 enum ChatTemplateRenderer {
     Fallback,
     Generic(Environment<'static>),
-    Qwen3,
+    Custom(ChatTemplateRenderFn),
 }
 
 /// Rust equivalent of mini-sglang's in-process tokenizer worker.
@@ -156,7 +158,7 @@ impl TokenizerWorker {
         })?;
 
         let chat_template = match kind {
-            ChatTemplateKind::Qwen3 => None,
+            ChatTemplateKind::Custom(_) => None,
             ChatTemplateKind::Auto | ChatTemplateKind::Generic => load_chat_template(&model_dir)?,
         };
         let chat_template_renderer = choose_chat_template_renderer(chat_template, kind)?;
@@ -231,7 +233,7 @@ impl TokenizerWorker {
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n")),
-            ChatTemplateRenderer::Qwen3 => qwen3_template::render(messages, options),
+            ChatTemplateRenderer::Custom(render) => render(messages, options),
             ChatTemplateRenderer::Generic(environment) => {
                 render_generic_chat_template(environment, messages, options)
             }
@@ -243,17 +245,16 @@ fn choose_chat_template_renderer(
     chat_template: Option<String>,
     kind: ChatTemplateKind,
 ) -> Result<ChatTemplateRenderer> {
-    if kind == ChatTemplateKind::Qwen3 {
-        return Ok(ChatTemplateRenderer::Qwen3);
+    if let ChatTemplateKind::Custom(render) = kind {
+        return Ok(ChatTemplateRenderer::Custom(render));
     }
     let Some(template_source) = chat_template else {
         return Ok(ChatTemplateRenderer::Fallback);
     };
-    if kind == ChatTemplateKind::Auto
-        && template_source.contains("namespace(multi_step_tool=true")
-        && template_source.contains("<|im_start|>")
+    if matches!(kind, ChatTemplateKind::Auto)
+        && let Some(render) = crate::models::registry::detect_chat_template(&template_source)
     {
-        return Ok(ChatTemplateRenderer::Qwen3);
+        return Ok(ChatTemplateRenderer::Custom(render));
     }
     let mut environment = Environment::new();
     environment
@@ -397,33 +398,20 @@ mod tests {
     }
 
     #[test]
-    fn renders_qwen3_role_content_template() {
-        let worker = worker(Some(
-            "{% set ns = namespace(multi_step_tool=true) %}<|im_start|>",
-        ));
-        let messages = [
-            ChatMessage::new("system", "Helpful."),
-            ChatMessage::new("user", "Say hi"),
-        ];
-        assert_eq!(
-            worker.apply_chat_template(&messages, true).unwrap(),
-            "<|im_start|>system\nHelpful.<|im_end|>\n<|im_start|>user\nSay hi<|im_end|>\n<|im_start|>assistant\n"
-        );
-    }
-
-    #[test]
-    fn explicit_qwen3_selection_does_not_depend_on_template_text() {
+    fn explicit_custom_selection_does_not_depend_on_template_text() {
+        fn render_custom(_: &[ChatMessage], _: ChatTemplateOptions<'_>) -> Result<String> {
+            Ok("custom".to_owned())
+        }
         let mut worker = worker(None);
-        worker.chat_template_renderer =
-            choose_chat_template_renderer(Some("{% if".to_owned()), ChatTemplateKind::Qwen3)
-                .unwrap();
+        worker.chat_template_renderer = choose_chat_template_renderer(
+            Some("{% if".to_owned()),
+            ChatTemplateKind::Custom(render_custom),
+        )
+        .unwrap();
         let rendered = worker
             .apply_chat_template(&[ChatMessage::new("user", "Say hi")], true)
             .unwrap();
-        assert_eq!(
-            rendered,
-            "<|im_start|>user\nSay hi<|im_end|>\n<|im_start|>assistant\n"
-        );
+        assert_eq!(rendered, "custom");
     }
 
     #[test]

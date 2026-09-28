@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use super::ChatOutputParser;
+use crate::server::output::ChatOutputParser;
 
 const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";

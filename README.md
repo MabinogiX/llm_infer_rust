@@ -24,7 +24,7 @@ cargo run -- --model-path /path/to/Qwen3-0.6B --port 8000
 
 `main.rs` 解析模型路径和服务参数，调用 `server::serve`。默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 修改。服务启动时加载模型与 tokenizer；加载失败会退出并显示原因。当前仅支持 CPU float32、`pt` attention 和 `tp-size 1`。
 
-模型组件统一放在 `src/server/components/`。启动时，`builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，只选择一次对应模型的组装模块；目前 `qwen3.rs` 组装 dense Qwen3 的 tokenizer、engine、scheduler 和输出解析器。不支持的模型会在加载权重前报错。接入新模型时，在该目录增加组装文件，并在 `builder.rs` 增加识别与分发分支；请求处理过程不切换模型。
+模型专有代码集中在 `src/models/<模型名>/`：`model.rs` 实现模型结构，`template.rs` 处理输入模板，`output.rs` 解析输出，`components.rs` 组装 tokenizer、engine、scheduler 和输出解析器。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择一次模型；不支持的模型会在加载权重前报错。新增模型时只需在 `src/models/` 下增加目录并登记，无须修改服务端和 tokenizer 的模型分支；请求处理过程不切换模型。
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -140,7 +140,7 @@ Qwen3 聊天模板支持请求中的 `tools` 完整 JSON 定义、消息的 `too
 
 聊天响应会把模型生成的 `<think>...</think>` 解析为 `reasoning_content`，把完整且合法的 `<tool_call>...</tool_call>` JSON 解析为 `tool_calls`。纯工具调用的 `content` 为 `null`；正常停止且包含工具调用时，`finish_reason` 为 `tool_calls`。SSE 将思考、正文和完整工具调用分别放在 `delta` 中，工具调用的 `function.arguments` 是 JSON 字符串。未闭合或无效的工具调用标签保留为正文。`/v1/completions` 继续返回原始生成文本。
 
-输出解析器位于 `src/server/output/`：`ChatOutputParser` 保存单个请求的解析状态。服务启动时在 `build_components` 中选择一次解析器构造函数；当前选择 `new_qwen3_output_parser`。每个请求调用这个固定函数创建独立状态，因此并发流不会混用尚未闭合的标签。新增模型时，实现解析器并在模型初始化分支中选择其构造函数，API 和 SSE 路径无需改动。
+`src/server/output/` 定义通用的 `ChatOutputParser` 接口；Qwen3 实现位于 `src/models/qwen3/output.rs`，保存单个请求的解析状态。服务启动时在 `build_components` 中选择一次解析器构造函数；每个请求调用这个固定函数创建独立状态，因此并发流不会混用尚未闭合的标签。新增模型时，在其模型目录中实现解析器并接入组件组装，API 和 SSE 路径无需改动。
 
 ```rust
 use sglang_rust::tokenizer::{ChatMessage, TokenizerWorker};

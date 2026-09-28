@@ -2,12 +2,16 @@
 
 use serde_json::Value;
 
-use super::{ChatMessage, ChatTemplateOptions, Result, TokenizerWorkerError};
+use crate::tokenizer::{ChatMessage, ChatTemplateOptions, Result, TokenizerWorkerError};
 
 const TOOL_INSTRUCTIONS: &str = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>";
 const TOOL_SUFFIX: &str = "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n";
 
-pub(super) fn render(messages: &[ChatMessage], options: ChatTemplateOptions<'_>) -> Result<String> {
+pub(crate) fn matches_chat_template(source: &str) -> bool {
+    source.contains("namespace(multi_step_tool=true") && source.contains("<|im_start|>")
+}
+
+pub(crate) fn render(messages: &[ChatMessage], options: ChatTemplateOptions<'_>) -> Result<String> {
     if messages.is_empty() {
         return Err(template_error("messages 不能为空"));
     }
@@ -218,9 +222,10 @@ mod tests {
 
     #[test]
     fn matches_hugging_face_qwen3_chat_template() {
-        let cases: Vec<GoldenCase> =
-            serde_json::from_str(include_str!("../../tests/fixtures/qwen3_chat_golden.json"))
-                .unwrap();
+        let cases: Vec<GoldenCase> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/qwen3_chat_golden.json"
+        ))
+        .unwrap();
         for case in cases {
             let actual = render(
                 &case.messages,
