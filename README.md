@@ -90,7 +90,7 @@ Attention 通过 `ServerArgs::attention_backend` 选择后端，当前默认且�
 
 `src/tokenizer.rs` 使用 Hugging Face 的原生 Rust `tokenizers` crate 加载模型目录中的 `tokenizer.json`，不需要 Python 或 `transformers` 运行时：
 
-Qwen3 聊天模板当前支持 HTTP 请求中的 `role`/`content` 消息和连续 `tool` 消息；完整 Hugging Face 模板中的工具定义与扩展字段仍需后续迁移。
+Qwen3 聊天模板支持请求中的 `tools` 完整 JSON 定义、消息的 `tool_calls`（OpenAI 嵌套结构或直接结构）、`reasoning_content`、可为空的 `content`、连续 `tool` 响应，以及 `enable_thinking` / `chat_template_kwargs.enable_thinking`。其他消息扩展字段会保留并传给通用 Jinja 模板。当前生成响应仍返回文本，不解析模型输出为结构化 `tool_calls`。
 
 ```rust
 use sglang_rust::tokenizer::{ChatMessage, TokenizerWorker};
@@ -105,4 +105,4 @@ let prompt = worker.apply_chat_template(
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-模型目录中的 `tokenizer_config.json` 若包含字符串形式的 `chat_template`，会以 Jinja 语法渲染，并提供 `messages` 与 `add_generation_prompt`。没有模板时，保持 mini-sglang 原始实现的回退行为：以空行拼接非空消息内容。`trust_remote_code=true` 和非字符串模板配置会明确返回 `未实现` 错误；原生 Rust 加载器不会执行 Python 远程代码。
+模型目录中的 `tokenizer_config.json` 若包含字符串形式的 `chat_template`，通用模板会以 Jinja 语法渲染，并提供 `messages`、`tools`、`add_generation_prompt` 及 `chat_template_kwargs`。Qwen3 模板使用与 Hugging Face 输出对照验证的 Rust 渲染器。没有模板时，保持 mini-sglang 原始实现的回退行为：以空行拼接非空消息内容。`trust_remote_code=true` 和非字符串模板配置会明确返回 `未实现` 错误；原生 Rust 加载器不会执行 Python 远程代码。

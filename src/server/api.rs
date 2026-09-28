@@ -12,6 +12,7 @@ use axum::{
 use serde_json::{Value, json};
 
 use crate::scheduler::FinishReason;
+use crate::tokenizer::ChatTemplateOptions;
 
 use super::{
     manager::{FrontendManager, RequestHandle},
@@ -60,7 +61,15 @@ async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let prompt = frontend
         .tokenizer()
-        .apply_chat_template(&request.messages, true)
+        .apply_chat_template_with_options(
+            &request.messages,
+            ChatTemplateOptions {
+                add_generation_prompt: true,
+                tools: &request.tools,
+                enable_thinking: request.enable_thinking,
+                kwargs: Some(&request.chat_template_kwargs),
+            },
+        )
         .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     let input_ids = frontend
         .tokenizer()

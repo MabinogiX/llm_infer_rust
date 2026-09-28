@@ -1,6 +1,7 @@
 //! OpenAI-compatible request shapes accepted by the HTTP frontend.
 
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use crate::{engine::SamplingParams, tokenizer::ChatMessage};
 
@@ -25,6 +26,12 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_model")]
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub chat_template_kwargs: Map<String, Value>,
     #[serde(default)]
     pub temperature: f64,
     #[serde(default = "default_top_p")]
@@ -88,5 +95,42 @@ mod tests {
         let params = sampling_params(0.0, 2.0, -1, -4, false);
         assert_eq!(params.max_tokens, 1);
         assert_eq!(params.top_p, 1.0);
+    }
+
+    #[test]
+    fn preserves_tools_tool_calls_and_template_kwargs() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages": [{
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "checking",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": {"city": "北京"}}
+                    }],
+                    "tool_call_id": "previous_call"
+                }],
+                "tools": [{"type": "function", "function": {
+                    "name": "lookup", "parameters": {"type": "object"}
+                }}],
+                "chat_template_kwargs": {"enable_thinking": false, "custom_key": "value"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(request.messages[0].content, None);
+        assert_eq!(
+            request.messages[0].reasoning_content.as_deref(),
+            Some("checking")
+        );
+        assert_eq!(
+            request.messages[0].tool_calls.as_ref().unwrap()[0]["id"],
+            "call_1"
+        );
+        assert_eq!(request.messages[0].extra["tool_call_id"], "previous_call");
+        assert_eq!(request.tools[0]["function"]["name"], "lookup");
+        assert_eq!(request.chat_template_kwargs["enable_thinking"], false);
+        assert_eq!(request.chat_template_kwargs["custom_key"], "value");
     }
 }

@@ -9,23 +9,55 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use minijinja::{Environment, context};
+use minijinja::Environment;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
+mod qwen3_template;
+
 /// A chat message accepted by [`TokenizerWorker::apply_chat_template`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<Value>>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl ChatMessage {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
-            content: content.into(),
+            content: Some(content.into()),
+            reasoning_content: None,
+            tool_calls: None,
+            extra: Map::new(),
         }
+    }
+}
+
+/// Additional values passed to a model's chat template.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChatTemplateOptions<'a> {
+    pub add_generation_prompt: bool,
+    pub tools: &'a [Value],
+    pub enable_thinking: Option<bool>,
+    pub kwargs: Option<&'a Map<String, Value>>,
+}
+
+impl ChatTemplateOptions<'_> {
+    fn effective_enable_thinking(self) -> Option<bool> {
+        self.enable_thinking.or_else(|| {
+            self.kwargs
+                .and_then(|kwargs| kwargs.get("enable_thinking"))
+                .and_then(Value::as_bool)
+        })
     }
 }
 
@@ -143,11 +175,28 @@ impl TokenizerWorker {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String> {
+        self.apply_chat_template_with_options(
+            messages,
+            ChatTemplateOptions {
+                add_generation_prompt,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn apply_chat_template_with_options(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions<'_>,
+    ) -> Result<String> {
         let Some(template_source) = &self.chat_template else {
             return Ok(messages
                 .iter()
                 .filter_map(|message| {
-                    (!message.content.is_empty()).then_some(message.content.as_str())
+                    message
+                        .content
+                        .as_deref()
+                        .filter(|content| !content.is_empty())
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n"));
@@ -155,97 +204,37 @@ impl TokenizerWorker {
 
         // Qwen3's Hugging Face template uses Python string methods and a
         // mutable Jinja namespace, neither of which Minijinja implements.
-        // The HTTP schema carries role/content only, so render that supported
-        // subset directly instead of returning an error for ordinary chat.
+        // Render Qwen3's full tool and reasoning branches directly.
         if template_source.contains("namespace(multi_step_tool=true")
             && template_source.contains("<|im_start|>")
         {
-            return render_qwen3_chat(messages, add_generation_prompt);
+            return qwen3_template::render(messages, options);
         }
 
         let mut environment = Environment::new();
         environment
             .add_template("chat", template_source)
             .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?;
+        let mut template_context = options.kwargs.cloned().unwrap_or_default();
+        template_context.insert(
+            "messages".to_owned(),
+            serde_json::to_value(messages)
+                .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?,
+        );
+        template_context.insert("tools".to_owned(), Value::Array(options.tools.to_vec()));
+        template_context.insert(
+            "add_generation_prompt".to_owned(),
+            Value::Bool(options.add_generation_prompt),
+        );
+        if let Some(enable_thinking) = options.effective_enable_thinking() {
+            template_context.insert("enable_thinking".to_owned(), Value::Bool(enable_thinking));
+        }
         environment
             .get_template("chat")
             .expect("template was added immediately before lookup")
-            .render(context!(messages => messages, add_generation_prompt => add_generation_prompt))
+            .render(template_context)
             .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))
     }
-}
-
-fn render_qwen3_chat(messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
-    if messages.is_empty() {
-        return Err(TokenizerWorkerError::RenderChatTemplate(
-            "messages 不能为空".to_owned(),
-        ));
-    }
-    let last_query = messages
-        .iter()
-        .rposition(|message| {
-            message.role == "user"
-                && !(message.content.starts_with("<tool_response>")
-                    && message.content.ends_with("</tool_response>"))
-        })
-        .unwrap_or(messages.len() - 1);
-    let mut rendered = String::new();
-    let mut index = 0;
-    while index < messages.len() {
-        let message = &messages[index];
-        match message.role.as_str() {
-            "system" | "user" | "assistant" => {
-                rendered.push_str("<|im_start|>");
-                rendered.push_str(&message.role);
-                rendered.push('\n');
-                if message.role == "assistant" && index > last_query {
-                    let (reasoning, content) = match message.content.split_once("</think>") {
-                        Some((reasoning, content)) => (
-                            reasoning
-                                .rsplit("<think>")
-                                .next()
-                                .unwrap_or(reasoning)
-                                .trim_matches('\n'),
-                            content.trim_start_matches('\n'),
-                        ),
-                        None => ("", message.content.as_str()),
-                    };
-                    if index == messages.len() - 1 || !reasoning.is_empty() {
-                        rendered.push_str("<think>\n");
-                        rendered.push_str(reasoning);
-                        rendered.push_str("\n</think>\n\n");
-                        rendered.push_str(content);
-                    } else {
-                        rendered.push_str(&message.content);
-                    }
-                } else {
-                    rendered.push_str(&message.content);
-                }
-                rendered.push_str("<|im_end|>\n");
-            }
-            "tool" => {
-                rendered.push_str("<|im_start|>user");
-                while index < messages.len() && messages[index].role == "tool" {
-                    rendered.push_str("\n<tool_response>\n");
-                    rendered.push_str(&messages[index].content);
-                    rendered.push_str("\n</tool_response>");
-                    index += 1;
-                }
-                rendered.push_str("<|im_end|>\n");
-                continue;
-            }
-            role => {
-                return Err(TokenizerWorkerError::RenderChatTemplate(format!(
-                    "不支持的 Qwen3 消息角色: {role}"
-                )));
-            }
-        }
-        index += 1;
-    }
-    if add_generation_prompt {
-        rendered.push_str("<|im_start|>assistant\n");
-    }
-    Ok(rendered)
 }
 
 fn resolve_tokenizer_path(model_path: &Path) -> (PathBuf, PathBuf) {
@@ -365,5 +354,24 @@ mod tests {
             worker.apply_chat_template(&messages, true).unwrap(),
             "<|im_start|>system\nHelpful.<|im_end|>\n<|im_start|>user\nSay hi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn passes_extended_kwargs_to_generic_template() {
+        let worker = worker(Some("{{ custom_key }}: {{ tools[0].function.name }}"));
+        let tools = [serde_json::json!({"type": "function", "function": {"name": "lookup"}})];
+        let kwargs = serde_json::from_str(r#"{"custom_key":"ready"}"#).unwrap();
+        let rendered = worker
+            .apply_chat_template_with_options(
+                &[ChatMessage::new("user", "hi")],
+                ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    tools: &tools,
+                    enable_thinking: None,
+                    kwargs: Some(&kwargs),
+                },
+            )
+            .unwrap();
+        assert_eq!(rendered, "ready: lookup");
     }
 }
