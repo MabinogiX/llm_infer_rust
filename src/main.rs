@@ -1,17 +1,21 @@
-use tokio::net::TcpListener;
-
-mod controllers;
-mod models;
-mod services;
+use sglang_rust::server::{USAGE, parse_args, serve};
 
 #[tokio::main]
 async fn main() {
-    let app = controllers::router();
-
-    let listener = TcpListener::bind("127.0.0.1:3000")
-        .await
-        .expect("无法绑定到 127.0.0.1:3000");
-
-    println!("API server listening on http://127.0.0.1:3000");
-    axum::serve(listener, app).await.expect("API server failed");
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{USAGE}");
+        return;
+    }
+    let args = match parse_args(argv) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = serve(args).await {
+        eprintln!("Server failed: {error}");
+        std::process::exit(1);
+    }
 }

@@ -381,11 +381,6 @@ fn validate_config(config: ModelArgs) -> Result<()> {
             "Qwen3 configuration dimensions must be greater than zero",
         ));
     }
-    if config.hidden_size != config.num_attention_heads * config.head_dim {
-        return Err(model_error(
-            "hidden_size must equal num_attention_heads * head_dim",
-        ));
-    }
     if config.num_attention_heads % config.num_kv_heads != 0 {
         return Err(model_error(
             "num_attention_heads must be divisible by num_kv_heads",
@@ -528,6 +523,22 @@ mod tests {
                 &Tensor::from_slice(&[0i64, 1, 2]),
                 None,
                 Some(&Tensor::from_slice(&[2i64])),
+            )
+            .unwrap();
+        assert_eq!(logits.size(), vec![1, 8]);
+    }
+
+    #[test]
+    fn allows_qwen3_attention_width_to_exceed_hidden_size() {
+        let mut config = config();
+        config.head_dim = 4;
+        let model = Qwen3ForCausalLM::new(config, Kind::Float, Device::Cpu).unwrap();
+        let logits = model
+            .forward(
+                &Tensor::from_slice(&[1i64]),
+                &Tensor::from_slice(&[0i64]),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(logits.size(), vec![1, 8]);

@@ -3,4 +3,5 @@
 pub mod engine;
 pub mod models;
 pub mod scheduler;
+pub mod server;
 pub mod tokenizer;

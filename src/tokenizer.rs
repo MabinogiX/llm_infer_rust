@@ -153,6 +153,16 @@ impl TokenizerWorker {
                 .join("\n\n"));
         };
 
+        // Qwen3's Hugging Face template uses Python string methods and a
+        // mutable Jinja namespace, neither of which Minijinja implements.
+        // The HTTP schema carries role/content only, so render that supported
+        // subset directly instead of returning an error for ordinary chat.
+        if template_source.contains("namespace(multi_step_tool=true")
+            && template_source.contains("<|im_start|>")
+        {
+            return render_qwen3_chat(messages, add_generation_prompt);
+        }
+
         let mut environment = Environment::new();
         environment
             .add_template("chat", template_source)
@@ -163,6 +173,79 @@ impl TokenizerWorker {
             .render(context!(messages => messages, add_generation_prompt => add_generation_prompt))
             .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))
     }
+}
+
+fn render_qwen3_chat(messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
+    if messages.is_empty() {
+        return Err(TokenizerWorkerError::RenderChatTemplate(
+            "messages 不能为空".to_owned(),
+        ));
+    }
+    let last_query = messages
+        .iter()
+        .rposition(|message| {
+            message.role == "user"
+                && !(message.content.starts_with("<tool_response>")
+                    && message.content.ends_with("</tool_response>"))
+        })
+        .unwrap_or(messages.len() - 1);
+    let mut rendered = String::new();
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        match message.role.as_str() {
+            "system" | "user" | "assistant" => {
+                rendered.push_str("<|im_start|>");
+                rendered.push_str(&message.role);
+                rendered.push('\n');
+                if message.role == "assistant" && index > last_query {
+                    let (reasoning, content) = match message.content.split_once("</think>") {
+                        Some((reasoning, content)) => (
+                            reasoning
+                                .rsplit("<think>")
+                                .next()
+                                .unwrap_or(reasoning)
+                                .trim_matches('\n'),
+                            content.trim_start_matches('\n'),
+                        ),
+                        None => ("", message.content.as_str()),
+                    };
+                    if index == messages.len() - 1 || !reasoning.is_empty() {
+                        rendered.push_str("<think>\n");
+                        rendered.push_str(reasoning);
+                        rendered.push_str("\n</think>\n\n");
+                        rendered.push_str(content);
+                    } else {
+                        rendered.push_str(&message.content);
+                    }
+                } else {
+                    rendered.push_str(&message.content);
+                }
+                rendered.push_str("<|im_end|>\n");
+            }
+            "tool" => {
+                rendered.push_str("<|im_start|>user");
+                while index < messages.len() && messages[index].role == "tool" {
+                    rendered.push_str("\n<tool_response>\n");
+                    rendered.push_str(&messages[index].content);
+                    rendered.push_str("\n</tool_response>");
+                    index += 1;
+                }
+                rendered.push_str("<|im_end|>\n");
+                continue;
+            }
+            role => {
+                return Err(TokenizerWorkerError::RenderChatTemplate(format!(
+                    "不支持的 Qwen3 消息角色: {role}"
+                )));
+            }
+        }
+        index += 1;
+    }
+    if add_generation_prompt {
+        rendered.push_str("<|im_start|>assistant\n");
+    }
+    Ok(rendered)
 }
 
 fn resolve_tokenizer_path(model_path: &Path) -> (PathBuf, PathBuf) {
@@ -267,5 +350,20 @@ mod tests {
     fn rejects_out_of_range_token_ids() {
         let error = worker(None).decode(&[-1], true).unwrap_err();
         assert_eq!(error, TokenizerWorkerError::InvalidTokenId(-1));
+    }
+
+    #[test]
+    fn renders_qwen3_role_content_template() {
+        let worker = worker(Some(
+            "{% set ns = namespace(multi_step_tool=true) %}<|im_start|>",
+        ));
+        let messages = [
+            ChatMessage::new("system", "Helpful."),
+            ChatMessage::new("user", "Say hi"),
+        ];
+        assert_eq!(
+            worker.apply_chat_template(&messages, true).unwrap(),
+            "<|im_start|>system\nHelpful.<|im_end|>\n<|im_start|>user\nSay hi<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 }
