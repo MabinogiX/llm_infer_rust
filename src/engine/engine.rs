@@ -29,6 +29,8 @@ pub struct ServerArgs {
     pub tp_size: usize,
     pub memory_ratio: f64,
     pub max_running_req: usize,
+    /// Maximum captured decode batch size. None uses max_running_req; zero disables capture.
+    pub cuda_graph_bs: Option<usize>,
     pub max_seq_len: usize,
     pub page_size: usize,
     pub dtype: String,
@@ -44,6 +46,7 @@ impl ServerArgs {
             tp_size: 1,
             memory_ratio: 0.9,
             max_running_req: 256,
+            cuda_graph_bs: None,
             max_seq_len: 8192,
             page_size: 16,
             dtype: "auto".to_owned(),
@@ -284,6 +287,7 @@ impl Engine {
 
         let mut engine = Self::with_runtime(server_args, model_args, tp_rank, kind, device)?;
         engine.attach_model_runner(runner)?;
+        engine.capture_graphs()?;
         tracing::info!(?device, ?kind, "model loaded for inference");
         Ok(engine)
     }
@@ -370,7 +374,7 @@ impl Engine {
         self.kv_cache_pool.clone().ok_or(EngineError::Released)
     }
 
-    /// Binds the migrated eager execution path after the Rust model is built.
+    /// Binds the Rust model and its KV cache views.
     pub fn attach_model_runner(&mut self, model_runner: ModelRunner) -> Result<()> {
         self.ensure_live()?;
         if model_runner.device() != self.device {
@@ -412,11 +416,29 @@ impl Engine {
         let weights = load_hf_safetensors(&self.server_args.model_path).map_err(|error| {
             EngineError::InvalidArgument(format!("Hugging Face 权重加载失败: {error}"))
         })?;
-        Ok(self
+        let loaded = self
             .model_runner
             .as_mut()
             .ok_or(EngineError::ModelRunnerNotAttached)?
-            .load_weights(weights)?)
+            .load_weights(weights)?;
+        self.capture_graphs()?;
+        Ok(loaded)
+    }
+
+    /// Capture decode only after the final weight tensors and KV views are bound.
+    pub fn capture_graphs(&mut self) -> Result<()> {
+        self.ensure_live()?;
+        tracing::info!(
+            device = ?self.device,
+            max_batch_size = self.server_args.cuda_graph_bs.unwrap_or(self.server_args.max_running_req),
+            "initializing decode graph runner"
+        );
+        let pool = self.shared_kv_cache_pool()?;
+        self.model_runner
+            .as_mut()
+            .ok_or(EngineError::ModelRunnerNotAttached)?
+            .capture_graphs(&self.server_args, pool)?;
+        Ok(())
     }
 
     /// Releases Rust-owned accelerator memory. Calling it repeatedly is safe.

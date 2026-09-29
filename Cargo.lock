@@ -1659,6 +1659,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-valid",
+ "cc",
  "futures-util",
  "minijinja",
  "serde",

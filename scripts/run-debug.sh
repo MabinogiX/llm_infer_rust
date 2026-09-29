@@ -80,4 +80,8 @@ if [[ "${target_dir}" != /* ]]; then
 fi
 
 echo "正在启动服务（默认 max-running-req=4、max-seq-len=512；可用命令行参数覆盖）..."
-exec env "${runtime_env[@]}" "${target_dir}/debug/sglang-rust" --max-running-req 4 --max-seq-len 512 "${server_args[@]}"
+set -- "${target_dir}/debug/sglang-rust" --max-running-req 4 --max-seq-len 512 "${server_args[@]}"
+if [[ -n "${runtime_env[0]-}" ]]; then
+    exec env "${runtime_env[@]}" "$@"
+fi
+exec "$@"

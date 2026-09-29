@@ -1,8 +1,8 @@
 //! Per-layer paged KV-cache binding, writes, and reads.
 
-use tch::{Device, Tensor};
+use tch::{Device, Kind, Tensor};
 
-use crate::engine::ModelRunnerError;
+use crate::engine::{BatchPhase, ModelRunnerError};
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
@@ -32,7 +32,13 @@ impl BaseAttention {
 
     /// Writes `(tokens, kv_heads, head_dim)` K/V values to flattened page slots.
     /// `-1` write locations are deliberately skipped.
-    pub fn write_kv(&mut self, k: &Tensor, v: &Tensor, write_loc: Option<&Tensor>) -> Result<()> {
+    pub fn write_kv(
+        &mut self,
+        k: &Tensor,
+        v: &Tensor,
+        write_loc: Option<&Tensor>,
+        phase: BatchPhase,
+    ) -> Result<()> {
         let (Some(k_cache), Some(v_cache), Some(write_loc)) =
             (&mut self.k_cache, &mut self.v_cache, write_loc)
         else {
@@ -43,9 +49,7 @@ impl BaseAttention {
                 "K/V input must have matching (tokens, kv_heads, head_dim) shapes",
             ));
         }
-        let locations = Vec::<i32>::try_from(&write_loc.to_device(Device::Cpu))
-            .map_err(ModelRunnerError::Torch)?;
-        if locations.len() != k.size()[0] as usize {
+        if write_loc.numel() != k.size()[0] as usize {
             return Err(model_error(
                 "write_loc length must equal the number of K/V tokens",
             ));
@@ -56,6 +60,20 @@ impl BaseAttention {
                 "K/V input head shape does not match the bound cache",
             ));
         }
+
+        // Decode locations are checked by the scheduler while still on the
+        // host. Keep the CUDA path free of device-to-host synchronization.
+        if phase == BatchPhase::Decode && matches!(k_cache.device(), Device::Cuda(_)) {
+            let indices = write_loc.to_kind(Kind::Int64);
+            let mut flat_k = k_cache.view([-1, flat_size[2], flat_size[3]]);
+            let mut flat_v = v_cache.view([-1, flat_size[2], flat_size[3]]);
+            let _ = flat_k.index_copy_(0, &indices, k);
+            let _ = flat_v.index_copy_(0, &indices, v);
+            return Ok(());
+        }
+
+        let locations = Vec::<i32>::try_from(&write_loc.to_device(Device::Cpu))
+            .map_err(ModelRunnerError::Torch)?;
 
         let capacity = flat_size[0] * flat_size[1];
         let mut cache_indices = Vec::new();
@@ -132,6 +150,22 @@ impl BaseAttention {
             flat_v.index_select(0, &indices),
         ))
     }
+
+    /// Gather a fixed number of cache slots per request without CPU reads.
+    pub fn read_kv_padded(&self, indices: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (Some(k_cache), Some(v_cache)) = (&self.k_cache, &self.v_cache) else {
+            return Err(model_error("paged-KV attention requires a bound KV cache"));
+        };
+        let shape = k_cache.size();
+        let output_shape = [indices.size()[0], indices.size()[1], shape[2], shape[3]];
+        let flat_k = k_cache.view([-1, shape[2], shape[3]]);
+        let flat_v = v_cache.view([-1, shape[2], shape[3]]);
+        let flat_indices = indices.view([-1]);
+        Ok((
+            flat_k.index_select(0, &flat_indices).view(output_shape),
+            flat_v.index_select(0, &flat_indices).view(output_shape),
+        ))
+    }
 }
 
 fn model_error(message: &str) -> ModelRunnerError {
@@ -156,7 +190,12 @@ mod tests {
         let k = Tensor::from_slice(&[1f32, 2., 3., 4.]).view([2, 1, 2]);
         let v = Tensor::from_slice(&[5f32, 6., 7., 8.]).view([2, 1, 2]);
         attention
-            .write_kv(&k, &v, Some(&Tensor::from_slice(&[1i32, 3])))
+            .write_kv(
+                &k,
+                &v,
+                Some(&Tensor::from_slice(&[1i32, 3])),
+                BatchPhase::Prefill,
+            )
             .unwrap();
         let table = Tensor::from_slice(&[1i32, 3]).view([1, 2]);
         let (cached_k, cached_v) = attention.read_kv(&table, 0, 2).unwrap();

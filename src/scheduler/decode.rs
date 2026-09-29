@@ -97,6 +97,13 @@ impl DecodeManager {
                 .map(|&page| self.cache_location(page, (len - 1) % self.page_size))
                 .transpose()?
                 .unwrap_or(-1);
+            if location < 0 {
+                return Err(SchedulerError::InvalidDecode(format!(
+                    "request {} has no writable KV page for position {}",
+                    request.uid,
+                    len - 1
+                )));
+            }
             write_loc.push(location);
 
             if let Some(handle) = handle {
