@@ -20,8 +20,8 @@ Options:\n\
   --max-seq-len N           Maximum sequence length (default 8192)\n\
   --page-size N             KV cache page size (default 16)\n\
   --attention-backend NAME  Attention backend (default pt)\n\
-  --dtype NAME              Model dtype (currently CPU float32)\n\
-  --device NAME             Device (currently cpu/auto)\n\
+  --dtype NAME              Model dtype (currently float32)\n\
+  --device NAME             Device: auto, cpu, or cuda (default auto)\n\
   --trust-remote-code       Request Hugging Face remote code\n\
   --log-dir PATH            Log directory (default logs)\n\
   --log-level LEVEL         trace/debug/info/warn/error (default info)\n\
@@ -53,15 +53,16 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--dtype" => {
                 let dtype = value()?;
                 if dtype != "auto" && dtype != "float32" {
-                    return Err("当前仅支持 CPU float32；--dtype 必须是 auto 或 float32".to_owned());
+                    return Err("当前仅支持 float32；--dtype 必须是 auto 或 float32".to_owned());
                 }
                 engine.dtype = dtype;
             }
             "--device" => {
                 let device = value()?;
-                if device != "auto" && device != "cpu" {
-                    return Err("当前仅支持 CPU；--device 必须是 auto 或 cpu".to_owned());
+                if device != "auto" && device != "cpu" && device != "cuda" {
+                    return Err("--device 必须是 auto、cpu 或 cuda".to_owned());
                 }
+                engine.device = device;
             }
             "--trust-remote-code" => engine.trust_remote_code = true,
             "--log-dir" => logging.directory = PathBuf::from(value()?),
@@ -96,7 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_model_server_address_and_rejects_unsupported_runtime() {
+    fn parses_model_server_address_and_device() {
         let args = parse_args(["--model-path", "/tmp/model", "--port", "9001"].map(str::to_owned))
             .unwrap();
         assert_eq!(args.bind.port(), 9001);
@@ -118,8 +119,15 @@ mod tests {
             PathBuf::from("/tmp/minisgl-logs")
         );
         assert_eq!(logging_args.logging.level.as_deref(), Some("debug"));
+        assert_eq!(args.engine.device, "auto");
+        for device in ["cpu", "cuda"] {
+            let parsed =
+                parse_args(["--model-path", "/tmp/model", "--device", device].map(str::to_owned))
+                    .unwrap();
+            assert_eq!(parsed.engine.device, device);
+        }
         assert!(
-            parse_args(["--model-path", "/tmp/model", "--device", "cuda"].map(str::to_owned))
+            parse_args(["--model-path", "/tmp/model", "--device", "mps"].map(str::to_owned))
                 .is_err()
         );
     }

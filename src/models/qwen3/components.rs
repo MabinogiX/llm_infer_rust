@@ -27,11 +27,8 @@ pub(crate) fn build(args: &ServeArgs) -> Result<ServeComponents, ServeError> {
         ChatTemplateKind::Custom(render_chat_template),
     )
     .map_err(ServeError::Tokenizer)?;
-    let mut engine = Engine::new(args.engine.clone(), model_args, 0).map_err(ServeError::Engine)?;
-    engine
-        .build_model(&Qwen3Factory)
+    let engine = Engine::load_for_serving(args.engine.clone(), model_args, 0, &Qwen3Factory)
         .map_err(ServeError::Engine)?;
-    engine.load_model_weights().map_err(ServeError::Engine)?;
     let scheduler = Scheduler::new(engine).map_err(ServeError::Scheduler)?;
     Ok(ServeComponents {
         scheduler,

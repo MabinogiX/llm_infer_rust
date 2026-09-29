@@ -10,7 +10,7 @@ use std::{
     rc::Rc,
 };
 
-use tch::{Device, Kind, Tensor};
+use tch::{Cuda, Device, Kind, Tensor};
 
 use super::kvcache::{
     KVCacheAllocationConfig, KVCacheAllocator, KVCacheError, KVCacheModelConfig, KVCachePool,
@@ -32,6 +32,7 @@ pub struct ServerArgs {
     pub max_seq_len: usize,
     pub page_size: usize,
     pub dtype: String,
+    pub device: String,
     pub attention_backend: String,
     pub trust_remote_code: bool,
 }
@@ -46,6 +47,7 @@ impl ServerArgs {
             max_seq_len: 8192,
             page_size: 16,
             dtype: "auto".to_owned(),
+            device: "auto".to_owned(),
             attention_backend: "pt".to_owned(),
             trust_remote_code: false,
         }
@@ -253,6 +255,38 @@ impl Engine {
         Self::with_runtime(server_args, model_args, tp_rank, Kind::Float, Device::Cpu)
     }
 
+    /// Loads model weights before sizing the KV cache against remaining GPU memory.
+    pub fn load_for_serving(
+        server_args: ServerArgs,
+        model_args: ModelArgs,
+        tp_rank: usize,
+        factory: &dyn ModelFactory,
+    ) -> Result<Self> {
+        validate_model_path(&server_args.model_path)?;
+        validate_parallelism(server_args.tp_size, tp_rank)?;
+        if server_args.tp_size > 1 {
+            return Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"));
+        }
+        let device = resolve_device(&server_args.device, Cuda::is_available())?;
+        let kind = Kind::Float;
+        let model = factory.create_with_attention_backend(
+            model_args,
+            kind,
+            device,
+            &server_args.attention_backend,
+        )?;
+        let mut runner = ModelRunner::new(model, device);
+        let weights = load_hf_safetensors(&server_args.model_path).map_err(|error| {
+            EngineError::InvalidArgument(format!("Hugging Face 权重加载失败: {error}"))
+        })?;
+        runner.load_weights(weights)?;
+
+        let mut engine = Self::with_runtime(server_args, model_args, tp_rank, kind, device)?;
+        engine.attach_model_runner(runner)?;
+        tracing::info!(?device, ?kind, "model loaded for inference");
+        Ok(engine)
+    }
+
     /// Validates configuration and allocates the libtorch-backed KV cache.
     pub fn with_runtime(
         mut server_args: ServerArgs,
@@ -449,6 +483,20 @@ pub fn validate_model_path(model_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn resolve_device(requested: &str, cuda_available: bool) -> Result<Device> {
+    match requested {
+        "auto" if cuda_available => Ok(Device::Cuda(0)),
+        "auto" | "cpu" => Ok(Device::Cpu),
+        "cuda" if cuda_available => Ok(Device::Cuda(0)),
+        "cuda" => Err(EngineError::InvalidArgument(
+            "请求 CUDA 设备，但当前 libtorch 未检测到可用的 CUDA GPU".to_owned(),
+        )),
+        _ => Err(EngineError::InvalidArgument(format!(
+            "无效的设备 {requested:?}；应为 auto、cpu 或 cuda"
+        ))),
+    }
+}
+
 fn validate_parallelism(tp_size: usize, tp_rank: usize) -> Result<()> {
     if tp_size == 0 {
         return Err(EngineError::InvalidArgument(
@@ -496,6 +544,15 @@ mod tests {
             max_position_embeddings: 4,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn resolves_requested_device_without_silent_cuda_fallback() {
+        assert_eq!(resolve_device("auto", false).unwrap(), Device::Cpu);
+        assert_eq!(resolve_device("auto", true).unwrap(), Device::Cuda(0));
+        assert_eq!(resolve_device("cpu", true).unwrap(), Device::Cpu);
+        assert_eq!(resolve_device("cuda", true).unwrap(), Device::Cuda(0));
+        assert!(resolve_device("cuda", false).is_err());
     }
 
     #[test]
@@ -689,6 +746,29 @@ mod tests {
 
         engine.build_model(&LoadingFactory).unwrap();
         assert_eq!(engine.load_model_weights().unwrap(), 1);
+        fs::remove_dir_all(model_dir).unwrap();
+    }
+
+    #[test]
+    fn serving_loader_builds_model_before_cache_on_cpu() {
+        let model_dir = model_dir();
+        let weight = Tensor::ones([2], (Kind::Float, Device::Cpu));
+        Tensor::write_safetensors(
+            &[("lm_head.weight", &weight)],
+            model_dir.join("model.safetensors"),
+        )
+        .unwrap();
+        let mut args = ServerArgs::new(&model_dir);
+        args.device = "cpu".to_owned();
+        args.max_running_req = 1;
+        args.max_seq_len = 2;
+        args.page_size = 2;
+
+        let engine = Engine::load_for_serving(args, model_args(), 0, &LoadingFactory).unwrap();
+        assert_eq!(engine.device(), Device::Cpu);
+        assert!(engine.model_runner().is_ok());
+        let (k_cache, _) = engine.kv_cache_pool().unwrap().get_all_kv_cache().unwrap();
+        assert_eq!(k_cache.device(), Device::Cpu);
         fs::remove_dir_all(model_dir).unwrap();
     }
 }

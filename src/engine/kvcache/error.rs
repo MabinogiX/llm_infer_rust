@@ -8,6 +8,7 @@ pub type Result<T> = std::result::Result<T, KVCacheError>;
 pub enum KVCacheError {
     InvalidArgument(String),
     OutOfMemory { requested: usize, available: usize },
+    MemoryQuery(String),
     NotImplemented(&'static str),
     Torch(TchError),
 }
@@ -23,6 +24,7 @@ impl fmt::Display for KVCacheError {
                 f,
                 "KV cache out of memory: requested {requested} pages, only {available} free"
             ),
+            Self::MemoryQuery(message) => write!(f, "CUDA 显存查询失败: {message}"),
             Self::NotImplemented(feature) => write!(f, "未实现: {feature}"),
             Self::Torch(error) => write!(f, "libtorch error: {error}"),
         }

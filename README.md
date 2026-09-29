@@ -1,6 +1,6 @@
 # mini-sglang Rust 服务
 
-Rust 版本的 mini-sglang 推理服务。目前支持本地 dense Qwen3 模型、CPU float32 执行，以及 OpenAI 风格的文本与聊天生成接口。
+Rust 版本的 mini-sglang 推理服务。目前支持本地 dense Qwen3 模型、CPU/CUDA float32 eager 执行，以及 OpenAI 风格的文本与聊天生成接口。
 
 ## 运行
 
@@ -22,7 +22,9 @@ Rust 版本的 mini-sglang 推理服务。目前支持本地 dense Qwen3 模型�
 cargo run -- --model-path /path/to/Qwen3-0.6B --port 8000
 ```
 
-`main.rs` 解析模型路径和服务参数，调用 `server::serve`。默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 修改。服务启动时加载模型与 tokenizer；加载失败会退出并显示原因。当前仅支持 CPU float32、`pt` attention 和 `tp-size 1`。
+`main.rs` 解析模型路径和服务参数，调用 `server::serve`。默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 修改。服务启动时加载模型与 tokenizer；加载失败会退出并显示原因。`--device auto`（默认）在 libtorch 检测到 CUDA 时使用 `cuda:0`，否则使用 CPU；`--device cuda` 要求 CUDA 可用，`--device cpu` 强制使用 CPU。启动日志会打印实际选择的设备。当前仅支持 float32、`pt` attention 和 `tp-size 1`。
+
+Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-debug.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
 
 模型专有代码集中在 `src/models/<模型名>/`：`model.rs` 实现模型结构，`template.rs` 处理输入模板，`output.rs` 解析输出，`components.rs` 组装 tokenizer、engine、scheduler 和输出解析器。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择一次模型；不支持的模型会在加载权重前报错。新增模型时只需在 `src/models/` 下增加目录并登记，无须修改服务端和 tokenizer 的模型分支；请求处理过程不切换模型。
 
@@ -82,7 +84,7 @@ SGLANG_E2E_BASE_URL=http://127.0.0.1:8000/v1 \
 - `KVCachePool::new` 使用 `tch::Tensor::f_empty` 创建 `(2, layers, pages, page_size, kv_heads, head_dim)` Tensor；
 - `get_all_kv_cache` 返回 `tch::Tensor` K/V 切片，供之后迁移的 attention 层使用；
 - `RadixCacheManager` 已迁移，支持页对齐前缀匹配、共享前缀引用计数、插入回滚、请求释放和页粒度驱逐；
-- Naive cache manager 已迁移；加速器空闲显存查询尚未迁移。
+- Naive cache manager 已迁移；CUDA 显存通过启动环境中的 PyTorch 查询。
 
 本机使用 `tch-rs` 构建时，需将 `LIBTORCH_USE_PYTORCH=1` 指向含 libtorch 的 Python 环境。`tch 0.26` 的官方目标版本是 PyTorch/libtorch 2.13，本项目当前环境为 2.13.0。macOS 运行时还需设置 `DYLD_LIBRARY_PATH`，让动态链接器找到 libtorch：
 
