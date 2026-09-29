@@ -20,8 +20,8 @@ Options:\n\
   --cuda-graph-bs N         Maximum CUDA decode graph batch (0 disables)\n\
   --max-seq-len N           Maximum sequence length (default 8192; must not exceed model config)\n\
   --page-size N             KV cache page size (default 16)\n\
-  --attention-backend NAME  Attention backend (default pt)\n\
-  --dtype NAME              Model dtype (currently float32)\n\
+  --attention-backend NAME  Attention backend: fa or pt (default fa)\n\
+  --dtype NAME              Model dtype: auto, bfloat16, float16, float32\n\
   --device NAME             Device: auto, cpu, or cuda (default auto)\n\
   --trust-remote-code       Request Hugging Face remote code\n\
   --log-dir PATH            Log directory (default logs)\n\
@@ -54,8 +54,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--attention-backend" => engine.attention_backend = value()?,
             "--dtype" => {
                 let dtype = value()?;
-                if dtype != "auto" && dtype != "float32" {
-                    return Err("当前仅支持 float32；--dtype 必须是 auto 或 float32".to_owned());
+                if !["auto", "bfloat16", "float16", "float32"].contains(&dtype.as_str()) {
+                    return Err("--dtype 必须是 auto、bfloat16、float16 或 float32".to_owned());
                 }
                 engine.dtype = dtype;
             }
@@ -126,6 +126,10 @@ mod tests {
             parse_args(["--model-path", "/tmp/model", "--cuda-graph-bs", "4"].map(str::to_owned))
                 .unwrap();
         assert_eq!(graph_args.engine.cuda_graph_bs, Some(4));
+        let bf16_args =
+            parse_args(["--model-path", "/tmp/model", "--dtype", "bfloat16"].map(str::to_owned))
+                .unwrap();
+        assert_eq!(bf16_args.engine.dtype, "bfloat16");
         for device in ["cpu", "cuda"] {
             let parsed =
                 parse_args(["--model-path", "/tmp/model", "--device", device].map(str::to_owned))

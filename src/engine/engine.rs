@@ -51,7 +51,7 @@ impl ServerArgs {
             page_size: 16,
             dtype: "auto".to_owned(),
             device: "auto".to_owned(),
-            attention_backend: "pt".to_owned(),
+            attention_backend: "fa".to_owned(),
             trust_remote_code: false,
         }
     }
@@ -272,7 +272,7 @@ impl Engine {
         }
         validate_max_seq_len(&server_args, model_args)?;
         let device = resolve_device(&server_args.device, Cuda::is_available())?;
-        let kind = Kind::Float;
+        let kind = resolve_kind(&server_args.dtype, &server_args.model_path, device)?;
         let model = factory.create_with_attention_backend(
             model_args,
             kind,
@@ -512,6 +512,40 @@ pub fn validate_model_path(model_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn resolve_kind(requested: &str, model_path: &Path, device: Device) -> Result<Kind> {
+    let name = if requested == "auto" {
+        let config = std::fs::read_to_string(model_path.join("config.json")).map_err(|error| {
+            EngineError::InvalidArgument(format!("读取模型 dtype 失败: {error}"))
+        })?;
+        let config: serde_json::Value = serde_json::from_str(&config).map_err(|error| {
+            EngineError::InvalidArgument(format!("解析模型 dtype 失败: {error}"))
+        })?;
+        config
+            .get("torch_dtype")
+            .or_else(|| config.get("dtype"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("float32")
+            .to_owned()
+    } else {
+        requested.to_owned()
+    };
+    let kind = match name.as_str() {
+        "bfloat16" => Kind::BFloat16,
+        "float16" => Kind::Half,
+        "float32" => Kind::Float,
+        _ => {
+            return Err(EngineError::InvalidArgument(format!(
+                "不支持的模型 dtype: {name}"
+            )));
+        }
+    };
+    if matches!(device, Device::Cpu) && kind != Kind::Float {
+        tracing::warn!(?kind, "CPU 推理使用 float32，忽略模型的低精度 dtype");
+        return Ok(Kind::Float);
+    }
+    Ok(kind)
+}
+
 fn resolve_device(requested: &str, cuda_available: bool) -> Result<Device> {
     match requested {
         "auto" if cuda_available => Ok(Device::Cuda(0)),
@@ -582,6 +616,25 @@ mod tests {
         assert_eq!(resolve_device("cpu", true).unwrap(), Device::Cpu);
         assert_eq!(resolve_device("cuda", true).unwrap(), Device::Cuda(0));
         assert!(resolve_device("cuda", false).is_err());
+    }
+
+    #[test]
+    fn auto_dtype_uses_checkpoint_config_and_cpu_fallback() {
+        let path = model_dir();
+        fs::write(path.join("config.json"), r#"{"torch_dtype":"bfloat16"}"#).unwrap();
+        assert_eq!(
+            resolve_kind("auto", &path, Device::Cuda(0)).unwrap(),
+            Kind::BFloat16
+        );
+        assert_eq!(
+            resolve_kind("auto", &path, Device::Cpu).unwrap(),
+            Kind::Float
+        );
+        assert_eq!(
+            resolve_kind("float32", &path, Device::Cuda(0)).unwrap(),
+            Kind::Float
+        );
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

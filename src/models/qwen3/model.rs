@@ -434,8 +434,8 @@ fn apply_rope(q: &Tensor, k: &Tensor, positions: &Tensor, rope_theta: f64) -> (T
         * (-(rope_theta.ln() / head_dim as f64)))
         .exp();
     let frequencies = positions.to_kind(Kind::Float).unsqueeze(-1) * inv_freq.unsqueeze(0);
-    let cos = frequencies.cos().unsqueeze(1);
-    let sin = frequencies.sin().unsqueeze(1);
+    let cos = frequencies.cos().to_kind(q.kind()).unsqueeze(1);
+    let sin = frequencies.sin().to_kind(q.kind()).unsqueeze(1);
     (
         rotate_half(q, &cos, &sin, half_dim),
         rotate_half(k, &cos, &sin, half_dim),
@@ -546,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn flash_attention_backend_is_explicitly_deferred() {
+    fn flash_attention_backend_runs_on_cpu_via_sdpa() {
         let model = Qwen3ForCausalLM::new_with_attention_backend(
             config(),
             Kind::Float,
@@ -554,15 +554,25 @@ mod tests {
             AttentionBackendKind::FlashAttention,
         )
         .unwrap();
-        let error = model
+        let logits = model
             .forward(
                 &Tensor::from_slice(&[1i64]),
                 &Tensor::from_slice(&[0i64]),
                 None,
                 None,
             )
-            .unwrap_err();
-        assert!(error.to_string().contains("FlashAttention"));
+            .unwrap();
+        assert_eq!(logits.size(), vec![1, 8]);
+    }
+
+    #[test]
+    fn rope_keeps_bfloat16_query_and_key() {
+        let q = Tensor::ones([2, 2, 4], (Kind::BFloat16, Device::Cpu));
+        let k = Tensor::ones([2, 1, 4], (Kind::BFloat16, Device::Cpu));
+        let positions = Tensor::from_slice(&[0i64, 1]);
+        let (q, k) = apply_rope(&q, &k, &positions, 10_000.0);
+        assert_eq!(q.kind(), Kind::BFloat16);
+        assert_eq!(k.kind(), Kind::BFloat16);
     }
 
     #[test]
