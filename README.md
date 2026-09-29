@@ -42,6 +42,8 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 ## 端到端接口测试
 
+完整的 PR smoke 与 release 性能测试入口见 [benchmark/README.md](benchmark/README.md)。
+
 先启动默认 Qwen3 模型服务，再在另一个终端安装测试依赖并运行：
 
 ```bash
