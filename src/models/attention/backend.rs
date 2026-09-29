@@ -185,6 +185,9 @@ fn decode_with_cache(
         .req_to_token
         .as_ref()
         .ok_or_else(|| model_error("paged-KV decode requires req_to_token"))?;
+    if matches!(q.device(), Device::Cuda(_)) {
+        return decode_with_cache_padded(q, cache, metadata, num_heads, num_kv_heads, head_dim);
+    }
     let cache_seqlens = tensor_i32(metadata.cache_seqlens.as_ref(), "cache_seqlens")?;
     if q.size()[0] != cache_seqlens.len() as i64 || table.size()[0] != q.size()[0] {
         return Err(model_error(
@@ -209,6 +212,54 @@ fn decode_with_cache(
         ));
     }
     Ok(Tensor::cat(&outputs, 0))
+}
+
+/// Fixed-shape decode used by CUDA Graph capture. Sequence lengths stay on
+/// device; invalid columns are masked before softmax.
+fn decode_with_cache_padded(
+    q: &Tensor,
+    cache: &BaseAttention,
+    metadata: &AttentionMetadata,
+    num_heads: i64,
+    num_kv_heads: i64,
+    head_dim: i64,
+) -> Result<Tensor> {
+    let table = metadata
+        .req_to_token
+        .as_ref()
+        .ok_or_else(|| model_error("paged-KV decode requires req_to_token"))?;
+    let lengths = metadata
+        .cache_seqlens
+        .as_ref()
+        .ok_or_else(|| model_error("paged-KV decode requires cache_seqlens"))?;
+    let max_len = metadata.max_seqlen.unwrap_or(table.size()[1] as usize) as i64;
+    let batch_size = q.size()[0];
+    if table.size()[0] != batch_size || lengths.size()[0] != batch_size {
+        return Err(model_error("decode metadata row count must match queries"));
+    }
+    let indices = table.narrow(1, 0, max_len);
+    let valid = indices.ge(0).logical_and(
+        &Tensor::arange(max_len, (Kind::Int64, q.device()))
+            .unsqueeze(0)
+            .lt_tensor(&lengths.to_kind(Kind::Int64).unsqueeze(1)),
+    );
+    let (k, v) = cache.read_kv_padded(&indices.clamp_min(0).to_kind(Kind::Int64))?;
+    let k = k
+        .repeat_interleave_self_int(num_heads / num_kv_heads, 2, Some(num_heads))
+        .permute([0, 2, 1, 3]);
+    let v = v
+        .repeat_interleave_self_int(num_heads / num_kv_heads, 2, Some(num_heads))
+        .permute([0, 2, 1, 3]);
+    let query = q.unsqueeze(2);
+    let scores = (query.matmul(&k.transpose(2, 3)) * (head_dim as f64).sqrt().recip()).masked_fill(
+        &valid.logical_not().unsqueeze(1).unsqueeze(2),
+        f64::NEG_INFINITY,
+    );
+    Ok(scores
+        .softmax(-1, Kind::Float)
+        .matmul(&v)
+        .squeeze_dim(2)
+        .reshape([batch_size, num_heads * head_dim]))
 }
 
 fn causal_attention(
@@ -306,4 +357,45 @@ fn tensor_i32(tensor: Option<&Tensor>, field: &str) -> Result<Vec<i32>> {
 
 fn model_error(message: &str) -> ModelRunnerError {
     ModelRunnerError::Model(message.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_decode_matches_eager_for_different_sequence_lengths() {
+        let mut cache = BaseAttention::default();
+        cache
+            .bind_kv_cache(
+                Tensor::zeros([1, 4, 1, 2], (Kind::Float, Device::Cpu)),
+                Tensor::zeros([1, 4, 1, 2], (Kind::Float, Device::Cpu)),
+            )
+            .unwrap();
+        let k = Tensor::from_slice(&[1f32, 0., 0., 1., 1., 1.]).view([3, 1, 2]);
+        let v = Tensor::from_slice(&[2f32, 0., 0., 4., 6., 6.]).view([3, 1, 2]);
+        cache
+            .write_kv(
+                &k,
+                &v,
+                Some(&Tensor::from_slice(&[0i32, 1, 2])),
+                BatchPhase::Prefill,
+            )
+            .unwrap();
+        let metadata = AttentionMetadata {
+            forward_mode: BatchPhase::Decode,
+            write_loc: None,
+            cu_seqlens_q: None,
+            prefix_lens: None,
+            block_table: None,
+            req_to_token: Some(Tensor::from_slice(&[0i32, 1, -1, -1, 2, -1, -1, -1]).view([2, 4])),
+            cache_seqlens: Some(Tensor::from_slice(&[2i32, 1])),
+            max_seqlen: Some(4),
+        };
+        let q = Tensor::from_slice(&[1f32, 0., 0., 1.]).view([2, 1, 2]);
+        let eager = decode_with_cache(&q, &cache, &metadata, 1, 1, 2).unwrap();
+        let padded = decode_with_cache_padded(&q, &cache, &metadata, 1, 1, 2).unwrap();
+        let difference = (eager - padded).abs().max().double_value(&[]);
+        assert!(difference < 1e-5, "decode difference: {difference}");
+    }
 }

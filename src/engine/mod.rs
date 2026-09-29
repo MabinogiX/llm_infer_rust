@@ -1,5 +1,6 @@
 mod batch_context;
 mod engine;
+mod graph;
 pub mod kvcache;
 mod model_loader;
 mod model_runner;

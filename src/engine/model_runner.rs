@@ -1,13 +1,10 @@
-//! Eager model execution over scheduler-prepared batches.
-//!
-//! `GraphRunner` is deliberately absent from this migration step. Decode uses
-//! the same eager path as prefill until CUDA/NPU graph capture is ported.
+//! Model execution over scheduler-prepared batches.
 
-use std::fmt;
+use std::{cell::RefCell, fmt, rc::Rc};
 
 use tch::{Device, TchError, Tensor, no_grad};
 
-use super::ModelWeights;
+use super::{ModelWeights, ServerArgs, graph::GraphRunner, kvcache::KVCachePool};
 
 /// Identifies the scheduler phase that produced a [`Batch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,15 +141,20 @@ impl From<TchError> for ModelRunnerError {
 
 pub type Result<T> = std::result::Result<T, ModelRunnerError>;
 
-/// Owns a model executor and runs its eager forward path.
+/// Owns a model executor and optional captured decode graphs.
 pub struct ModelRunner {
     model: Box<dyn ModelExecutor>,
     device: Device,
+    graph_runner: Option<GraphRunner>,
 }
 
 impl ModelRunner {
     pub fn new(model: Box<dyn ModelExecutor>, device: Device) -> Self {
-        Self { model, device }
+        Self {
+            model,
+            device,
+            graph_runner: None,
+        }
     }
 
     pub fn device(&self) -> Device {
@@ -168,7 +170,17 @@ impl ModelRunner {
         self.model.bind_kv_cache(k_cache, v_cache)
     }
 
-    /// The single model-forward entry point retained for future GraphRunner use.
+    pub fn capture_graphs(
+        &mut self,
+        args: &ServerArgs,
+        pool: Rc<RefCell<KVCachePool>>,
+    ) -> Result<()> {
+        self.graph_runner = None;
+        self.graph_runner = GraphRunner::capture(self, args, pool)?;
+        Ok(())
+    }
+
+    /// The single model-forward entry point used by eager and capture paths.
     pub fn run_model(
         &self,
         input_ids: &Tensor,
@@ -183,9 +195,15 @@ impl ModelRunner {
         })
     }
 
-    /// Executes prefill or decode eagerly. Decode graph replay is intentionally
-    /// skipped until `GraphRunner` is migrated.
+    /// Uses captured CUDA graphs for decode when a fitting graph exists.
     pub fn forward(&self, batch: &Batch) -> Result<Tensor> {
+        if batch.phase == BatchPhase::Decode {
+            if let Some(graph) = &self.graph_runner {
+                if let Some(output) = graph.replay(batch)? {
+                    return Ok(output);
+                }
+            }
+        }
         let logits_indices = match batch.phase {
             BatchPhase::Prefill => Some(
                 batch
@@ -203,8 +221,9 @@ impl ModelRunner {
         )
     }
 
-    /// Compatibility hook for Engine cleanup. There are no graphs to clear yet.
-    pub fn clear_graphs(&mut self) {}
+    pub fn clear_graphs(&mut self) {
+        self.graph_runner = None;
+    }
 
     fn validate_tensors(&self, input_ids: &Tensor, positions: &Tensor) -> Result<()> {
         if input_ids.numel() != positions.numel() {

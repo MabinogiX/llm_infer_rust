@@ -24,6 +24,8 @@ cargo run -- --model-path /path/to/Qwen3-0.6B --port 8000
 
 `main.rs` 解析模型路径和服务参数，调用 `server::serve`。默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 修改。服务启动时加载模型与 tokenizer；加载失败会退出并显示原因。`--device auto`（默认）在 libtorch 检测到 CUDA 时使用 `cuda:0`，否则使用 CPU；`--device cuda` 要求 CUDA 可用，`--device cpu` 强制使用 CPU。启动日志会打印实际选择的设备。当前仅支持 float32、`pt` attention 和 `tp-size 1`。
 
+Linux CUDA 环境中，模型权重和 KV cache 绑定后会捕获 decode CUDA Graph；图捕获失败的批次回退到 eager。`--cuda-graph-bs N` 设置最大捕获批量（默认使用 `--max-running-req`），设为 `0` 可禁用。构建图桥接层需要与 PyTorch 对应的 CUDA Toolkit；缺少时服务仍使用 eager decode。CPU 不启用图捕获。
+
 Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-debug.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
 
 模型专有代码集中在 `src/models/<模型名>/`：`model.rs` 实现模型结构，`template.rs` 处理输入模板，`output.rs` 解析输出，`components.rs` 组装 tokenizer、engine、scheduler 和输出解析器。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择一次模型；不支持的模型会在加载权重前报错。新增模型时只需在 `src/models/` 下增加目录并登记，无须修改服务端和 tokenizer 的模型分支；请求处理过程不切换模型。
@@ -102,7 +104,7 @@ cargo test --lib
 
 `src/engine/engine.rs` 提供了 `mini-sglang` `Engine` 的 Rust 生命周期骨架：它会校验本地 Hugging Face 模型目录；当 `--max-seq-len` 超过模型配置的 `max_position_embeddings` 时，启动会报错退出，不再静默截断。Qwen3-0.6B 的配置上限为 40960。通过校验后，已迁移的 `KVCacheAllocator` 才会创建 libtorch KV Cache。
 
-`ModelRunner` 已迁移为 eager 执行器：通过 `Engine::attach_model_runner` 绑定 Rust `ModelExecutor` 后，`Engine::forward(&batch)` 会在 libtorch `no_grad` 环境中执行 prefill 或 decode。prefill 会传递 `logits_indices`，decode 走 eager 路径。模型构建、权重加载和 scheduler 的 `BatchContext` 已接入；CUDA Graph 和分布式张量并行仍未迁移。未绑定 runner 的 `Engine::forward` 或指定 `tp_size > 1` 会返回明确错误。
+`ModelRunner` 通过 `Engine::attach_model_runner` 绑定 Rust `ModelExecutor`。`Engine::forward(&batch)` 在 libtorch `no_grad` 环境中执行 prefill，传入 `logits_indices`；decode 优先回放已捕获的 CUDA Graph，没有可用图时走 eager 路径。模型构建、权重加载、scheduler 的 `BatchContext` 和 CUDA Graph 已接入；分布式张量并行仍未迁移。未绑定 runner 的 `Engine::forward` 或指定 `tp_size > 1` 会返回明确错误。
 
 `Engine::sample(&logits, &params)` 已接入 Rust `Sampler`。`logits` 为 `(num_reqs, vocab_size)`，`params` 必须有同样数量的 `SamplingParams`；它支持 greedy、temperature、top-k 与 top-p，并将相同采样参数的请求合并为一次 libtorch 调用。
 

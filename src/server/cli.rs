@@ -17,6 +17,7 @@ Options:\n\
   --tp-size N               Tensor parallel size (only 1 is supported)\n\
   --memory-ratio R          KV cache memory ratio (default 0.9)\n\
   --max-running-req N       Maximum active requests (default 256)\n\
+  --cuda-graph-bs N         Maximum CUDA decode graph batch (0 disables)\n\
   --max-seq-len N           Maximum sequence length (default 8192; must not exceed model config)\n\
   --page-size N             KV cache page size (default 16)\n\
   --attention-backend NAME  Attention backend (default pt)\n\
@@ -47,6 +48,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--tp-size" => engine.tp_size = parse_value(&value()?, &flag)?,
             "--memory-ratio" => engine.memory_ratio = parse_value(&value()?, &flag)?,
             "--max-running-req" => engine.max_running_req = parse_value(&value()?, &flag)?,
+            "--cuda-graph-bs" => engine.cuda_graph_bs = Some(parse_value(&value()?, &flag)?),
             "--max-seq-len" => engine.max_seq_len = parse_value(&value()?, &flag)?,
             "--page-size" => engine.page_size = parse_value(&value()?, &flag)?,
             "--attention-backend" => engine.attention_backend = value()?,
@@ -120,6 +122,10 @@ mod tests {
         );
         assert_eq!(logging_args.logging.level.as_deref(), Some("debug"));
         assert_eq!(args.engine.device, "auto");
+        let graph_args =
+            parse_args(["--model-path", "/tmp/model", "--cuda-graph-bs", "4"].map(str::to_owned))
+                .unwrap();
+        assert_eq!(graph_args.engine.cuda_graph_bs, Some(4));
         for device in ["cpu", "cuda"] {
             let parsed =
                 parse_args(["--model-path", "/tmp/model", "--device", device].map(str::to_owned))

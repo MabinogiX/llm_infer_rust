@@ -19,3 +19,6 @@ tch = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
 tracing-appender = "0.2"
+
+[build-dependencies]
+cc = "1"

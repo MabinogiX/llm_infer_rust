@@ -316,6 +316,7 @@ impl DecoderLayer {
             &k,
             &v,
             attention_metadata.and_then(|metadata| metadata.write_loc.as_ref()),
+            attention_metadata.map_or(BatchPhase::Prefill, |metadata| metadata.forward_mode),
         )?;
 
         let output = self.attention_backend.forward(
