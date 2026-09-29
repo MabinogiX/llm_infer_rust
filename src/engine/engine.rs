@@ -267,6 +267,7 @@ impl Engine {
         if server_args.tp_size > 1 {
             return Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"));
         }
+        validate_max_seq_len(&server_args, model_args)?;
         let device = resolve_device(&server_args.device, Cuda::is_available())?;
         let kind = Kind::Float;
         let model = factory.create_with_attention_backend(
@@ -289,7 +290,7 @@ impl Engine {
 
     /// Validates configuration and allocates the libtorch-backed KV cache.
     pub fn with_runtime(
-        mut server_args: ServerArgs,
+        server_args: ServerArgs,
         model_args: ModelArgs,
         tp_rank: usize,
         kind: Kind,
@@ -300,8 +301,7 @@ impl Engine {
         if server_args.tp_size > 1 {
             return Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"));
         }
-        clamp_max_seq_len(&mut server_args, model_args);
-
+        validate_max_seq_len(&server_args, model_args)?;
         let allocator = KVCacheAllocator::new(KVCacheAllocationConfig {
             server: KVCacheServerConfig {
                 page_size: server_args.page_size,
@@ -458,13 +458,20 @@ impl Drop for Engine {
     }
 }
 
-/// Clamps scheduler and cache sizing to the trained context window.
-pub fn clamp_max_seq_len(server_args: &mut ServerArgs, model_args: ModelArgs) {
-    if model_args.max_position_embeddings > 0
-        && server_args.max_seq_len > model_args.max_position_embeddings
-    {
-        server_args.max_seq_len = model_args.max_position_embeddings;
+/// Rejects a context window larger than the model configuration before allocating memory.
+pub fn validate_max_seq_len(server_args: &ServerArgs, model_args: ModelArgs) -> Result<()> {
+    if model_args.max_position_embeddings == 0 {
+        return Err(EngineError::InvalidArgument(
+            "模型配置 max_position_embeddings 必须大于 0".to_owned(),
+        ));
     }
+    if server_args.max_seq_len > model_args.max_position_embeddings {
+        return Err(EngineError::InvalidArgument(format!(
+            "--max-seq-len {} 超过模型配置的 max_position_embeddings={}；请降低 --max-seq-len",
+            server_args.max_seq_len, model_args.max_position_embeddings
+        )));
+    }
+    Ok(())
 }
 
 /// Fails early when `model_path` cannot be a local Hugging Face model directory.
@@ -556,16 +563,19 @@ mod tests {
     }
 
     #[test]
-    fn initializes_kv_cache_and_clamps_sequence_length() {
+    fn rejects_sequence_length_above_model_limit() {
         let model_dir = model_dir();
         let mut args = ServerArgs::new(&model_dir);
         args.max_running_req = 1;
         args.max_seq_len = 8;
         args.page_size = 2;
 
-        let engine = Engine::new(args, model_args(), 0).unwrap();
-        assert_eq!(engine.server_args().max_seq_len, 4);
-        assert_eq!(engine.kv_cache_pool().unwrap().layout.num_pages, 3);
+        let error = Engine::new(args, model_args(), 0).err().unwrap();
+        assert!(error.to_string().contains("--max-seq-len 8"));
+        assert!(error.to_string().contains("max_position_embeddings=4"));
+        let mut at_limit = ServerArgs::new(&model_dir);
+        at_limit.max_seq_len = 4;
+        assert!(validate_max_seq_len(&at_limit, model_args()).is_ok());
         fs::remove_dir_all(model_dir).unwrap();
     }
 

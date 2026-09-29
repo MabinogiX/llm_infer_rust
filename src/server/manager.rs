@@ -5,7 +5,7 @@ use std::{
     fmt,
     sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::{mpsc as async_mpsc, oneshot};
@@ -60,11 +60,19 @@ pub struct FrontendManager {
     commands: mpsc::Sender<Command>,
     tokenizer: Arc<TokenizerWorker>,
     output_parser_constructor: ChatOutputParserConstructor,
+    model_id: String,
+    model_created: u64,
 }
 
 impl FrontendManager {
     /// Build all model state inside the thread that will run the scheduler.
     pub fn start(args: ServeArgs) -> Result<Self, ManagerError> {
+        let model_id = args
+            .engine
+            .model_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "default".to_owned());
         let (commands, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         thread::Builder::new()
@@ -92,11 +100,25 @@ impl FrontendManager {
             .recv()
             .map_err(|_| ManagerError::Startup("scheduler 线程启动失败".to_owned()))?
             .map_err(ManagerError::Startup)?;
+        let model_created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Ok(Self {
             commands,
             tokenizer: Arc::new(tokenizer),
             output_parser_constructor,
+            model_id,
+            model_created,
         })
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    pub fn model_created(&self) -> u64 {
+        self.model_created
     }
 
     pub fn tokenizer(&self) -> &TokenizerWorker {

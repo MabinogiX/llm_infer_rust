@@ -24,6 +24,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn router(frontend: FrontendManager) -> Router {
     Router::new()
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/health", get(health))
@@ -66,6 +67,18 @@ impl IntoResponse for ApiError {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
+}
+
+async fn list_models(State(frontend): State<FrontendManager>) -> Json<Value> {
+    Json(json!({
+        "object": "list",
+        "data": [{
+            "id": frontend.model_id(),
+            "object": "model",
+            "created": frontend.model_created(),
+            "owned_by": "sglang-rust",
+        }],
+    }))
 }
 
 async fn chat_completions(

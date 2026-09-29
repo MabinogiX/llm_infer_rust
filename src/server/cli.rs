@@ -17,7 +17,7 @@ Options:\n\
   --tp-size N               Tensor parallel size (only 1 is supported)\n\
   --memory-ratio R          KV cache memory ratio (default 0.9)\n\
   --max-running-req N       Maximum active requests (default 256)\n\
-  --max-seq-len N           Maximum sequence length (default 8192)\n\
+  --max-seq-len N           Maximum sequence length (default 8192; must not exceed model config)\n\
   --page-size N             KV cache page size (default 16)\n\
   --attention-backend NAME  Attention backend (default pt)\n\
   --dtype NAME              Model dtype (currently float32)\n\
