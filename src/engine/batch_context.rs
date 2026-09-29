@@ -5,14 +5,14 @@ use std::fmt;
 use tch::{Device, Tensor};
 
 use super::{AttentionMetadata, Batch, BatchPhase};
-use crate::engine::kvcache::BaseCacheHandle;
 
 /// Scheduler-side request data needed to derive one prefill [`Batch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchRequest {
     pub input_ids: Vec<i64>,
     pub cached_len: usize,
-    pub cache_handle: Option<BaseCacheHandle>,
+    /// Non-owning snapshot used only to construct this forward's tensors.
+    pub page_ids: Vec<usize>,
 }
 
 impl BatchRequest {
@@ -20,7 +20,7 @@ impl BatchRequest {
         Self {
             input_ids,
             cached_len: 0,
-            cache_handle: None,
+            page_ids: Vec::new(),
         }
     }
 }
@@ -171,9 +171,8 @@ impl BatchContext {
         let mut locations = Vec::with_capacity(request.input_ids.len() - request.cached_len);
         for position in request.cached_len..request.input_ids.len() {
             let location = request
-                .cache_handle
-                .as_ref()
-                .and_then(|handle| handle.page_ids.get(position / self.page_size))
+                .page_ids
+                .get(position / self.page_size)
                 .map(|&page_id| cache_location(page_id, position % self.page_size, self.page_size))
                 .transpose()?
                 .unwrap_or(-1);
@@ -187,10 +186,8 @@ impl BatchContext {
         let row_len = to_i64(max_blocks, "max blocks")?;
         let mut values = vec![-1i32; requests.len() * max_blocks];
         for (row, request) in requests.iter().enumerate() {
-            if let Some(handle) = &request.cache_handle {
-                for (column, &page_id) in handle.page_ids.iter().take(max_blocks).enumerate() {
-                    values[row * max_blocks + column] = to_i32(page_id, "page id")?;
-                }
+            for (column, &page_id) in request.page_ids.iter().take(max_blocks).enumerate() {
+                values[row * max_blocks + column] = to_i32(page_id, "page id")?;
             }
         }
         Ok(Tensor::from_slice(&values)
@@ -201,10 +198,10 @@ impl BatchContext {
     fn build_req_to_token(&self, requests: &[BatchRequest]) -> Result<Tensor> {
         let mut values = vec![-1i32; requests.len() * self.max_seq_len];
         for (row, request) in requests.iter().enumerate() {
-            let Some(handle) = &request.cache_handle else {
+            if request.page_ids.is_empty() {
                 continue;
-            };
-            let page_capacity = handle.page_ids.len().saturating_mul(self.page_size);
+            }
+            let page_capacity = request.page_ids.len().saturating_mul(self.page_size);
             let filled = request
                 .input_ids
                 .len()
@@ -212,7 +209,7 @@ impl BatchContext {
                 .min(page_capacity);
             for position in 0..filled {
                 values[row * self.max_seq_len + position] = cache_location(
-                    handle.page_ids[position / self.page_size],
+                    request.page_ids[position / self.page_size],
                     position % self.page_size,
                     self.page_size,
                 )?;
@@ -262,7 +259,6 @@ fn to_i64(value: usize, field: &'static str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::kvcache::BaseCacheHandle;
 
     #[test]
     fn prepares_prefill_tensors_and_page_tables() {
@@ -271,18 +267,12 @@ mod tests {
             BatchRequest {
                 input_ids: vec![10, 11, 12],
                 cached_len: 2,
-                cache_handle: Some(BaseCacheHandle {
-                    page_ids: vec![5, 3],
-                    ..Default::default()
-                }),
+                page_ids: vec![5, 3],
             },
             BatchRequest {
                 input_ids: vec![20, 21],
                 cached_len: 0,
-                cache_handle: Some(BaseCacheHandle {
-                    page_ids: vec![7],
-                    ..Default::default()
-                }),
+                page_ids: vec![7],
             },
         ];
 
@@ -319,7 +309,7 @@ mod tests {
         let request = BatchRequest {
             input_ids: vec![1],
             cached_len: 1,
-            cache_handle: None,
+            page_ids: Vec::new(),
         };
         assert!(matches!(
             context.prepare_prefill(&[request]),

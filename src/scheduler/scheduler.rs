@@ -54,7 +54,7 @@ impl Scheduler {
             args.page_size,
             engine.device(),
         )?;
-        let prefill = PrefillManager::new(&args, pool, cache, batch_context);
+        let prefill = PrefillManager::new(&args, cache, batch_context);
         let decode = DecodeManager::new(&args, engine.device())?;
         Ok(Self {
             engine,
@@ -189,27 +189,55 @@ impl Scheduler {
         let sampled = self
             .engine
             .forward(&model_batch)
-            .and_then(|logits| self.engine.sample(&logits, &params));
+            .and_then(|logits| self.engine.sample(&logits, &params))
+            .and_then(|tokens| {
+                if tokens.len() == request_ids.len() {
+                    Ok(tokens)
+                } else {
+                    Err(EngineError::InvalidArgument(
+                        "sampled token count differs from batch size".to_owned(),
+                    ))
+                }
+            });
         match sampled {
             Ok(tokens) => {
                 let mut finished = Vec::new();
                 for (uid, token_id) in request_ids.into_iter().zip(tokens) {
+                    // The current sequence is exactly what this forward wrote.
+                    // The newly sampled token has not entered KV yet.
+                    let (written_ids, reason) = {
+                        let request = self
+                            .prefill
+                            .running_request(uid)
+                            .expect("scheduled request is running");
+                        let reason = if self.eos_token_ids.contains(&token_id)
+                            && !request.sampling_params.ignore_eos
+                        {
+                            Some(FinishReason::Stop)
+                        } else if request.output_len + 1 >= request.sampling_params.max_tokens
+                            || request.input_ids.len() + 1 >= self.args.max_seq_len
+                        {
+                            Some(FinishReason::Length)
+                        } else {
+                            None
+                        };
+                        (request.input_ids.clone(), reason)
+                    };
+                    if phase == BatchPhase::Prefill || reason.is_some() {
+                        if let Err(error) = self.prefill.publish(uid, &written_ids) {
+                            tracing::error!(uid, error = %error, "KV cache publish failed");
+                            self.prefill.remove_batch(&[uid]);
+                            results.push(self.terminal_result(uid, FinishReason::Error));
+                            continue;
+                        }
+                    } else {
+                        self.prefill.mark_written(uid, written_ids.len());
+                    }
                     let request = self
                         .prefill
                         .running_request_mut(uid)
                         .expect("scheduled request is running");
                     request.append_token(token_id);
-                    let reason = if self.eos_token_ids.contains(&token_id)
-                        && !request.sampling_params.ignore_eos
-                    {
-                        Some(FinishReason::Stop)
-                    } else if request.output_len >= request.sampling_params.max_tokens
-                        || request.input_ids.len() >= self.args.max_seq_len
-                    {
-                        Some(FinishReason::Length)
-                    } else {
-                        None
-                    };
                     if reason.is_some() {
                         request.status = SequenceStatus::Finished;
                         finished.push(uid);
@@ -221,16 +249,11 @@ impl Scheduler {
                         finish_reason: reason,
                     });
                 }
-                self.prefill.remove_finished_batch(&finished)?;
+                self.prefill.remove_batch(&finished);
             }
             Err(error) => {
                 self.last_step_error = Some(error);
-                match phase {
-                    BatchPhase::Prefill => {
-                        self.prefill.remove_failed_prefill_batch(&request_ids)?
-                    }
-                    BatchPhase::Decode => self.prefill.remove_finished_batch(&request_ids)?,
-                }
+                self.prefill.remove_batch(&request_ids);
                 results.extend(
                     request_ids
                         .into_iter()
@@ -326,6 +349,7 @@ mod tests {
 
     use tch::{Device, Tensor};
 
+    use crate::engine::kvcache::{AcquireOutcome, BaseCacheHandle, KVCacheError};
     use crate::engine::{
         AttentionMetadata, ModelArgs, ModelExecutor, ModelRunner, ModelRunnerError,
     };
@@ -346,6 +370,14 @@ mod tests {
         strategy: CacheStrategy,
         max_running_req: usize,
     ) -> (Scheduler, PathBuf) {
+        scheduler_with_options(strategy, max_running_req, 4)
+    }
+
+    fn scheduler_with_options(
+        strategy: CacheStrategy,
+        max_running_req: usize,
+        max_seq_len: usize,
+    ) -> (Scheduler, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -363,7 +395,7 @@ mod tests {
         .unwrap();
         let mut args = ServerArgs::new(&path);
         args.max_running_req = max_running_req;
-        args.max_seq_len = 4;
+        args.max_seq_len = max_seq_len;
         args.page_size = 2;
         let engine = Engine::new(
             args,
@@ -371,7 +403,7 @@ mod tests {
                 num_layers: 1,
                 num_kv_heads: 1,
                 head_dim: 1,
-                max_position_embeddings: 4,
+                max_position_embeddings: max_seq_len,
                 ..Default::default()
             },
             0,
@@ -457,6 +489,41 @@ mod tests {
     }
 
     struct DecodeFailModel;
+
+    struct FailSecondPublish {
+        inner: RadixCacheManager,
+        calls: usize,
+    }
+
+    impl CacheManager for FailSecondPublish {
+        fn acquire(
+            &mut self,
+            input_ids: &[i64],
+            capacity_tokens: usize,
+            budget: Option<usize>,
+        ) -> crate::engine::kvcache::Result<AcquireOutcome> {
+            self.inner.acquire(input_ids, capacity_tokens, budget)
+        }
+
+        fn publish(
+            &mut self,
+            handle: &mut BaseCacheHandle,
+            written_ids: &[i64],
+        ) -> crate::engine::kvcache::Result<()> {
+            self.calls += 1;
+            if self.calls == 2 {
+                self.inner.publish(handle, written_ids)?;
+                return Err(KVCacheError::InvalidArgument(
+                    "injected failure after one request published".into(),
+                ));
+            }
+            self.inner.publish(handle, written_ids)
+        }
+
+        fn release(&mut self, handle: &mut BaseCacheHandle) {
+            self.inner.release(handle);
+        }
+    }
 
     impl ModelExecutor for DecodeFailModel {
         fn forward(
@@ -672,6 +739,139 @@ mod tests {
         assert_eq!(
             scheduler.engine().kv_cache_pool().unwrap().free_count(),
             free_before
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn generated_prefix_collision_reclaims_the_duplicate_page() {
+        let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 2, 6);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), Device::Cpu))
+            .unwrap();
+        let total_pages = scheduler.engine().kv_cache_pool().unwrap().layout.num_pages;
+        let a = scheduler
+            .add_request(
+                vec![1, 2],
+                SamplingParams {
+                    max_tokens: 3,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(scheduler.step().unwrap().len(), 2);
+        assert_eq!(scheduler.running_len(), 1);
+
+        let b = scheduler
+            .add_request(
+                vec![1, 2, 3, 3, 4],
+                SamplingParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let results = scheduler.step().unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|output| (output.uid, output.finish_reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (b, Some(FinishReason::Length)),
+                (a, Some(FinishReason::Length))
+            ]
+        );
+        assert!(scheduler.is_idle());
+        // The two complete token pages are canonical. A's duplicate output
+        // page and B's partial tail page were returned exactly once.
+        assert_eq!(
+            scheduler.engine().kv_cache_pool().unwrap().free_count(),
+            total_pages - 2
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn abort_running_request_releases_only_its_private_pages() {
+        let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 1, 6);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), Device::Cpu))
+            .unwrap();
+        let total_pages = scheduler.engine.kv_cache_pool().unwrap().layout.num_pages;
+        let uid = scheduler
+            .add_request(
+                vec![1, 2],
+                SamplingParams {
+                    max_tokens: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(scheduler.step().unwrap().len(), 2);
+        assert!(scheduler.abort_request(uid));
+        assert!(!scheduler.abort_request(uid));
+        assert!(scheduler.is_idle());
+        // The prompt page was published; generation pages stayed private.
+        assert_eq!(
+            scheduler.engine.kv_cache_pool().unwrap().free_count(),
+            total_pages - 1
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn publish_failure_isolated_to_one_request() {
+        let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 2, 4);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), Device::Cpu))
+            .unwrap();
+        let pool = scheduler.engine.shared_kv_cache_pool().unwrap();
+        let total_pages = pool.borrow().layout.num_pages;
+        let cache = Box::new(FailSecondPublish {
+            inner: RadixCacheManager::new(pool, 2).unwrap(),
+            calls: 0,
+        });
+        let context = BatchContext::new(2, 4, 2, Device::Cpu).unwrap();
+        scheduler.prefill = PrefillManager::new(&scheduler.args, cache, context);
+        let first = scheduler
+            .add_request(
+                vec![1, 2],
+                SamplingParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let second = scheduler
+            .add_request(
+                vec![3, 4],
+                SamplingParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let results = scheduler.step().unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|out| (out.uid, out.finish_reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (first, Some(FinishReason::Length)),
+                (second, Some(FinishReason::Error))
+            ]
+        );
+        assert!(scheduler.is_idle());
+        // Both valid pages reached the tree before the injected error; the
+        // failed request's release must not free its newly published page.
+        assert_eq!(
+            scheduler.engine.kv_cache_pool().unwrap().free_count(),
+            total_pages - 2
         );
         fs::remove_dir_all(path).unwrap();
     }

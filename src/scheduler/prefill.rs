@@ -1,8 +1,8 @@
 //! Pending queue, KV allocation, and prefill batch selection.
 
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::collections::VecDeque;
 
-use crate::engine::kvcache::{CacheManager, KVCachePool};
+use crate::engine::kvcache::{AcquireOutcome, CacheManager};
 use crate::engine::{Batch, BatchContext, BatchRequest, ServerArgs};
 
 use super::{Request, RequestId, Result, SequenceStatus};
@@ -16,18 +16,15 @@ pub struct PrefillManager {
     pending: VecDeque<Request>,
     running: Vec<Request>,
     aborted: Vec<RequestId>,
-    pool: Rc<RefCell<KVCachePool>>,
     cache: Box<dyn CacheManager>,
     batch_context: BatchContext,
     max_running_req: usize,
     max_seq_len: usize,
-    page_size: usize,
 }
 
 impl PrefillManager {
     pub fn new(
         args: &ServerArgs,
-        pool: Rc<RefCell<KVCachePool>>,
         cache: Box<dyn CacheManager>,
         batch_context: BatchContext,
     ) -> Self {
@@ -35,12 +32,10 @@ impl PrefillManager {
             pending: VecDeque::new(),
             running: Vec::new(),
             aborted: Vec::new(),
-            pool,
             cache,
             batch_context,
             max_running_req: args.max_running_req,
             max_seq_len: args.max_seq_len,
-            page_size: args.page_size,
         }
     }
 
@@ -86,12 +81,10 @@ impl PrefillManager {
             let mut restored = Vec::new();
             for uid in &selected {
                 if let Some(index) = self.running.iter().position(|request| request.uid == *uid) {
-                    let request = &self.running[index];
-                    if let Some(handle) = &request.cache_handle {
-                        self.cache.rollback_insert(&request.input_ids, handle)?;
-                    }
                     let mut request = self.running.remove(index);
-                    request.cache_handle = None;
+                    if let Some(mut handle) = request.cache_handle.take() {
+                        self.cache.release(&mut handle);
+                    }
                     request.cached_len = 0;
                     request.status = SequenceStatus::Waiting;
                     restored.push(request);
@@ -116,51 +109,26 @@ impl PrefillManager {
                 continue;
             }
 
-            let (mut matched_len, mut shared_pages) =
-                self.cache.match_prefix(&request.input_ids)?;
-            let mut uncached = request.input_ids.len() - matched_len;
-            if total_tokens.saturating_add(uncached) > self.max_seq_len && !selected.is_empty() {
-                break;
-            }
-            let mut new_pages = self.pages_needed(request, matched_len);
-            if new_pages > self.pool.borrow().layout.num_pages {
-                let request = self.pending.pop_front().expect("front exists");
-                self.aborted.push(request.uid);
-                continue;
-            }
-
-            if self.pool.borrow().free_count() < new_pages {
-                let shortfall = new_pages - self.pool.borrow().free_count();
-                self.cache.evict(shortfall)?;
-                // Pages matched before eviction may have been returned to the
-                // pool. Match again before assigning any of them to this request.
-                (matched_len, shared_pages) = self.cache.match_prefix(&request.input_ids)?;
-                uncached = request.input_ids.len() - matched_len;
-                new_pages = self.pages_needed(request, matched_len);
-            }
-            if new_pages > self.pool.borrow().layout.num_pages {
-                let request = self.pending.pop_front().expect("front exists");
-                self.aborted.push(request.uid);
-                continue;
-            }
-            if total_tokens.saturating_add(uncached) > self.max_seq_len && !selected.is_empty() {
-                break;
-            }
-            if self.pool.borrow().free_count() < new_pages {
-                break;
-            }
-
-            let mut handle = self.pool.borrow_mut().alloc(new_pages)?;
-            handle.page_ids.splice(0..0, shared_pages);
-            handle.num_shared = matched_len / self.page_size;
-            handle.cached_len = matched_len;
-            let request = self.pending.front().expect("front exists");
-            if let Err(error) = self.cache.insert(&request.input_ids, &handle) {
-                self.pool
-                    .borrow_mut()
-                    .free_pages_by_id(handle.page_ids[handle.num_shared..].iter().copied());
-                return Err(error.into());
-            }
+            let capacity_tokens = request
+                .input_ids
+                .len()
+                .saturating_add(request.sampling_params.max_tokens.saturating_sub(1))
+                .min(self.max_seq_len);
+            let budget = (!selected.is_empty()).then_some(self.max_seq_len - total_tokens);
+            let handle = match self
+                .cache
+                .acquire(&request.input_ids, capacity_tokens, budget)?
+            {
+                AcquireOutcome::Ready(handle) => handle,
+                AcquireOutcome::Impossible => {
+                    let request = self.pending.pop_front().expect("front exists");
+                    self.aborted.push(request.uid);
+                    continue;
+                }
+                AcquireOutcome::DeferredBudget | AcquireOutcome::DeferredMemory => break,
+            };
+            let matched_len = handle.cached_len;
+            let uncached = request.input_ids.len() - matched_len;
             let mut request = self.pending.pop_front().expect("front exists");
             request.cached_len = matched_len;
             request.cache_handle = Some(handle);
@@ -182,27 +150,31 @@ impl PrefillManager {
                 BatchRequest {
                     input_ids: request.input_ids.clone(),
                     cached_len: request.cached_len,
-                    cache_handle: request.cache_handle.clone(),
+                    page_ids: request
+                        .cache_handle
+                        .as_ref()
+                        .expect("selected request has a handle")
+                        .page_ids
+                        .clone(),
                 }
             })
             .collect::<Vec<_>>();
         let model_batch = self.batch_context.prepare_prefill(&requests)?;
+        for uid in selected.iter().copied() {
+            let request = self
+                .running_request(uid)
+                .expect("selected request is running");
+            tracing::info!(
+                request_id = uid,
+                cached_tokens = request.cached_len,
+                prompt_tokens = request.input_ids.len(),
+                "prefill KV cache match"
+            );
+        }
         Ok(Some(PrefillBatch {
             request_ids: std::mem::take(selected),
             model_batch,
         }))
-    }
-
-    fn pages_needed(&self, request: &Request, matched_len: usize) -> usize {
-        let upper = request
-            .input_ids
-            .len()
-            .saturating_add(request.sampling_params.max_tokens)
-            .min(self.max_seq_len);
-        upper
-            .saturating_sub(matched_len)
-            .div_ceil(self.page_size)
-            .max(1)
     }
 
     pub fn abort(&mut self, uid: RequestId) -> bool {
@@ -211,55 +183,63 @@ impl PrefillManager {
             return true;
         }
         if let Some(index) = self.running.iter().position(|request| request.uid == uid) {
-            let request = &self.running[index];
-            if let Some(handle) = &request.cache_handle {
-                if self
-                    .cache
-                    .remove(request.written_input_ids(), handle)
-                    .is_err()
-                {
-                    return false;
-                }
+            let mut request = self.running.remove(index);
+            if let Some(mut handle) = request.cache_handle.take() {
+                self.cache.release(&mut handle);
             }
-            self.running.remove(index);
             return true;
         }
         false
     }
 
-    pub fn remove_finished_batch(&mut self, ids: &[RequestId]) -> Result<()> {
+    pub fn remove_batch(&mut self, ids: &[RequestId]) {
         for uid in ids {
             if let Some(index) = self.running.iter().position(|request| request.uid == *uid) {
-                let request = &self.running[index];
-                if let Some(handle) = &request.cache_handle {
-                    self.cache.remove(request.written_input_ids(), handle)?;
+                let mut request = self.running.remove(index);
+                if let Some(mut handle) = request.cache_handle.take() {
+                    self.cache.release(&mut handle);
                 }
-                self.running.remove(index);
             }
         }
-        Ok(())
     }
 
-    pub fn remove_failed_prefill_batch(&mut self, ids: &[RequestId]) -> Result<()> {
-        for uid in ids {
-            if let Some(index) = self.running.iter().position(|request| request.uid == *uid) {
-                let request = &self.running[index];
-                if let Some(handle) = &request.cache_handle {
-                    self.cache.rollback_insert(&request.input_ids, handle)?;
-                }
-                self.running.remove(index);
-            }
-        }
-        Ok(())
+    pub fn publish(
+        &mut self,
+        uid: RequestId,
+        written_ids: &[i64],
+    ) -> crate::engine::kvcache::Result<()> {
+        let request = self
+            .running
+            .iter_mut()
+            .find(|request| request.uid == uid)
+            .expect("scheduled request is running");
+        let handle = request
+            .cache_handle
+            .as_mut()
+            .expect("running request has KV handle");
+        self.cache.publish(handle, written_ids)
+    }
+
+    pub fn mark_written(&mut self, uid: RequestId, written_len: usize) {
+        let request = self
+            .running_request_mut(uid)
+            .expect("scheduled request is running");
+        request
+            .cache_handle
+            .as_mut()
+            .expect("running request has KV handle")
+            .written_len = written_len;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use tch::Device;
 
     use crate::engine::SamplingParams;
-    use crate::engine::kvcache::{KVCacheLayout, RadixCacheManager};
+    use crate::engine::kvcache::{KVCacheLayout, KVCachePool, RadixCacheManager};
 
     use super::*;
 
@@ -279,7 +259,7 @@ mod tests {
         args.page_size = page_size;
         let context =
             BatchContext::new(max_running_req, max_seq_len, page_size, Device::Cpu).unwrap();
-        let manager = PrefillManager::new(&args, pool.clone(), cache, context);
+        let manager = PrefillManager::new(&args, cache, context);
         (pool, manager)
     }
 
@@ -308,7 +288,7 @@ mod tests {
         assert_eq!(first.model_batch.input_ids.size(), vec![2]);
         assert_eq!(manager.pending_len(), 1);
         assert!(manager.schedule_prefill().unwrap().is_none());
-        manager.remove_finished_batch(&[0]).unwrap();
+        manager.remove_batch(&[0]);
         assert_eq!(
             manager.schedule_prefill().unwrap().unwrap().request_ids,
             vec![1]
@@ -341,7 +321,7 @@ mod tests {
         let (_pool, mut manager) = manager(2, 1, 4);
         manager.add_request(request(0, vec![1, 2, 3], 1));
         manager.schedule_prefill().unwrap().unwrap();
-        manager.remove_finished_batch(&[0]).unwrap();
+        manager.remove_batch(&[0]);
         manager.add_request(request(1, vec![1, 2, 4], 1));
         let batch = manager.schedule_prefill().unwrap().unwrap();
         assert_eq!(batch.request_ids, vec![1]);
@@ -358,13 +338,57 @@ mod tests {
     #[test]
     fn completed_prefill_does_not_cache_unwritten_sampled_token() {
         let (_pool, mut manager) = manager(3, 1, 6);
-        manager.add_request(request(0, vec![1], 1));
+        manager.add_request(request(0, vec![1, 2], 1));
         manager.schedule_prefill().unwrap().unwrap();
+        manager.publish(0, &[1, 2]).unwrap();
         manager.running_request_mut(0).unwrap().append_token(7);
-        manager.remove_finished_batch(&[0]).unwrap();
+        manager.remove_batch(&[0]);
 
-        manager.add_request(request(1, vec![1, 7, 4], 1));
+        manager.add_request(request(1, vec![1, 2, 7, 4], 1));
         manager.schedule_prefill().unwrap().unwrap();
-        assert_eq!(manager.running_request(1).unwrap().cached_len, 0);
+        assert_eq!(manager.running_request(1).unwrap().cached_len, 2);
+    }
+
+    #[test]
+    fn capacity_excludes_the_last_sampled_token() {
+        let (pool, mut manager) = manager(1, 1, 3);
+        manager.add_request(request(0, vec![1, 2], 1));
+        assert_eq!(
+            manager.schedule_prefill().unwrap().unwrap().request_ids,
+            vec![0]
+        );
+        assert_eq!(pool.borrow().free_count(), 0);
+        assert!(manager.drain_aborted().is_empty());
+        manager.remove_batch(&[0]);
+        assert_eq!(pool.borrow().free_count(), 1);
+    }
+
+    #[test]
+    fn batch_preparation_error_restores_order_and_all_pages() {
+        let page_size = 2;
+        let pool = Rc::new(RefCell::new(KVCachePool::without_tensor(
+            KVCacheLayout::new(1, 4, page_size, 1, 1).unwrap(),
+        )));
+        let cache = Box::new(RadixCacheManager::new(pool.clone(), page_size).unwrap());
+        let mut args = ServerArgs::new("unused-model-path");
+        args.max_running_req = 2;
+        args.max_seq_len = 4;
+        args.page_size = page_size;
+        // The narrower context rejects two selected requests after acquire.
+        let context = BatchContext::new(1, 4, page_size, Device::Cpu).unwrap();
+        let mut manager = PrefillManager::new(&args, cache, context);
+        manager.add_request(request(0, vec![1], 1));
+        manager.add_request(request(1, vec![2], 1));
+        assert!(manager.schedule_prefill().is_err());
+        assert_eq!(manager.running_len(), 0);
+        assert_eq!(pool.borrow().free_count(), 4);
+        assert_eq!(
+            manager
+                .pending
+                .iter()
+                .map(|req| req.uid)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 }

@@ -14,6 +14,6 @@ pub use allocator::{
 };
 pub use error::{KVCacheError, Result};
 pub use naive::NaiveCacheManager;
-pub use pool::{BaseCacheHandle, CacheManager, KVCacheLayout, KVCachePool};
+pub use pool::{AcquireOutcome, BaseCacheHandle, CacheManager, KVCacheLayout, KVCachePool};
 pub use radix::{RadixCacheManager, RadixNode};
 pub use tch::{Device, Kind, Tensor};

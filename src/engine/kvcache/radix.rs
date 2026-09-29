@@ -1,449 +1,463 @@
-use std::{
-    cell::RefCell,
-    collections::{BTreeSet, HashMap},
-    rc::Rc,
-};
+//! Page-granular prefix cache. Only successful forwards publish KV pages.
 
-use super::{BaseCacheHandle, CacheManager, KVCacheError, KVCachePool, Result};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
+
+use super::{AcquireOutcome, BaseCacheHandle, CacheManager, KVCacheError, KVCachePool, Result};
+use crate::engine::kvcache::pool::PageOwner;
 
 type NodeId = usize;
 
-/// One token in a prefix-sharing radix tree.
-#[derive(Debug, Clone)]
+/// One complete token page and its canonical physical KV page.
+#[derive(Debug)]
 pub struct RadixNode {
-    pub token: i64,
-    pub ref_count: usize,
-    pub page_id: Option<usize>,
-    depth: isize,
+    tokens: Vec<i64>,
+    page_id: usize,
     parent: Option<NodeId>,
-    children: HashMap<i64, NodeId>,
+    children: HashMap<Vec<i64>, NodeId>,
+    pin_count: usize,
+    depth: usize,
 }
 
 impl RadixNode {
     fn root() -> Self {
         Self {
-            token: -1,
-            ref_count: 1,
-            page_id: None,
-            depth: -1,
+            tokens: Vec::new(),
+            page_id: usize::MAX,
             parent: None,
             children: HashMap::new(),
+            pin_count: 0,
+            depth: 0,
         }
     }
 
-    fn child(token: i64, parent: NodeId, depth: isize) -> Self {
+    fn child(tokens: Vec<i64>, page_id: usize, parent: NodeId, depth: usize) -> Self {
         Self {
-            token,
-            ref_count: 0,
-            page_id: None,
-            depth,
+            tokens,
+            page_id,
             parent: Some(parent),
             children: HashMap::new(),
+            pin_count: 1,
+            depth,
         }
     }
 }
 
-/// Prefix cache with page-granular eviction.
-///
-/// `Rc<RefCell<_>>` lets the scheduler retain access to the same pool while the
-/// cache manager returns pages during eviction. Scheduling remains single-threaded
-/// at this stage; multi-threaded scheduling should replace it with `Arc<Mutex<_>>`.
+/// The scheduler owns this manager exclusively; the pool is shared with Engine.
 pub struct RadixCacheManager {
     pool: Rc<RefCell<KVCachePool>>,
     page_size: usize,
-    nodes: Vec<RadixNode>,
+    nodes: Vec<Option<RadixNode>>,
+    free_node_ids: Vec<NodeId>,
 }
 
 impl RadixCacheManager {
     pub fn new(pool: Rc<RefCell<KVCachePool>>, page_size: usize) -> Result<Self> {
-        if page_size == 0 {
+        if page_size == 0 || page_size != pool.borrow().layout.page_size {
             return Err(KVCacheError::InvalidArgument(
-                "page_size must be greater than zero".to_owned(),
+                "radix page size must match the KV pool".to_owned(),
             ));
         }
         Ok(Self {
             pool,
             page_size,
-            nodes: vec![RadixNode::root()],
+            nodes: vec![Some(RadixNode::root())],
+            free_node_ids: Vec::new(),
         })
     }
 
     fn node(&self, id: NodeId) -> &RadixNode {
-        &self.nodes[id]
+        self.nodes[id].as_ref().expect("live radix node")
     }
 
     fn node_mut(&mut self, id: NodeId) -> &mut RadixNode {
-        &mut self.nodes[id]
+        self.nodes[id].as_mut().expect("live radix node")
     }
 
-    fn child_id(&self, node: NodeId, token: i64) -> Option<NodeId> {
-        self.node(node).children.get(&token).copied()
-    }
-
-    fn get_or_create_child(&mut self, parent: NodeId, token: i64) -> NodeId {
-        if let Some(child) = self.child_id(parent, token) {
-            return child;
-        }
-
-        let child = self.nodes.len();
-        let depth = self.node(parent).depth + 1;
-        self.nodes.push(RadixNode::child(token, parent, depth));
-        self.node_mut(parent).children.insert(token, child);
-        child
-    }
-
-    fn required_pages(&self, input_ids: &[i64]) -> usize {
-        input_ids.len().div_ceil(self.page_size)
-    }
-
-    fn ensure_page_table(&self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()> {
-        let required = self.required_pages(input_ids);
-        if handle.page_ids.len() < required {
-            return Err(KVCacheError::InvalidArgument(format!(
-                "page table has {} pages but {required} are required for {} tokens",
-                handle.page_ids.len(),
-                input_ids.len()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Return the page-aligned reusable prefix. The final token is always
-    /// excluded so the model recomputes logits for sampling.
-    pub fn match_prefix(&self, input_ids: &[i64]) -> (usize, Vec<usize>) {
-        if input_ids.is_empty() {
-            return (0, Vec::new());
-        }
-
-        let mut node = 0;
+    fn match_path(&self, input_ids: &[i64]) -> Vec<NodeId> {
+        // Prefill must recompute at least one prompt token for its logits.
+        let max_pages = input_ids.len().saturating_sub(1) / self.page_size;
         let mut path = Vec::new();
-        for &token in input_ids {
-            let Some(child) = self.child_id(node, token) else {
-                break;
-            };
-            node = child;
-            path.push(node);
-        }
-
-        let matched_len = (path.len() / self.page_size) * self.page_size;
-        let maximum = ((input_ids.len() - 1) / self.page_size) * self.page_size;
-        let matched_len = matched_len.min(maximum);
-        let shared_pages = (0..matched_len / self.page_size)
-            .filter_map(|page| self.node(path[(page + 1) * self.page_size - 1]).page_id)
-            .collect();
-        (matched_len, shared_pages)
-    }
-
-    /// Claim a reference to every node of a prompt path.
-    pub fn insert(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()> {
-        self.ensure_page_table(input_ids, handle)?;
-        let mut node = 0;
-        for (depth, &token) in input_ids.iter().enumerate() {
-            node = self.get_or_create_child(node, token);
-            let page_id = handle.page_ids[depth / self.page_size];
-            let node = self.node_mut(node);
-            node.ref_count += 1;
-            node.page_id = Some(page_id);
-        }
-        Ok(())
-    }
-
-    /// Undo an insert whose forward pass failed before writing its KV values.
-    pub fn rollback_insert(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()> {
-        let mut node = 0;
-        let mut path = Vec::new();
-        for &token in input_ids {
-            let Some(child) = self.child_id(node, token) else {
+        let mut parent = 0;
+        for index in 0..max_pages {
+            let tokens = &input_ids[index * self.page_size..(index + 1) * self.page_size];
+            let Some(&child) = self.node(parent).children.get(tokens) else {
                 break;
             };
             path.push(child);
-            node = child;
+            parent = child;
         }
-
-        for &node in &path {
-            self.node_mut(node).ref_count = self.node(node).ref_count.saturating_sub(1);
-        }
-
-        let mut freed_pages = BTreeSet::new();
-        for &node in path.iter().rev() {
-            let removable = self.node(node).ref_count == 0 && self.node(node).children.is_empty();
-            if !removable {
-                continue;
-            }
-            if let Some(page_id) = self.node(node).page_id {
-                freed_pages.insert(page_id);
-            }
-            let parent = self
-                .node(node)
-                .parent
-                .expect("root is never on an inserted path");
-            let token = self.node(node).token;
-            self.node_mut(parent).children.remove(&token);
-        }
-        if !freed_pages.is_empty() {
-            self.pool
-                .borrow_mut()
-                .free_pages_by_id(freed_pages.into_iter());
-        }
-
-        let used = self.required_pages(input_ids);
-        self.pool.borrow_mut().free_pages_by_id(
-            handle.page_ids[used.min(handle.page_ids.len())..]
-                .iter()
-                .copied(),
-        );
-        Ok(())
+        path
     }
 
-    /// Drop request references, preserve written KV in the tree, and return
-    /// over-allocated pages that cannot contain a token.
-    pub fn remove(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()> {
-        let mut node = 0;
-        for (depth, &token) in input_ids.iter().enumerate() {
-            let child = if let Some(child) = self.child_id(node, token) {
-                self.node_mut(child).ref_count = self.node(child).ref_count.saturating_sub(1);
-                child
-            } else {
-                let child = self.get_or_create_child(node, token);
-                if depth < handle.page_ids.len() * self.page_size {
-                    self.node_mut(child).page_id = Some(handle.page_ids[depth / self.page_size]);
-                }
-                child
-            };
-            node = child;
-        }
-
-        let used = self.required_pages(input_ids);
-        self.pool.borrow_mut().free_pages_by_id(
-            handle.page_ids[used.min(handle.page_ids.len())..]
-                .iter()
-                .copied(),
-        );
-        Ok(())
+    /// Read-only inspection; actual reuse must go through `acquire` to pin pages.
+    pub fn match_prefix(&self, input_ids: &[i64]) -> (usize, Vec<usize>) {
+        let path = self.match_path(input_ids);
+        (
+            path.len() * self.page_size,
+            path.iter().map(|&id| self.node(id).page_id).collect(),
+        )
     }
 
-    /// Evict unreferenced leaf chains. It only begins a page when the entire
-    /// page can be detached, so a shared page is never partially released.
+    fn insert_page(&mut self, parent: NodeId, tokens: Vec<i64>, page_id: usize) -> NodeId {
+        let id = self.free_node_ids.pop().unwrap_or(self.nodes.len());
+        let depth = self.node(parent).depth + 1;
+        let node = RadixNode::child(tokens.clone(), page_id, parent, depth);
+        if id == self.nodes.len() {
+            self.nodes.push(Some(node));
+        } else {
+            self.nodes[id] = Some(node);
+        }
+        self.node_mut(parent).children.insert(tokens, id);
+        id
+    }
+
+    /// Evict only unpinned leaves; their ancestors remain until no child needs them.
     pub fn evict(&mut self, num_pages: usize) -> Vec<usize> {
         let mut freed = Vec::new();
-        let mut remaining = num_pages;
-
-        while remaining > 0 {
-            let mut leaves: Vec<_> = self
-                .iter_leaves()
-                .into_iter()
-                .filter(|&node| self.node(node).ref_count == 0)
-                .collect();
-            if leaves.is_empty() {
-                break;
-            }
-            leaves.sort_unstable_by_key(|&node| std::cmp::Reverse(self.node(node).depth));
-
-            let mut progress = false;
-            for leaf in leaves {
-                let count = self.evict_leaf_chain(leaf, remaining, &mut freed);
-                if count > 0 {
-                    remaining -= count;
-                    progress = true;
-                    break;
-                }
-            }
-            if !progress {
-                break;
-            }
+        while freed.len() < num_pages {
+            let leaf = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(id, node)| {
+                    let node = node.as_ref()?;
+                    (id != 0 && node.children.is_empty() && node.pin_count == 0)
+                        .then_some((id, node.depth))
+                })
+                .max_by_key(|(_, depth)| *depth)
+                .map(|(id, _)| id);
+            let Some(id) = leaf else { break };
+            let node = self.nodes[id].take().expect("selected live leaf");
+            let parent = node.parent.expect("leaf is not root");
+            self.node_mut(parent).children.remove(&node.tokens);
+            self.free_node_ids.push(id);
+            self.pool.borrow_mut().free_pages_by_id([node.page_id]);
+            freed.push(node.page_id);
         }
         freed
-    }
-
-    fn iter_leaves(&self) -> Vec<NodeId> {
-        let mut leaves = Vec::new();
-        let mut stack = vec![0];
-        while let Some(node) = stack.pop() {
-            let node_ref = self.node(node);
-            if node != 0 && node_ref.children.is_empty() {
-                leaves.push(node);
-            }
-            stack.extend(node_ref.children.values().copied());
-        }
-        leaves
-    }
-
-    fn evict_leaf_chain(
-        &mut self,
-        leaf: NodeId,
-        max_pages: usize,
-        freed: &mut Vec<usize>,
-    ) -> usize {
-        let mut chain = Vec::new();
-        let mut node = leaf;
-        while node != 0 && self.node(node).ref_count == 0 && self.node(node).children.len() <= 1 {
-            chain.push(node);
-            node = self
-                .node(node)
-                .parent
-                .expect("non-root nodes have a parent");
-        }
-
-        let depth = self.node(leaf).depth as usize;
-        let mut position = 0;
-        let mut pages_freed = 0;
-        while position < chain.len() && pages_freed < max_pages {
-            let group_size = if position == 0 {
-                depth % self.page_size + 1
-            } else {
-                self.page_size
-            };
-            if position + group_size > chain.len() {
-                break;
-            }
-
-            let owner = chain[position];
-            for &victim in &chain[position..position + group_size] {
-                let parent = self.node(victim).parent.expect("victim is not root");
-                let token = self.node(victim).token;
-                self.node_mut(parent).children.remove(&token);
-            }
-            if let Some(page_id) = self.node(owner).page_id {
-                self.pool.borrow_mut().free_pages_by_id([page_id]);
-                freed.push(page_id);
-                pages_freed += 1;
-            }
-            position += group_size;
-        }
-        pages_freed
     }
 }
 
 impl CacheManager for RadixCacheManager {
-    fn match_prefix(&self, input_ids: &[i64]) -> Result<(usize, Vec<usize>)> {
-        Ok(self.match_prefix(input_ids))
+    fn acquire(
+        &mut self,
+        input_ids: &[i64],
+        capacity_tokens: usize,
+        budget: Option<usize>,
+    ) -> Result<AcquireOutcome> {
+        if input_ids.is_empty() || capacity_tokens < input_ids.len() {
+            return Err(KVCacheError::InvalidArgument(
+                "nonempty prompt must fit the KV capacity".to_owned(),
+            ));
+        }
+        let total_pages = capacity_tokens.div_ceil(self.page_size);
+        if total_pages > self.pool.borrow().layout.num_pages {
+            return Ok(AcquireOutcome::Impossible);
+        }
+        let path = self.match_path(input_ids);
+        let cached_len = path.len() * self.page_size;
+        if budget.is_some_and(|limit| input_ids.len() - cached_len > limit) {
+            return Ok(AcquireOutcome::DeferredBudget);
+        }
+
+        for &id in &path {
+            self.node_mut(id).pin_count += 1;
+        }
+        let private_count = total_pages - path.len();
+        let free = self.pool.borrow().free_count();
+        if free < private_count {
+            self.evict(private_count - free);
+        }
+        if self.pool.borrow().free_count() < private_count {
+            for &id in &path {
+                self.node_mut(id).pin_count -= 1;
+            }
+            return Ok(AcquireOutcome::DeferredMemory);
+        }
+
+        let allocation_result = { self.pool.borrow_mut().alloc(private_count) };
+        let allocation = match allocation_result {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                for &id in &path {
+                    self.node_mut(id).pin_count -= 1;
+                }
+                return Err(error);
+            }
+        };
+        let mut page_ids = path
+            .iter()
+            .map(|&id| self.node(id).page_id)
+            .collect::<Vec<_>>();
+        page_ids.extend(allocation.page_ids);
+        let mut owners = path
+            .iter()
+            .map(|&id| PageOwner::Tree(id))
+            .collect::<Vec<_>>();
+        owners.extend(allocation.owners);
+        Ok(AcquireOutcome::Ready(BaseCacheHandle {
+            page_ids,
+            cached_len,
+            owners,
+            published_pages: path.len(),
+            written_len: cached_len,
+        }))
     }
 
-    fn insert(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()> {
-        self.insert(input_ids, handle)
+    fn publish(&mut self, handle: &mut BaseCacheHandle, written_ids: &[i64]) -> Result<()> {
+        if handle.page_ids.len() != handle.owners.len()
+            || written_ids.len() < handle.written_len
+            || written_ids.len() > handle.page_ids.len() * self.page_size
+        {
+            return Err(KVCacheError::InvalidArgument(
+                "written tokens do not fit the KV handle".to_owned(),
+            ));
+        }
+        let full_pages = written_ids.len() / self.page_size;
+        for index in 0..full_pages {
+            let PageOwner::Tree(id) = handle.owners[index] else {
+                break;
+            };
+            let tokens = &written_ids[index * self.page_size..(index + 1) * self.page_size];
+            if self.node(id).tokens != tokens {
+                return Err(KVCacheError::InvalidArgument(
+                    "published prefix differs from the handle".to_owned(),
+                ));
+            }
+        }
+        for index in handle.published_pages..full_pages {
+            if handle.owners[index] != PageOwner::Private {
+                return Err(KVCacheError::InvalidArgument(
+                    "unpublished page is not private".to_owned(),
+                ));
+            }
+            let parent = if index == 0 {
+                0
+            } else if let PageOwner::Tree(id) = handle.owners[index - 1] {
+                id
+            } else {
+                return Err(KVCacheError::InvalidArgument(
+                    "published page path is discontinuous".to_owned(),
+                ));
+            };
+            let tokens = written_ids[index * self.page_size..(index + 1) * self.page_size].to_vec();
+            let private_page = handle.page_ids[index];
+            if let Some(&canonical) = self.node(parent).children.get(tokens.as_slice()) {
+                let canonical_page = self.node(canonical).page_id;
+                if private_page == canonical_page {
+                    return Err(KVCacheError::InvalidArgument(
+                        "private page already belongs to radix".to_owned(),
+                    ));
+                }
+                self.node_mut(canonical).pin_count += 1;
+                handle.page_ids[index] = canonical_page;
+                handle.owners[index] = PageOwner::Tree(canonical);
+                self.pool.borrow_mut().free_pages_by_id([private_page]);
+            } else {
+                let id = self.insert_page(parent, tokens, private_page);
+                handle.owners[index] = PageOwner::Tree(id);
+            }
+            handle.published_pages += 1;
+        }
+        handle.written_len = written_ids.len();
+        Ok(())
     }
 
-    fn evict(&mut self, num_pages: usize) -> Result<Vec<usize>> {
-        Ok(self.evict(num_pages))
-    }
-
-    fn remove(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()> {
-        self.remove(input_ids, handle)
-    }
-
-    fn rollback_insert(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()> {
-        self.rollback_insert(input_ids, handle)
+    fn release(&mut self, handle: &mut BaseCacheHandle) {
+        let page_ids = std::mem::take(&mut handle.page_ids);
+        let owners = std::mem::take(&mut handle.owners);
+        assert_eq!(page_ids.len(), owners.len(), "KV handle ownership mismatch");
+        let mut private = Vec::new();
+        for (page_id, owner) in page_ids.into_iter().zip(owners) {
+            match owner {
+                PageOwner::Private => private.push(page_id),
+                PageOwner::Tree(id) => {
+                    let node = self.node_mut(id);
+                    assert!(node.pin_count > 0, "radix pin underflow");
+                    node.pin_count -= 1;
+                }
+            }
+        }
+        self.pool.borrow_mut().free_pages_by_id(private);
+        handle.cached_len = 0;
+        handle.published_pages = 0;
+        handle.written_len = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::engine::kvcache::KVCacheLayout;
 
     fn cache(num_pages: usize) -> (Rc<RefCell<KVCachePool>>, RadixCacheManager) {
         let pool = Rc::new(RefCell::new(KVCachePool::without_tensor(
-            KVCacheLayout::new(2, num_pages, 4, 4, 32).unwrap(),
+            KVCacheLayout::new(1, num_pages, 2, 1, 1).unwrap(),
         )));
-        let manager = RadixCacheManager::new(Rc::clone(&pool), 4).unwrap();
-        (pool, manager)
+        let cache = RadixCacheManager::new(pool.clone(), 2).unwrap();
+        (pool, cache)
+    }
+
+    fn ready(outcome: AcquireOutcome) -> BaseCacheHandle {
+        match outcome {
+            AcquireOutcome::Ready(handle) => handle,
+            _ => panic!("request should acquire pages"),
+        }
+    }
+
+    fn assert_partition(cache: &RadixCacheManager, handles: &[&BaseCacheHandle]) {
+        let pool = cache.pool.borrow();
+        let mut all = HashSet::new();
+        for &page in pool.free_page_ids() {
+            assert!(all.insert(page), "duplicate free page {page}");
+        }
+        for node in cache.nodes.iter().skip(1).flatten() {
+            assert!(all.insert(node.page_id), "tree page is already owned");
+        }
+        for handle in handles {
+            for (&page, owner) in handle.page_ids.iter().zip(&handle.owners) {
+                match owner {
+                    PageOwner::Private => {
+                        assert!(all.insert(page), "private page is already owned");
+                    }
+                    PageOwner::Tree(id) => {
+                        assert_eq!(cache.node(*id).page_id, page);
+                        assert!(cache.node(*id).pin_count > 0);
+                        assert!(!pool.free_page_ids().contains(&page));
+                    }
+                }
+            }
+        }
+        assert_eq!(all.len(), pool.layout.num_pages);
     }
 
     #[test]
-    fn matches_complete_pages_but_recomputes_the_last_token() {
-        let (pool, mut cache) = cache(20);
-        let handle = pool.borrow_mut().alloc(2).unwrap();
-        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &handle).unwrap();
+    fn cold_batch_keeps_private_pages_until_serial_publication() {
+        let (pool, mut cache) = cache(6);
+        let mut a = ready(cache.acquire(&[1, 2, 3, 4], 4, None).unwrap());
+        let mut b = ready(cache.acquire(&[1, 2, 3, 4], 4, None).unwrap());
+        assert_ne!(a.page_ids, b.page_ids);
+        assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 5]), (0, vec![]));
+        assert_partition(&cache, &[&a, &b]);
 
+        cache.publish(&mut a, &[1, 2, 3, 4]).unwrap();
+        cache.publish(&mut b, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(a.page_ids, b.page_ids);
+        assert_eq!(pool.borrow().free_count(), 4);
+        assert_partition(&cache, &[&a, &b]);
+        cache.release(&mut a);
+        cache.release(&mut b);
+        cache.release(&mut b);
+        assert_eq!(cache.evict(2).len(), 2);
+        assert_eq!(pool.borrow().free_count(), 6);
+    }
+
+    #[test]
+    fn generated_prefix_merges_with_later_prompt_without_leaking_a_page() {
+        let (pool, mut cache) = cache(6);
+        let mut a = ready(cache.acquire(&[1, 2], 4, None).unwrap());
+        cache.publish(&mut a, &[1, 2]).unwrap();
+        let a_generated_page = a.page_ids[1];
+
+        let mut b = ready(cache.acquire(&[1, 2, 3, 4, 6], 5, None).unwrap());
+        assert_eq!(b.cached_len, 2);
+        assert_ne!(b.page_ids[1], a_generated_page);
+        cache.publish(&mut b, &[1, 2, 3, 4, 6]).unwrap();
+        cache.publish(&mut a, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(a.page_ids[1], b.page_ids[1]);
+        assert!(pool.borrow().free_page_ids().contains(&a_generated_page));
+        assert_partition(&cache, &[&a, &b]);
+
+        cache.release(&mut a);
+        assert_partition(&cache, &[&b]);
+        cache.release(&mut b);
+        cache.evict(6);
+        assert_eq!(pool.borrow().free_count(), 6);
+    }
+
+    #[test]
+    fn completed_generation_is_reused_by_a_later_prompt() {
+        let (pool, mut cache) = cache(4);
+        let mut a = ready(cache.acquire(&[1, 2], 4, None).unwrap());
+        cache.publish(&mut a, &[1, 2]).unwrap();
+        cache.publish(&mut a, &[1, 2, 3, 4]).unwrap();
+        cache.release(&mut a);
+
+        let mut b = ready(cache.acquire(&[1, 2, 3, 4, 5], 5, None).unwrap());
+        assert_eq!(b.cached_len, 4);
+        assert_eq!(b.published_pages, 2);
+        assert_partition(&cache, &[&b]);
+        cache.release(&mut b);
+        cache.evict(4);
+        assert_eq!(pool.borrow().free_count(), 4);
+    }
+
+    #[test]
+    fn partial_and_unwritten_tokens_are_never_published() {
+        let (_, mut cache) = cache(5);
+        let mut a = ready(cache.acquire(&[1, 2, 3], 3, None).unwrap());
+        cache.publish(&mut a, &[1, 2, 3]).unwrap();
+        assert_eq!(a.published_pages, 1);
         assert_eq!(
-            cache.match_prefix(&[1, 2, 3, 4, 9, 0]),
-            (4, vec![handle.page_ids[0]])
+            cache.match_prefix(&[1, 2, 3, 4, 5]),
+            (2, vec![a.page_ids[0]])
         );
-        assert_eq!(
-            cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]),
-            (4, vec![handle.page_ids[0]])
-        );
+        cache.release(&mut a);
+        assert_eq!(cache.evict(5).len(), 1);
     }
 
     #[test]
-    fn removes_then_evicts_full_and_partial_pages() {
-        let (pool, mut cache) = cache(20);
-        let handle = pool.borrow_mut().alloc(2).unwrap();
-        cache.insert(&[1, 2, 3, 4, 5, 6], &handle).unwrap();
-        cache.remove(&[1, 2, 3, 4, 5, 6], &handle).unwrap();
-
-        let mut evicted = cache.evict(2);
-        evicted.sort_unstable();
-        let mut expected = handle.page_ids.clone();
-        expected.sort_unstable();
-        assert_eq!(evicted, expected);
-        assert_eq!(pool.borrow().free_count(), 20);
+    fn budget_deferral_does_not_pin_or_evict() {
+        let (pool, mut cache) = cache(2);
+        let mut first = ready(cache.acquire(&[1, 2], 2, None).unwrap());
+        cache.publish(&mut first, &[1, 2]).unwrap();
+        cache.release(&mut first);
+        let free = pool.borrow().free_count();
+        assert!(matches!(
+            cache.acquire(&[1, 2, 3], 3, Some(0)).unwrap(),
+            AcquireOutcome::DeferredBudget
+        ));
+        assert_eq!(pool.borrow().free_count(), free);
+        assert_eq!(cache.node(1).pin_count, 0);
     }
 
     #[test]
-    fn preserves_shared_prefix_when_one_insert_is_rolled_back() {
-        let (pool, mut cache) = cache(30);
-        let first = pool.borrow_mut().alloc(2).unwrap();
-        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &first).unwrap();
-        let (_, shared) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        let mut second = pool.borrow_mut().alloc(1).unwrap();
-        second.page_ids.splice(0..0, shared.iter().copied());
-        second.num_shared = shared.len();
-        cache
-            .insert(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], &second)
-            .unwrap();
+    fn matched_page_stays_pinned_during_eviction_and_capacity_is_total() {
+        let (pool, mut cache) = cache(2);
+        let mut first = ready(cache.acquire(&[1, 2, 3, 4], 4, None).unwrap());
+        cache.publish(&mut first, &[1, 2, 3, 4]).unwrap();
+        cache.release(&mut first);
+        assert!(matches!(
+            cache.acquire(&[1, 2, 3, 4, 5], 5, None).unwrap(),
+            AcquireOutcome::Impossible
+        ));
 
-        cache
-            .rollback_insert(&[1, 2, 3, 4, 5, 6, 7, 8], &first)
-            .unwrap();
-        assert_eq!(
-            cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8, 9]),
-            (8, shared)
-        );
-        assert_eq!(pool.borrow().free_count(), 27);
+        let mut second = ready(cache.acquire(&[1, 2, 9], 3, None).unwrap());
+        assert_eq!(second.cached_len, 2);
+        assert_ne!(second.page_ids[0], second.page_ids[1]);
+        assert_partition(&cache, &[&second]);
+        cache.release(&mut second);
+        cache.evict(2);
+        assert_eq!(pool.borrow().free_count(), 2);
     }
 
     #[test]
-    fn rollback_returns_unshared_pages_and_removes_the_prefix() {
-        let (pool, mut cache) = cache(20);
-        let handle = pool.borrow_mut().alloc(2).unwrap();
-        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &handle).unwrap();
-        cache
-            .rollback_insert(&[1, 2, 3, 4, 5, 6, 7, 8], &handle)
-            .unwrap();
-
-        assert_eq!(cache.match_prefix(&[1, 2, 3, 4]), (0, vec![]));
-        assert_eq!(pool.borrow().free_count(), 20);
-    }
-
-    #[test]
-    fn shared_prefix_pages_are_evicted_exactly_once() {
-        let (pool, mut cache) = cache(20);
-        let first = pool.borrow_mut().alloc(2).unwrap();
-        cache.insert(&[1, 2, 3, 4, 5, 6], &first).unwrap();
-
-        let (_, shared) = cache.match_prefix(&[1, 2, 3, 4, 7, 8]);
-        let mut second = pool.borrow_mut().alloc(1).unwrap();
-        second.page_ids.splice(0..0, shared.iter().copied());
-        cache.insert(&[1, 2, 3, 4, 7, 8], &second).unwrap();
-        cache.remove(&[1, 2, 3, 4, 5, 6], &first).unwrap();
-        cache.remove(&[1, 2, 3, 4, 7, 8], &second).unwrap();
-
-        let mut evicted = cache.evict(10);
-        evicted.sort_unstable();
-        let mut expected = vec![first.page_ids[0], first.page_ids[1], second.page_ids[1]];
-        expected.sort_unstable();
-        assert_eq!(evicted, expected);
-        assert_eq!(pool.borrow().free_count(), 20);
-    }
-
-    #[test]
-    fn referenced_nodes_cannot_be_evicted() {
-        let (pool, mut cache) = cache(20);
-        let handle = pool.borrow_mut().alloc(1).unwrap();
-        cache.insert(&[1, 2, 3, 4], &handle).unwrap();
-
+    fn evicted_node_slot_is_reused_only_after_release() {
+        let (_, mut cache) = cache(3);
+        let mut first = ready(cache.acquire(&[1, 2], 2, None).unwrap());
+        cache.publish(&mut first, &[1, 2]).unwrap();
+        let id = match first.owners[0] {
+            PageOwner::Tree(id) => id,
+            _ => unreachable!(),
+        };
         assert!(cache.evict(1).is_empty());
-        assert_eq!(pool.borrow().free_count(), 19);
+        cache.release(&mut first);
+        assert_eq!(cache.evict(1).len(), 1);
+        let mut second = ready(cache.acquire(&[3, 4], 2, None).unwrap());
+        cache.publish(&mut second, &[3, 4]).unwrap();
+        assert_eq!(second.owners[0], PageOwner::Tree(id));
+        cache.release(&mut second);
     }
 }

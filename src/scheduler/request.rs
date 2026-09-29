@@ -29,7 +29,7 @@ pub enum SequenceStatus {
     Finished,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Request {
     pub uid: RequestId,
     pub input_ids: Vec<i64>,

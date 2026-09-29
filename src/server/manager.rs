@@ -200,14 +200,17 @@ fn run_scheduler(mut scheduler: Scheduler, commands: mpsc::Receiver<Command>) {
             }
             Err(error) => {
                 tracing::error!(error = %error, "scheduler step failed");
-                for (uid, sender) in results.drain() {
+                let terminated = results.drain().collect::<Vec<_>>();
+                for (uid, _) in &terminated {
+                    scheduler.abort_request(*uid);
+                }
+                for (uid, sender) in terminated {
                     let _ = sender.send(OutputToken {
                         uid,
                         token_id: 0,
                         finished: true,
                         finish_reason: Some(FinishReason::Error),
                     });
-                    scheduler.abort_request(uid);
                 }
             }
         }
@@ -239,8 +242,9 @@ fn handle_command(
             }
         },
         Command::Abort(uid) => {
-            scheduler.abort_request(uid);
-            if let Some(sender) = results.remove(&uid) {
+            if scheduler.abort_request(uid)
+                && let Some(sender) = results.remove(&uid)
+            {
                 let _ = sender.send(OutputToken {
                     uid,
                     token_id: 0,

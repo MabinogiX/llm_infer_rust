@@ -2,15 +2,21 @@ use tch::{Device, Kind, Tensor};
 
 use super::{KVCacheError, Result};
 
-/// A request's complete KV page table.
-///
-/// When prefix caching is introduced, the leading `num_shared` page IDs are
-/// borrowed from that cache. The remaining IDs belong to this request.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// One page is either private to a request or pinned in the radix tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageOwner {
+    Private,
+    Tree(usize),
+}
+
+/// A request's unique KV page table and its exact page ownership.
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct BaseCacheHandle {
     pub page_ids: Vec<usize>,
     pub cached_len: usize,
-    pub num_shared: usize,
+    pub(crate) owners: Vec<PageOwner>,
+    pub(crate) published_pages: usize,
+    pub(crate) written_len: usize,
 }
 
 impl BaseCacheHandle {
@@ -19,13 +25,24 @@ impl BaseCacheHandle {
     }
 }
 
+/// Result of an atomic cache lookup and allocation.
+pub enum AcquireOutcome {
+    Ready(BaseCacheHandle),
+    DeferredBudget,
+    DeferredMemory,
+    Impossible,
+}
+
 /// Interface shared by naive and radix cache managers.
 pub trait CacheManager {
-    fn match_prefix(&self, input_ids: &[i64]) -> Result<(usize, Vec<usize>)>;
-    fn insert(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()>;
-    fn evict(&mut self, num_pages: usize) -> Result<Vec<usize>>;
-    fn remove(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()>;
-    fn rollback_insert(&mut self, input_ids: &[i64], handle: &BaseCacheHandle) -> Result<()>;
+    fn acquire(
+        &mut self,
+        input_ids: &[i64],
+        capacity_tokens: usize,
+        budget: Option<usize>,
+    ) -> Result<AcquireOutcome>;
+    fn publish(&mut self, handle: &mut BaseCacheHandle, written_ids: &[i64]) -> Result<()>;
+    fn release(&mut self, handle: &mut BaseCacheHandle);
 }
 
 /// Shape metadata for the backing `(K, V)` tensor.
@@ -130,13 +147,24 @@ impl KVCachePool {
             .collect();
         Ok(BaseCacheHandle {
             page_ids,
+            owners: vec![PageOwner::Private; num_pages],
             ..Default::default()
         })
     }
 
     /// Return a handle's pages. Clearing the handle makes repeated frees safe.
     pub fn free(&mut self, handle: &mut BaseCacheHandle) {
+        debug_assert!(
+            handle
+                .owners
+                .iter()
+                .all(|owner| *owner == PageOwner::Private)
+        );
         self.free_pages.append(&mut handle.page_ids);
+        handle.owners.clear();
+        handle.cached_len = 0;
+        handle.published_pages = 0;
+        handle.written_len = 0;
     }
 
     /// Return pages owned by a future cache manager, such as a radix tree.
@@ -146,6 +174,11 @@ impl KVCachePool {
 
     pub fn free_count(&self) -> usize {
         self.free_pages.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn free_page_ids(&self) -> &[usize] {
+        &self.free_pages
     }
 
     /// Return `(k_cache, v_cache)`, each shaped
