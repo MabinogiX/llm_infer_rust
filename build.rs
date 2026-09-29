@@ -30,7 +30,7 @@ fn main() {
     let lib_dir = lines.next().unwrap_or_default();
     let mut build = cc::Build::new();
     build.cpp(true).file("src/engine/cuda_graph_bridge.cpp");
-    build.flag_if_supported("-std=c++17");
+    build.flag_if_supported("-std=c++20");
     build.define("_GLIBCXX_USE_CXX11_ABI", abi);
     for include in lines {
         build.include(include);
@@ -38,5 +38,6 @@ fn main() {
     build.compile("sglang_cuda_graph_bridge");
     println!("cargo:rustc-link-search=native={lib_dir}");
     println!("cargo:rustc-link-lib=dylib=torch_cuda");
+    println!("cargo:rustc-link-lib=dylib=c10_cuda");
     println!("cargo:rustc-cfg=has_cuda_graph");
 }
