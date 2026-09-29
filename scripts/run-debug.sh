@@ -31,6 +31,18 @@ else
     export LD_LIBRARY_PATH="${torch_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
+# `torch-sys` can be linked with --as-needed on Linux, which may omit
+# libtorch_cuda.so from the final Rust executable even when this PyTorch
+# installation provides CUDA. Preload it only after PyTorch itself confirms
+# CUDA is usable, preserving the CPU fallback for CPU-only or unavailable
+# CUDA installations.
+runtime_env=()
+if [[ "$(uname -s)" == "Linux" && -f "${torch_lib}/libtorch_cuda.so" ]] \
+    && "${venv_dir}/bin/python" -c 'import sys, torch; sys.exit(not torch.cuda.is_available())' \
+        >/dev/null 2>&1; then
+    runtime_env+=("LD_PRELOAD=${torch_lib}/libtorch_cuda.so${LD_PRELOAD:+:${LD_PRELOAD}}")
+fi
+
 has_model_path=false
 show_help=false
 for arg in "$@"; do
@@ -68,4 +80,4 @@ if [[ "${target_dir}" != /* ]]; then
 fi
 
 echo "正在启动服务（默认 max-running-req=4、max-seq-len=512；可用命令行参数覆盖）..."
-exec "${target_dir}/debug/sglang-rust" --max-running-req 4 --max-seq-len 512 "${server_args[@]}"
+exec env "${runtime_env[@]}" "${target_dir}/debug/sglang-rust" --max-running-req 4 --max-seq-len 512 "${server_args[@]}"

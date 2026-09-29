@@ -1,3 +1,5 @@
+use std::process::Command;
+
 use tch::{Device, Kind};
 
 use super::{KVCacheError, KVCacheLayout, KVCachePool, Result};
@@ -58,6 +60,17 @@ impl KVCacheAllocator {
     pub fn available_memory(&self, device: Device) -> Result<usize> {
         match device {
             Device::Cpu => Ok(CPU_KV_CACHE_BYTES),
+            Device::Cuda(index) => {
+                let (free, total) = cuda_memory_info(index)?;
+                let available = cuda_cache_budget(free, total, self.config.server.memory_ratio);
+                if available == 0 {
+                    return Err(KVCacheError::MemoryQuery(format!(
+                        "模型加载后没有可用于 KV cache 的显存（total={total}, free={free}, memory_ratio={}）",
+                        self.config.server.memory_ratio
+                    )));
+                }
+                Ok(available)
+            }
             _ => Err(KVCacheError::NotImplemented(
                 "加速器空闲显存查询（尚未迁移）",
             )),
@@ -115,6 +128,51 @@ impl KVCacheAllocator {
     }
 }
 
+fn cuda_cache_budget(free: usize, total: usize, memory_ratio: f64) -> usize {
+    let used = total.saturating_sub(free);
+    let budget = (total as f64 * memory_ratio) as usize;
+    budget.saturating_sub(used).min(free)
+}
+
+fn cuda_memory_info(index: usize) -> Result<(usize, usize)> {
+    // run-debug.sh puts the same PyTorch environment used by libtorch on PATH.
+    // Querying through torch preserves CUDA_VISIBLE_DEVICES index remapping.
+    let output = Command::new("python")
+        .args([
+            "-c",
+            "import sys, torch; free, total = torch.cuda.mem_get_info(int(sys.argv[1])); print(f'{free} {total}')",
+            &index.to_string(),
+        ])
+        .output()
+        .map_err(|error| {
+            KVCacheError::MemoryQuery(format!(
+                "无法运行 python/PyTorch：{error}；请使用 scripts/run-debug.sh 启动"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(KVCacheError::MemoryQuery(format!(
+            "PyTorch 返回状态 {}：{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    parse_memory_info(&output.stdout)
+}
+
+fn parse_memory_info(output: &[u8]) -> Result<(usize, usize)> {
+    let output = std::str::from_utf8(output)
+        .map_err(|error| KVCacheError::MemoryQuery(error.to_string()))?;
+    let mut numbers = output.split_whitespace();
+    let free = numbers.next().and_then(|value| value.parse::<usize>().ok());
+    let total = numbers.next().and_then(|value| value.parse::<usize>().ok());
+    match (free, total, numbers.next()) {
+        (Some(free), Some(total), None) if free <= total => Ok((free, total)),
+        _ => Err(KVCacheError::MemoryQuery(format!(
+            "PyTorch 返回了无效的显存数据: {output:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,10 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn accelerator_memory_lookup_is_explicitly_deferred() {
-        assert!(matches!(
-            allocator().available_memory(Device::Cuda(0)),
-            Err(KVCacheError::NotImplemented(_))
-        ));
+    fn cuda_budget_accounts_for_model_memory_and_reserve() {
+        assert_eq!(cuda_cache_budget(600, 1000, 0.9), 500);
+        assert_eq!(cuda_cache_budget(100, 1000, 0.9), 0);
+        assert_eq!(cuda_cache_budget(600, 1000, 1.0), 600);
+        assert_eq!(parse_memory_info(b"600 1000\n").unwrap(), (600, 1000));
+        assert!(parse_memory_info(b"1100 1000\n").is_err());
     }
 }
