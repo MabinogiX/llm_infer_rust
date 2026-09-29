@@ -31,6 +31,8 @@ Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 
 ```bash
 curl http://127.0.0.1:8000/health
 
+curl http://127.0.0.1:8000/v1/models
+
 curl http://127.0.0.1:8000/v1/completions \
   -H 'content-type: application/json' \
   -d '{"prompt":"Hello","max_tokens":16}'

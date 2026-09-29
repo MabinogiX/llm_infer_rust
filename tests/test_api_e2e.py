@@ -47,6 +47,21 @@ class ApiE2ETest(unittest.TestCase):
             extra_body={"ignore_eos": True},
         )
 
+    def test_list_models(self):
+        models = self.client.models.list()
+        self.assertEqual(models.object, "list")
+        self.assertEqual(len(models.data), 1)
+        model = models.data[0]
+        self.assertTrue(model.id)
+        self.assertEqual(model.object, "model")
+        self.assertIsInstance(model.created, int)
+        self.assertGreater(model.created, 0)
+        self.assertEqual(model.owned_by, "sglang-rust")
+        response = self.client.completions.create(
+            model=model.id, prompt="Say hi", max_tokens=1
+        )
+        self.assertEqual(response.model, model.id)
+
     def test_max_tokens_and_usage(self):
         for limit in (1, 3):
             with self.subTest(max_tokens=limit):
