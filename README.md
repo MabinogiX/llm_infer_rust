@@ -100,7 +100,7 @@ cargo test --lib
 
 ## Engine
 
-`src/engine/engine.rs` 提供了 `mini-sglang` `Engine` 的 Rust 生命周期骨架：它会校验本地 Hugging Face 模型目录、将 `max_seq_len` 收敛到模型的上下文窗口，并通过已迁移的 `KVCacheAllocator` 创建和释放 libtorch KV Cache。
+`src/engine/engine.rs` 提供了 `mini-sglang` `Engine` 的 Rust 生命周期骨架：它会校验本地 Hugging Face 模型目录；当 `--max-seq-len` 超过模型配置的 `max_position_embeddings` 时，启动会报错退出，不再静默截断。Qwen3-0.6B 的配置上限为 40960。通过校验后，已迁移的 `KVCacheAllocator` 才会创建 libtorch KV Cache。
 
 `ModelRunner` 已迁移为 eager 执行器：通过 `Engine::attach_model_runner` 绑定 Rust `ModelExecutor` 后，`Engine::forward(&batch)` 会在 libtorch `no_grad` 环境中执行 prefill 或 decode。prefill 会传递 `logits_indices`，decode 走 eager 路径。模型构建、权重加载和 scheduler 的 `BatchContext` 已接入；CUDA Graph 和分布式张量并行仍未迁移。未绑定 runner 的 `Engine::forward` 或指定 `tp_size > 1` 会返回明确错误。
 

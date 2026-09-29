@@ -11,10 +11,10 @@
 
 ## 准备
 
-先用适合目标负载的服务配置启动。项目的 `scripts/run-debug.sh` 默认限制为 `--max-running-req 4 --max-seq-len 512`；要跑正式矩阵，须提高上下文长度，并确认模型自身上下文和可用内存足够。当前服务仅支持 CPU float32，64K 上下文 × 128 客户端并发可能需要远超本机容量。
+先用适合目标负载的服务配置启动。项目的 `scripts/run-debug.sh` 默认限制为 `--max-running-req 4 --max-seq-len 512`。Qwen3-0.6B 的 `max_position_embeddings` 为 40960，服务会拒绝更大的 `--max-seq-len`；因此它无法运行包含 64K 输入的完整 release 矩阵。要跑完整矩阵，需要模型配置支持至少约 65808 tokens，并确认可用内存足够。
 
 ```bash
-./scripts/run-debug.sh --max-running-req 32 --max-seq-len 70000
+./scripts/run-debug.sh --max-running-req 32 --max-seq-len 40960
 ```
 
 工具建议安装在**独立** Python 环境中；当前仓库的 Python 环境主要用于 PyTorch/libtorch。请按各项目安装文档安装 `sglang`、`guidellm`、`lm_eval[api]`，以及本仓库开发依赖中的 `openai`。`SGLANG_BENCH_PYTHON` 可以指定安装了 SGLang 的 Python；`PROTOCOL_PYTHON` 可以指定装有 `openai` 的 Python（默认优先使用本仓库 `.venv/bin/python`）；其他两个工具由 `PATH` 查找。SGLang 的服务端无需使用 Python 版 SGLang。
@@ -23,7 +23,7 @@
 export BENCH_BASE_URL=http://127.0.0.1:8000
 export BENCH_MODEL=default
 export BENCH_TOKENIZER=/path/to/Qwen3-0.6B
-export BENCH_MAX_SEQ_LEN=70000 # 与服务实际 --max-seq-len 一致
+export BENCH_MAX_SEQ_LEN=40960 # 与服务实际 --max-seq-len 一致
 ```
 
 服务目前没有 `GET /v1/models`，必须显式配置 `BENCH_MODEL`（缺省为服务默认的 `default`）。`BENCH_TOKENIZER` 缺省读取相邻 `mini-sglang/Qwen/Qwen3-0.6B`。三个工具都走 `/v1/chat/completions`；`BENCH_BASE_URL` 只填服务根 URL，不加 `/v1`。
