@@ -31,6 +31,7 @@ pub enum BatchContextError {
     EmptyBatch,
     CachedLengthExceedsInput { cached_len: usize, input_len: usize },
     EmptyUncachedRequest,
+    MissingWritablePage { position: usize },
     IntegerOverflow(&'static str),
 }
 
@@ -47,6 +48,9 @@ impl fmt::Display for BatchContextError {
                 "cached_len ({cached_len}) 不能大于 input_ids 长度 ({input_len})"
             ),
             Self::EmptyUncachedRequest => write!(f, "prefill 请求必须至少包含一个未缓存 token"),
+            Self::MissingWritablePage { position } => {
+                write!(f, "prefill 位置 {position} 没有可写的 KV page")
+            }
             Self::IntegerOverflow(field) => {
                 write!(f, "{field} exceeds supported tensor index range")
             }
@@ -168,14 +172,18 @@ impl BatchContext {
     }
 
     fn build_write_locations(&self, request: &BatchRequest) -> Result<Vec<i32>> {
+        let required_pages = request.input_ids.len().div_ceil(self.page_size);
+        if request.page_ids.len() < required_pages {
+            return Err(BatchContextError::MissingWritablePage {
+                position: request
+                    .cached_len
+                    .max(request.page_ids.len().saturating_mul(self.page_size)),
+            });
+        }
         let mut locations = Vec::with_capacity(request.input_ids.len() - request.cached_len);
         for position in request.cached_len..request.input_ids.len() {
-            let location = request
-                .page_ids
-                .get(position / self.page_size)
-                .map(|&page_id| cache_location(page_id, position % self.page_size, self.page_size))
-                .transpose()?
-                .unwrap_or(-1);
+            let page_id = request.page_ids[position / self.page_size];
+            let location = cache_location(page_id, position % self.page_size, self.page_size)?;
             locations.push(location);
         }
         Ok(locations)
@@ -314,6 +322,29 @@ mod tests {
         assert!(matches!(
             context.prepare_prefill(&[request]),
             Err(BatchContextError::EmptyUncachedRequest)
+        ));
+    }
+
+    #[test]
+    fn rejects_prefill_without_a_writable_page() {
+        let context = BatchContext::new(1, 4, 2, Device::Cpu).unwrap();
+        let request = BatchRequest {
+            input_ids: vec![1, 2, 3],
+            cached_len: 0,
+            page_ids: vec![0],
+        };
+        assert!(matches!(
+            context.prepare_prefill(&[request]),
+            Err(BatchContextError::MissingWritablePage { position: 2 })
+        ));
+        let cached_request = BatchRequest {
+            input_ids: vec![1, 2, 3],
+            cached_len: 2,
+            page_ids: vec![0],
+        };
+        assert!(matches!(
+            context.prepare_prefill(&[cached_request]),
+            Err(BatchContextError::MissingWritablePage { position: 2 })
         ));
     }
 }

@@ -37,7 +37,7 @@ impl BaseAttention {
         k: &Tensor,
         v: &Tensor,
         write_loc: Option<&Tensor>,
-        phase: BatchPhase,
+        _phase: BatchPhase,
     ) -> Result<()> {
         let (Some(k_cache), Some(v_cache), Some(write_loc)) =
             (&mut self.k_cache, &mut self.v_cache, write_loc)
@@ -61,9 +61,9 @@ impl BaseAttention {
             ));
         }
 
-        // Decode locations are checked by the scheduler while still on the
-        // host. Keep the CUDA path free of device-to-host synchronization.
-        if phase == BatchPhase::Decode && matches!(k_cache.device(), Device::Cuda(_)) {
+        // Prefill and decode locations are checked by the scheduler before
+        // upload. Keep both CUDA paths free of device-to-host synchronization.
+        if matches!(k_cache.device(), Device::Cuda(_)) {
             let indices = write_loc.to_kind(Kind::Int64);
             let mut flat_k = k_cache.view([-1, flat_size[2], flat_size[3]]);
             let mut flat_v = v_cache.view([-1, flat_size[2], flat_size[3]]);
