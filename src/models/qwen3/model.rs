@@ -11,9 +11,7 @@ use crate::engine::{
     AttentionMetadata, BatchPhase, ModelArgs, ModelExecutor, ModelFactory, ModelRunnerError,
     ModelWeights,
 };
-use crate::models::attention::{
-    AttentionBackend, AttentionBackendKind, BaseAttention, create_attention_backend,
-};
+use crate::models::attention::{Attention, AttentionBatch, AttentionSpec, BaseAttention};
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
@@ -38,9 +36,11 @@ impl ModelFactory for Qwen3Factory {
         device: Device,
         attention_backend: &str,
     ) -> Result<Box<dyn ModelExecutor>> {
-        let backend = AttentionBackendKind::parse(attention_backend)?;
         Ok(Box::new(Qwen3ForCausalLM::new_with_attention_backend(
-            model_args, kind, device, backend,
+            model_args,
+            kind,
+            device,
+            attention_backend,
         )?))
     }
 }
@@ -50,6 +50,7 @@ pub struct Qwen3ForCausalLM {
     config: ModelArgs,
     device: Device,
     kind: Kind,
+    attention: Attention,
     embed_tokens: Tensor,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
@@ -58,14 +59,14 @@ pub struct Qwen3ForCausalLM {
 
 impl Qwen3ForCausalLM {
     pub fn new(config: ModelArgs, kind: Kind, device: Device) -> Result<Self> {
-        Self::new_with_attention_backend(config, kind, device, AttentionBackendKind::Pt)
+        Self::new_with_attention_backend(config, kind, device, "pt")
     }
 
     pub fn new_with_attention_backend(
         config: ModelArgs,
         kind: Kind,
         device: Device,
-        attention_backend: AttentionBackendKind,
+        attention_backend: &str,
     ) -> Result<Self> {
         validate_config(config)?;
         let hidden = as_i64(config.hidden_size, "hidden_size")?;
@@ -74,11 +75,22 @@ impl Qwen3ForCausalLM {
         let heads = as_i64(config.num_attention_heads, "num_attention_heads")?;
         let kv_heads = as_i64(config.num_kv_heads, "num_kv_heads")?;
         let head_dim = as_i64(config.head_dim, "head_dim")?;
+        let attention = Attention::new(
+            attention_backend,
+            AttentionSpec {
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                head_dim,
+                kind,
+                device,
+            },
+        )?;
 
         Ok(Self {
             config,
             device,
             kind,
+            attention,
             embed_tokens: parameter([vocab, hidden], kind, device),
             layers: (0..config.num_layers)
                 .map(|_| {
@@ -90,7 +102,6 @@ impl Qwen3ForCausalLM {
                         head_dim,
                         kind,
                         device,
-                        attention_backend,
                     )
                 })
                 .collect(),
@@ -113,13 +124,13 @@ impl Qwen3ForCausalLM {
                 "input_ids and positions must have identical lengths",
             ));
         }
-        let sequence_boundaries = prefill_boundaries(attention_metadata, ids.numel())?;
+        let attention = self.attention.prepare(attention_metadata, ids.numel())?;
         let mut hidden_states = self.embed_tokens.index_select(0, &ids);
         for layer in &self.layers {
             hidden_states = layer.forward(
                 &hidden_states,
                 &positions,
-                &sequence_boundaries,
+                &attention,
                 attention_metadata,
                 self.config.rms_norm_eps,
                 self.config.rope_theta,
@@ -178,6 +189,10 @@ impl Qwen3ForCausalLM {
 }
 
 impl ModelExecutor for Qwen3ForCausalLM {
+    fn supports_cuda_graph(&self) -> bool {
+        self.attention.supports_cuda_graph()
+    }
+
     fn forward(
         &self,
         input_ids: &Tensor,
@@ -201,6 +216,7 @@ impl ModelExecutor for Qwen3ForCausalLM {
                 "Qwen3 KV cache must be (layers, pages, page_size, kv_heads, head_dim)",
             ));
         }
+        self.attention.bind_cache_layout(k_cache.size()[2]);
         for (index, layer) in self.layers.iter().enumerate() {
             layer
                 .base_attention
@@ -213,7 +229,6 @@ impl ModelExecutor for Qwen3ForCausalLM {
 
 struct DecoderLayer {
     base_attention: RefCell<BaseAttention>,
-    attention_backend: Box<dyn AttentionBackend>,
     input_layernorm: Tensor,
     q_proj: Tensor,
     k_proj: Tensor,
@@ -239,11 +254,9 @@ impl DecoderLayer {
         head_dim: i64,
         kind: Kind,
         device: Device,
-        attention_backend: AttentionBackendKind,
     ) -> Self {
         Self {
             base_attention: RefCell::new(BaseAttention::default()),
-            attention_backend: create_attention_backend(attention_backend),
             input_layernorm: parameter([hidden], kind, device),
             q_proj: parameter([num_heads * head_dim, hidden], kind, device),
             k_proj: parameter([num_kv_heads * head_dim, hidden], kind, device),
@@ -265,7 +278,7 @@ impl DecoderLayer {
         &self,
         hidden_states: &Tensor,
         positions: &Tensor,
-        sequence_boundaries: &[i64],
+        attention_batch: &AttentionBatch<'_>,
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
         rope_theta: f64,
@@ -275,7 +288,7 @@ impl DecoderLayer {
         let attention = self.attention(
             &normalized,
             positions,
-            sequence_boundaries,
+            attention_batch,
             attention_metadata,
             eps,
             rope_theta,
@@ -290,7 +303,7 @@ impl DecoderLayer {
         &self,
         hidden_states: &Tensor,
         positions: &Tensor,
-        sequence_boundaries: &[i64],
+        attention_batch: &AttentionBatch<'_>,
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
         rope_theta: f64,
@@ -319,17 +332,7 @@ impl DecoderLayer {
             attention_metadata.map_or(BatchPhase::Prefill, |metadata| metadata.forward_mode),
         )?;
 
-        let output = self.attention_backend.forward(
-            &q,
-            &k,
-            &v,
-            &self.base_attention.borrow(),
-            sequence_boundaries,
-            attention_metadata,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
+        let output = attention_batch.forward(&q, &k, &v, &self.base_attention.borrow())?;
         Ok(linear(&output, &self.o_proj))
     }
 
@@ -391,32 +394,6 @@ fn validate_config(config: ModelArgs) -> Result<()> {
         return Err(model_error("Qwen3 RoPE requires an even head_dim"));
     }
     Ok(())
-}
-
-fn prefill_boundaries(
-    metadata: Option<&AttentionMetadata>,
-    total_tokens: usize,
-) -> Result<Vec<i64>> {
-    let total_tokens = as_i64(total_tokens, "token count")?;
-    let Some(metadata) = metadata else {
-        return Ok(vec![0, total_tokens]);
-    };
-    if metadata.forward_mode == BatchPhase::Decode {
-        return Ok(vec![0, total_tokens]);
-    }
-    let Some(cumulative) = &metadata.cu_seqlens_q else {
-        return Ok(vec![0, total_tokens]);
-    };
-    let boundaries = Vec::<i32>::try_from(&cumulative.to_device(Device::Cpu))
-        .map_err(ModelRunnerError::Torch)?;
-    if boundaries.len() < 2
-        || boundaries.first().copied() != Some(0)
-        || boundaries.last().copied().map(i64::from) != Some(total_tokens)
-        || boundaries.windows(2).any(|window| window[0] >= window[1])
-    {
-        return Err(model_error("invalid prefill cu_seqlens_q"));
-    }
-    Ok(boundaries.into_iter().map(i64::from).collect())
 }
 
 fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
@@ -547,13 +524,9 @@ mod tests {
 
     #[test]
     fn flash_attention_backend_runs_on_cpu_via_sdpa() {
-        let model = Qwen3ForCausalLM::new_with_attention_backend(
-            config(),
-            Kind::Float,
-            Device::Cpu,
-            AttentionBackendKind::FlashAttention,
-        )
-        .unwrap();
+        let model =
+            Qwen3ForCausalLM::new_with_attention_backend(config(), Kind::Float, Device::Cpu, "fa")
+                .unwrap();
         let logits = model
             .forward(
                 &Tensor::from_slice(&[1i64]),

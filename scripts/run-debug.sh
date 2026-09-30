@@ -70,6 +70,26 @@ for ((i = 0; i + 1 < ${#server_args[@]}; i++)); do
     fi
 done
 
+attention_backend=""
+for ((i = 0; i + 1 < ${#server_args[@]}; i++)); do
+    if [[ "${server_args[i]}" == "--attention-backend" ]]; then
+        attention_backend="${server_args[i + 1]}"
+    fi
+done
+if [[ "${attention_backend,,}" == "flashinfer" ]]; then
+    flashinfer_header=""
+    for candidate in "${venv_dir}"/lib/python*/site-packages/flashinfer/data/include/flashinfer/attention/decode.cuh; do
+        if [[ -f "${candidate}" ]]; then
+            flashinfer_header="${candidate}"
+            break
+        fi
+    done
+    if [[ -z "${flashinfer_header}" ]]; then
+        echo "FlashInfer 头文件不可用：请在 VENV_DIR 指向的环境中安装 flashinfer-python。" >&2
+        exit 1
+    fi
+fi
+
 cd "${repo_dir}"
 echo "正在编译 debug 版本..."
 cargo build --bin sglang-rust

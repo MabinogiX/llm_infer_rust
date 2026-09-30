@@ -32,6 +32,12 @@ impl GraphRunner {
         args: &ServerArgs,
         pool: Rc<RefCell<KVCachePool>>,
     ) -> Result<Option<Self>> {
+        if !runner.supports_cuda_graph() {
+            tracing::info!(
+                "selected model does not support CUDA Graph capture; using eager decode"
+            );
+            return Ok(None);
+        }
         let Device::Cuda(device_index) = runner.device() else {
             if args.cuda_graph_bs.is_some_and(|size| size > 0) {
                 tracing::warn!(device = ?runner.device(), "CUDA Graph requested on a non-CUDA device; using eager decode");

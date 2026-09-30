@@ -22,9 +22,24 @@ Rust 版本的 mini-sglang 推理服务。目前支持本地 dense Qwen3 模型�
 cargo run -- --model-path /path/to/Qwen3-0.6B --port 8000
 ```
 
-`main.rs` 解析模型路径和服务参数，调用 `server::serve`。默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 修改。服务启动时加载模型与 tokenizer；加载失败会退出并显示原因。`--device auto`（默认）在 libtorch 检测到 CUDA 时使用 `cuda:0`，否则使用 CPU；`--device cuda` 要求 CUDA 可用，`--device cpu` 强制使用 CPU。启动日志会打印实际选择的设备。当前仅支持 float32、`pt` attention 和 `tp-size 1`。
+`main.rs` 解析模型路径和服务参数，调用 `server::serve`。默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 修改。服务启动时加载模型与 tokenizer；加载失败会退出并显示原因。`--device auto`（默认）在 libtorch 检测到 CUDA 时使用 `cuda:0`，否则使用 CPU；`--device cuda` 要求 CUDA 可用，`--device cpu` 强制使用 CPU。启动日志会打印实际选择的设备。当前仅支持 `tp-size 1`。
 
 Linux CUDA 环境中，模型权重和 KV cache 绑定后会捕获 decode CUDA Graph；图捕获失败的批次回退到 eager。`--cuda-graph-bs N` 设置最大捕获批量（默认使用 `--max-running-req`），设为 `0` 可禁用。构建图桥接层需要与 PyTorch 对应的 CUDA Toolkit；缺少时服务仍使用 eager decode。CPU 不启用图捕获。
+
+### FlashInfer 分页 decode
+
+在 Linux CUDA 环境中，可以将 `--attention-backend flashinfer` 用于 BF16/FP16、head_dim=128 的模型。构建时需要在 `VENV_DIR` 指向的环境中安装带 CUDA 头文件的 `flashinfer-python` 和与 `tch` 一致的 PyTorch/libtorch。构建脚本从 FlashInfer 包中编译 CUDA 内核；服务运行时不加载 Python。默认编译目标为 A100（sm_80），其他架构可设置 `FLASHINFER_CUDA_ARCH`。FlashInfer 后端的 decode 直接使用现有 KV cache 的分页视图、页表和请求实际长度，prefill 仍使用 libtorch SDPA。当前原生桥接仅支持 eager decode，因此选择它时会跳过 CUDA Graph 捕获。
+
+```bash
+VENV_DIR=/path/to/cuda-venv ./scripts/run-debug.sh \
+  --model-path /path/to/Qwen3-0.6B \
+  --attention-backend flashinfer \
+  --max-running-req 4 --max-seq-len 40960
+```
+
+这里调用 FlashInfer 官方的 `DecodePlan` 与分页 decode dispatch；每轮 decode 构造一次分页元数据，规划结果和工作区供所有模型层复用。FlashInfer 的规划器会按请求长度和 GPU 并行度决定是否拆分 KV。若构建环境缺少 FlashInfer 头文件，服务会在模型初始化时报错，不会静默回退到原先的 SDPA decode。
+
+如果服务器使用 CUDA 兼容驱动，启动前先设置 `export LD_LIBRARY_PATH="/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"`，再运行上述脚本。
 
 Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-debug.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
 
@@ -138,7 +153,7 @@ engine.load_model_weights()?;
 
 当前 dense Qwen3 支持 eager prefill、带缓存前缀的 prefill 和 paged-KV decode；模型接入 `Engine` 时会自动绑定 `KVCachePool` 的逐层 K/V 切片。Qwen3-MoE 与张量并行尚未迁移，调用时会返回明确错误。
 
-Attention 通过 `ServerArgs::attention_backend` 选择后端，默认 `"fa"` 使用 LibTorch 的 scaled dot product attention；符合条件的 CUDA BF16/FP16 输入由 LibTorch 选择 fused FlashAttention kernel。不符合条件时 LibTorch 会使用其他 SDPA kernel。`"pt"` 保留原有 eager 实现。`--dtype auto` 读取模型 `config.json` 中的 `torch_dtype`（或 `dtype`），CPU 推理回退到 float32。
+Attention 通过 `ServerArgs::attention_backend` 选择后端，默认 `"fa"` 使用 LibTorch 的 scaled dot product attention。Prefill 会把不同长度的请求填充成一个 batch，每层调用一次 SDPA，再还原输出顺序；无缓存前缀时使用 causal mask，让符合条件的 CUDA BF16/FP16 输入可由 LibTorch 选择 fused FlashAttention kernel。带缓存前缀时使用显式掩码，LibTorch 可能选择其他 SDPA kernel。`"pt"` 保留原有 eager 实现。`--dtype auto` 读取模型 `config.json` 中的 `torch_dtype`（或 `dtype`），CPU 推理回退到 float32。
 
 ## TokenizerWorker
 
