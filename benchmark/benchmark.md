@@ -1,5 +1,8 @@
 # Benchmark优化记录
 
+## 2026.09.30
+发现昨天的测试有误，启动参数变成了--max-running-req 4 --max-seq-len 512，因而单个请求变快。优化prefill kv cache不再跟cpu通讯，单个请求依然3s左右。使用--max-running-req 4 --max-seq-len 40960单个请求长达86s，出现显著性能回退。cpu和gpu利用率接近100%
+
 ## 2026.09.29
 数据类型改成BF16（原来是Float32）,使用LibTorch SDPA，显存占用大幅度下降，单个请求速度约3s，gpu利用率约90%
 
