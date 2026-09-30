@@ -52,6 +52,7 @@ pub struct Qwen3ForCausalLM {
     device: Device,
     kind: Kind,
     attention: Attention,
+    rope: RopeCache,
     embed_tokens: Tensor,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
@@ -76,6 +77,7 @@ impl Qwen3ForCausalLM {
         let heads = as_i64(config.num_attention_heads, "num_attention_heads")?;
         let kv_heads = as_i64(config.num_kv_heads, "num_kv_heads")?;
         let head_dim = as_i64(config.head_dim, "head_dim")?;
+        let max_positions = as_i64(config.max_position_embeddings, "max_position_embeddings")?;
         let attention = Attention::new(
             attention_backend,
             AttentionSpec {
@@ -92,6 +94,7 @@ impl Qwen3ForCausalLM {
             device,
             kind,
             attention,
+            rope: RopeCache::new(max_positions, head_dim, config.rope_theta, kind, device),
             embed_tokens: parameter([vocab, hidden], kind, device),
             layers: (0..config.num_layers)
                 .map(|_| {
@@ -143,7 +146,7 @@ impl Qwen3ForCausalLM {
                 &attention,
                 attention_metadata,
                 self.config.rms_norm_eps,
-                self.config.rope_theta,
+                &self.rope,
                 &mut profiler,
             )?;
         }
@@ -306,7 +309,7 @@ impl DecoderLayer {
         attention_batch: &AttentionBatch<'_>,
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
-        rope_theta: f64,
+        rope: &RopeCache,
         profiler: &mut ModelProfiler,
     ) -> Result<Tensor> {
         let residual = hidden_states.shallow_clone();
@@ -319,7 +322,7 @@ impl DecoderLayer {
             attention_batch,
             attention_metadata,
             eps,
-            rope_theta,
+            rope,
             profiler,
         )?;
         let timer = profiler.start(ModelStage::Norm);
@@ -341,7 +344,7 @@ impl DecoderLayer {
         attention_batch: &AttentionBatch<'_>,
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
-        rope_theta: f64,
+        rope: &RopeCache,
         profiler: &mut ModelProfiler,
     ) -> Result<Tensor> {
         let timer = profiler.start(ModelStage::QkvLinear);
@@ -366,7 +369,7 @@ impl DecoderLayer {
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::Rope);
-        let (q, k) = apply_rope(&q, &k, positions, rope_theta);
+        let (q, k) = rope.apply(&q, &k, positions);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::KvWrite);
@@ -434,6 +437,7 @@ fn validate_config(config: ModelArgs) -> Result<()> {
         || config.intermediate_size == 0
         || config.vocab_size == 0
         || config.head_dim == 0
+        || config.max_position_embeddings == 0
     {
         return Err(model_error(
             "Qwen3 configuration dimensions must be greater than zero",
@@ -447,6 +451,11 @@ fn validate_config(config: ModelArgs) -> Result<()> {
     if config.head_dim % 2 != 0 {
         return Err(model_error("Qwen3 RoPE requires an even head_dim"));
     }
+    if !config.rope_theta.is_finite() || config.rope_theta <= 0.0 {
+        return Err(model_error(
+            "Qwen3 RoPE requires a positive finite rope_theta",
+        ));
+    }
     Ok(())
 }
 
@@ -458,19 +467,37 @@ fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
     (x_float * (variance + eps).rsqrt() * weight.to_kind(Kind::Float)).to_kind(x.kind())
 }
 
-fn apply_rope(q: &Tensor, k: &Tensor, positions: &Tensor, rope_theta: f64) -> (Tensor, Tensor) {
-    let head_dim = q.size()[2];
-    let half_dim = head_dim / 2;
-    let inv_freq = (Tensor::arange_start_step(0, head_dim, 2, (Kind::Float, q.device()))
-        * (-(rope_theta.ln() / head_dim as f64)))
-        .exp();
-    let frequencies = positions.to_kind(Kind::Float).unsqueeze(-1) * inv_freq.unsqueeze(0);
-    let cos = frequencies.cos().to_kind(q.kind()).unsqueeze(1);
-    let sin = frequencies.sin().to_kind(q.kind()).unsqueeze(1);
-    (
-        rotate_half(q, &cos, &sin, half_dim),
-        rotate_half(k, &cos, &sin, half_dim),
-    )
+/// Shared by every decoder layer; values depend only on position and model config.
+struct RopeCache {
+    cos: Tensor,
+    sin: Tensor,
+    half_dim: i64,
+}
+
+impl RopeCache {
+    fn new(max_positions: i64, head_dim: i64, rope_theta: f64, kind: Kind, device: Device) -> Self {
+        let inv_freq = (Tensor::arange_start_step(0, head_dim, 2, (Kind::Float, device))
+            * (-(rope_theta.ln() / head_dim as f64)))
+            .exp();
+        let positions = Tensor::arange(max_positions, (Kind::Float, device));
+        let frequencies = positions.unsqueeze(-1) * inv_freq.unsqueeze(0);
+        let cos = frequencies.cos().to_kind(kind);
+        let sin = frequencies.sin().to_kind(kind);
+        Self {
+            cos,
+            sin,
+            half_dim: head_dim / 2,
+        }
+    }
+
+    fn apply(&self, q: &Tensor, k: &Tensor, positions: &Tensor) -> (Tensor, Tensor) {
+        let cos = self.cos.index_select(0, positions).unsqueeze(1);
+        let sin = self.sin.index_select(0, positions).unsqueeze(1);
+        (
+            rotate_half(q, &cos, &sin, self.half_dim),
+            rotate_half(k, &cos, &sin, self.half_dim),
+        )
+    }
 }
 
 fn rotate_half(x: &Tensor, cos: &Tensor, sin: &Tensor, half_dim: i64) -> Tensor {
@@ -597,9 +624,38 @@ mod tests {
         let q = Tensor::ones([2, 2, 4], (Kind::BFloat16, Device::Cpu));
         let k = Tensor::ones([2, 1, 4], (Kind::BFloat16, Device::Cpu));
         let positions = Tensor::from_slice(&[0i64, 1]);
-        let (q, k) = apply_rope(&q, &k, &positions, 10_000.0);
+        let rope = RopeCache::new(16, 4, 10_000.0, Kind::BFloat16, Device::Cpu);
+        let (q, k) = rope.apply(&q, &k, &positions);
         assert_eq!(q.kind(), Kind::BFloat16);
         assert_eq!(k.kind(), Kind::BFloat16);
+    }
+
+    #[test]
+    fn cached_rope_matches_eager_formula_for_reordered_and_last_positions() {
+        for kind in [Kind::Float, Kind::BFloat16] {
+            let q = Tensor::arange(32, (Kind::Float, Device::Cpu))
+                .view([4, 2, 4])
+                .to_kind(kind);
+            let k = Tensor::arange(16, (Kind::Float, Device::Cpu))
+                .view([4, 1, 4])
+                .to_kind(kind);
+            let positions = Tensor::from_slice(&[0i64, 15, 3, 15]);
+            let rope = RopeCache::new(16, 4, 10_000.0, kind, Device::Cpu);
+            let (cached_q, cached_k) = rope.apply(&q, &k, &positions);
+
+            let inv_freq = (Tensor::arange_start_step(0, 4, 2, (Kind::Float, Device::Cpu))
+                * (-(10_000.0_f64.ln() / 4.0)))
+                .exp();
+            let frequencies = positions.to_kind(Kind::Float).unsqueeze(-1) * inv_freq.unsqueeze(0);
+            let cos = frequencies.cos().to_kind(kind).unsqueeze(1);
+            let sin = frequencies.sin().to_kind(kind).unsqueeze(1);
+            let eager_q = rotate_half(&q, &cos, &sin, 2);
+            let eager_k = rotate_half(&k, &cos, &sin, 2);
+            let q_error = (cached_q - eager_q).abs().max().double_value(&[]);
+            let k_error = (cached_k - eager_k).abs().max().double_value(&[]);
+            assert!(q_error <= 1e-5, "kind={kind:?}, q_error={q_error}");
+            assert!(k_error <= 1e-5, "kind={kind:?}, k_error={k_error}");
+        }
     }
 
     #[test]
