@@ -13,7 +13,7 @@ type Result<T> = std::result::Result<T, ModelRunnerError>;
 pub enum AttentionBackendKind {
     /// Eager libtorch operations, corresponding to Python's PyTorch/SDPA path.
     Pt,
-    /// Reserved for a future FlashAttention binding.
+    /// LibTorch SDPA, which selects the fused FlashAttention kernel on supported CUDA inputs.
     FlashAttention,
 }
 
@@ -101,7 +101,7 @@ impl AttentionBackend for PyTorchAttentionBackend {
     }
 }
 
-/// Placeholder preserving the Python dispatch surface until a Rust binding is added.
+/// Uses LibTorch SDPA so supported CUDA BF16/FP16 inputs take its FlashAttention path.
 struct FlashAttentionBackend;
 
 impl AttentionBackend for FlashAttentionBackend {
@@ -111,20 +111,175 @@ impl AttentionBackend for FlashAttentionBackend {
 
     fn forward(
         &self,
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _cache: &BaseAttention,
-        _sequence_boundaries: &[i64],
-        _metadata: Option<&AttentionMetadata>,
-        _num_heads: i64,
-        _num_kv_heads: i64,
-        _head_dim: i64,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        cache: &BaseAttention,
+        sequence_boundaries: &[i64],
+        metadata: Option<&AttentionMetadata>,
+        num_heads: i64,
+        num_kv_heads: i64,
+        head_dim: i64,
     ) -> Result<Tensor> {
-        Err(model_error(
-            "FlashAttention Rust binding has not been implemented; use attention_backend=\"pt\"",
-        ))
+        if let Some(metadata) = metadata {
+            if metadata.forward_mode == BatchPhase::Decode {
+                return sdpa_decode_with_cache(
+                    q,
+                    cache,
+                    metadata,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                );
+            }
+            if has_cached_prefix(metadata)? {
+                let boundaries = prefill_boundaries(metadata, q.size()[0] as usize)?;
+                let prefix_lens = tensor_i32(metadata.prefix_lens.as_ref(), "prefix_lens")?;
+                let table = metadata
+                    .req_to_token
+                    .as_ref()
+                    .ok_or_else(|| model_error("cached prefill requires req_to_token"))?;
+                let mut outputs = Vec::with_capacity(prefix_lens.len());
+                for (index, (&prefix, bounds)) in
+                    prefix_lens.iter().zip(boundaries.windows(2)).enumerate()
+                {
+                    if prefix < 0 {
+                        return Err(model_error("prefix_lens cannot be negative"));
+                    }
+                    let start = bounds[0];
+                    let query_len = bounds[1] - start;
+                    let (cached_k, cached_v) =
+                        cache.read_kv(table, index as i64, i64::from(prefix) + query_len)?;
+                    outputs.push(sdpa_attention(
+                        &q.narrow(0, start, query_len),
+                        &cached_k,
+                        &cached_v,
+                        i64::from(prefix),
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                    )?);
+                }
+                return Ok(Tensor::cat(&outputs, 0));
+            }
+        }
+        let mut outputs = Vec::with_capacity(sequence_boundaries.len().saturating_sub(1));
+        for bounds in sequence_boundaries.windows(2) {
+            let start = bounds[0];
+            let length = bounds[1] - start;
+            outputs.push(sdpa_attention(
+                &q.narrow(0, start, length),
+                &k.narrow(0, start, length),
+                &v.narrow(0, start, length),
+                0,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            )?);
+        }
+        Ok(Tensor::cat(&outputs, 0))
     }
+}
+
+fn sdpa_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix: i64,
+    num_heads: i64,
+    num_kv_heads: i64,
+    head_dim: i64,
+) -> Result<Tensor> {
+    let query_len = q.size()[0];
+    let key_len = k.size()[0];
+    let repeats = num_heads / num_kv_heads;
+    let q = q.transpose(0, 1).unsqueeze(0);
+    let k = k
+        .transpose(0, 1)
+        .repeat_interleave_self_int(repeats, 0, Some(num_heads))
+        .unsqueeze(0);
+    let v = v
+        .transpose(0, 1)
+        .repeat_interleave_self_int(repeats, 0, Some(num_heads))
+        .unsqueeze(0);
+    let mask = if prefix > 0 {
+        let queries = Tensor::arange(query_len, (Kind::Int64, q.device())) + prefix;
+        let keys = Tensor::arange(key_len, (Kind::Int64, q.device()));
+        Some(
+            keys.unsqueeze(0)
+                .le_tensor(&queries.unsqueeze(1))
+                .unsqueeze(0)
+                .unsqueeze(0),
+        )
+    } else {
+        None
+    };
+    let output = Tensor::f_scaled_dot_product_attention(
+        &q,
+        &k,
+        &v,
+        mask.as_ref(),
+        0.0,
+        prefix == 0,
+        None,
+        false,
+    )?;
+    Ok(output
+        .squeeze_dim(0)
+        .transpose(0, 1)
+        .reshape([query_len, num_heads * head_dim]))
+}
+
+fn sdpa_decode_with_cache(
+    q: &Tensor,
+    cache: &BaseAttention,
+    metadata: &AttentionMetadata,
+    num_heads: i64,
+    num_kv_heads: i64,
+    head_dim: i64,
+) -> Result<Tensor> {
+    let table = metadata
+        .req_to_token
+        .as_ref()
+        .ok_or_else(|| model_error("paged-KV decode requires req_to_token"))?;
+    let lengths = metadata
+        .cache_seqlens
+        .as_ref()
+        .ok_or_else(|| model_error("paged-KV decode requires cache_seqlens"))?;
+    let max_len = metadata.max_seqlen.unwrap_or(table.size()[1] as usize) as i64;
+    let batch_size = q.size()[0];
+    if table.size()[0] != batch_size || lengths.size()[0] != batch_size {
+        return Err(model_error("decode metadata row count must match queries"));
+    }
+    let indices = table.narrow(1, 0, max_len);
+    let valid = indices.ge(0).logical_and(
+        &Tensor::arange(max_len, (Kind::Int64, q.device()))
+            .unsqueeze(0)
+            .lt_tensor(&lengths.to_kind(Kind::Int64).unsqueeze(1)),
+    );
+    let (k, v) = cache.read_kv_padded(&indices.clamp_min(0).to_kind(Kind::Int64))?;
+    let repeats = num_heads / num_kv_heads;
+    let k = k
+        .repeat_interleave_self_int(repeats, 2, Some(num_heads))
+        .permute([0, 2, 1, 3]);
+    let v = v
+        .repeat_interleave_self_int(repeats, 2, Some(num_heads))
+        .permute([0, 2, 1, 3]);
+    let query = q.unsqueeze(2);
+    let mask = valid.unsqueeze(1).unsqueeze(2);
+    let output = Tensor::f_scaled_dot_product_attention(
+        &query,
+        &k,
+        &v,
+        Some(&mask),
+        0.0,
+        false,
+        None,
+        false,
+    )?;
+    Ok(output
+        .squeeze_dim(2)
+        .reshape([batch_size, num_heads * head_dim]))
 }
 
 fn prefill_with_cache(
@@ -257,6 +412,7 @@ fn decode_with_cache_padded(
     );
     Ok(scores
         .softmax(-1, Kind::Float)
+        .to_kind(v.kind())
         .matmul(&v)
         .squeeze_dim(2)
         .reshape([batch_size, num_heads * head_dim]))
@@ -288,6 +444,7 @@ fn causal_attention(
     );
     scores
         .softmax(-1, Kind::Float)
+        .to_kind(v.kind())
         .bmm(&v)
         .transpose(0, 1)
         .reshape([sequence_length, num_heads * head_dim])
@@ -321,6 +478,7 @@ fn attention_against_cache(
     (q.bmm(&k.transpose(1, 2)) * scale)
         .masked_fill(&mask.logical_not().unsqueeze(0), f64::NEG_INFINITY)
         .softmax(-1, Kind::Float)
+        .to_kind(v.kind())
         .bmm(&v)
         .transpose(0, 1)
         .reshape([query_len, num_heads * head_dim])
@@ -397,5 +555,20 @@ mod tests {
         let padded = decode_with_cache_padded(&q, &cache, &metadata, 1, 1, 2).unwrap();
         let difference = (eager - padded).abs().max().double_value(&[]);
         assert!(difference < 1e-5, "decode difference: {difference}");
+        let sdpa = sdpa_decode_with_cache(&q, &cache, &metadata, 1, 1, 2).unwrap();
+        let reference = decode_with_cache_padded(&q, &cache, &metadata, 1, 1, 2).unwrap();
+        let difference = (reference - sdpa).abs().max().double_value(&[]);
+        assert!(difference < 1e-5, "SDPA decode difference: {difference}");
+    }
+
+    #[test]
+    fn sdpa_causal_prefill_matches_reference() {
+        let q = Tensor::from_slice(&[1f32, 0., 0., 1., 1., 1.]).view([3, 1, 2]);
+        let k = q.shallow_clone();
+        let v = Tensor::from_slice(&[2f32, 1., 3., 4., 5., 6.]).view([3, 1, 2]);
+        let reference = causal_attention(&q, &k, &v, 1, 1, 2);
+        let sdpa = sdpa_attention(&q, &k, &v, 0, 1, 1, 2).unwrap();
+        let difference = (reference - sdpa).abs().max().double_value(&[]);
+        assert!(difference < 1e-5, "SDPA prefill difference: {difference}");
     }
 }
