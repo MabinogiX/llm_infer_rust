@@ -12,6 +12,7 @@ use crate::engine::{
     ModelWeights,
 };
 use crate::models::attention::{Attention, AttentionBatch, AttentionSpec, BaseAttention};
+use crate::profiling::{ModelProfiler, ModelStage};
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
@@ -117,6 +118,7 @@ impl Qwen3ForCausalLM {
         attention_metadata: Option<&AttentionMetadata>,
         logits_indices: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let mut profiler = ModelProfiler::new(self.device);
         let ids = input_ids.view([-1]);
         let positions = positions.view([-1]);
         if ids.numel() != positions.numel() {
@@ -124,8 +126,16 @@ impl Qwen3ForCausalLM {
                 "input_ids and positions must have identical lengths",
             ));
         }
-        let attention = self.attention.prepare(attention_metadata, ids.numel())?;
+        let timer = profiler.start(ModelStage::Plan);
+        let attention = self.attention.prepare(attention_metadata, ids.numel());
+        profiler.finish(timer);
+        let attention = attention?;
+
+        let timer = profiler.start(ModelStage::Embed);
         let mut hidden_states = self.embed_tokens.index_select(0, &ids);
+        profiler.finish(timer);
+
+        let timer = profiler.start(ModelStage::Layers);
         for layer in &self.layers {
             hidden_states = layer.forward(
                 &hidden_states,
@@ -134,13 +144,28 @@ impl Qwen3ForCausalLM {
                 attention_metadata,
                 self.config.rms_norm_eps,
                 self.config.rope_theta,
+                &mut profiler,
             )?;
         }
+        profiler.finish(timer);
+
+        let timer = profiler.start(ModelStage::Head);
         hidden_states = rms_norm(&hidden_states, &self.norm, self.config.rms_norm_eps);
         if let Some(indices) = logits_indices {
             hidden_states = hidden_states.index_select(0, indices);
         }
-        Ok(linear(&hidden_states, &self.lm_head))
+        let logits = linear(&hidden_states, &self.lm_head);
+        profiler.finish(timer);
+
+        let timer = profiler.start(ModelStage::PlanDrop);
+        drop(attention);
+        profiler.finish(timer);
+        profiler.log(
+            attention_metadata.map_or(BatchPhase::Prefill, |metadata| metadata.forward_mode),
+            ids.numel(),
+            self.layers.len(),
+        );
+        Ok(logits)
     }
 
     fn load_weights_impl(&mut self, weights: ModelWeights) -> Result<usize> {
@@ -282,9 +307,12 @@ impl DecoderLayer {
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
         rope_theta: f64,
+        profiler: &mut ModelProfiler,
     ) -> Result<Tensor> {
         let residual = hidden_states.shallow_clone();
+        let timer = profiler.start(ModelStage::Norm);
         let normalized = rms_norm(hidden_states, &self.input_layernorm, eps);
+        profiler.finish(timer);
         let attention = self.attention(
             &normalized,
             positions,
@@ -292,11 +320,18 @@ impl DecoderLayer {
             attention_metadata,
             eps,
             rope_theta,
+            profiler,
         )?;
+        let timer = profiler.start(ModelStage::Norm);
         let residual = attention + residual;
         let normalized = rms_norm(&residual, &self.post_attention_layernorm, eps);
+        profiler.finish(timer);
+
+        let timer = profiler.start(ModelStage::Mlp);
         let mlp = linear(&normalized, &self.gate_proj).silu() * linear(&normalized, &self.up_proj);
-        Ok(linear(&mlp, &self.down_proj) + residual)
+        let output = linear(&mlp, &self.down_proj) + residual;
+        profiler.finish(timer);
+        Ok(output)
     }
 
     fn attention(
@@ -307,11 +342,13 @@ impl DecoderLayer {
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
         rope_theta: f64,
+        profiler: &mut ModelProfiler,
     ) -> Result<Tensor> {
+        let timer = profiler.start(ModelStage::QkvLinear);
         let total_tokens = hidden_states.size()[0];
-        let mut q =
+        let q =
             linear(hidden_states, &self.q_proj).view([total_tokens, self.num_heads, self.head_dim]);
-        let mut k = linear(hidden_states, &self.k_proj).view([
+        let k = linear(hidden_states, &self.k_proj).view([
             total_tokens,
             self.num_kv_heads,
             self.head_dim,
@@ -321,19 +358,36 @@ impl DecoderLayer {
             self.num_kv_heads,
             self.head_dim,
         ]);
-        q = rms_norm(&q, &self.q_norm, eps);
-        k = rms_norm(&k, &self.k_norm, eps);
-        let (q, k) = apply_rope(&q, &k, positions, rope_theta);
+        profiler.finish(timer);
 
-        self.base_attention.borrow_mut().write_kv(
+        let timer = profiler.start(ModelStage::QkNorm);
+        let q = rms_norm(&q, &self.q_norm, eps);
+        let k = rms_norm(&k, &self.k_norm, eps);
+        profiler.finish(timer);
+
+        let timer = profiler.start(ModelStage::Rope);
+        let (q, k) = apply_rope(&q, &k, positions, rope_theta);
+        profiler.finish(timer);
+
+        let timer = profiler.start(ModelStage::KvWrite);
+        let write_result = self.base_attention.borrow_mut().write_kv(
             &k,
             &v,
             attention_metadata.and_then(|metadata| metadata.write_loc.as_ref()),
             attention_metadata.map_or(BatchPhase::Prefill, |metadata| metadata.forward_mode),
-        )?;
+        );
+        profiler.finish(timer);
+        write_result?;
 
-        let output = attention_batch.forward(&q, &k, &v, &self.base_attention.borrow())?;
-        Ok(linear(&output, &self.o_proj))
+        let timer = profiler.start(ModelStage::AttentionBackend);
+        let output = attention_batch.forward(&q, &k, &v, &self.base_attention.borrow());
+        profiler.finish(timer);
+        let output = output?;
+
+        let timer = profiler.start(ModelStage::AttentionOutput);
+        let output = linear(&output, &self.o_proj);
+        profiler.finish(timer);
+        Ok(output)
     }
 
     fn load_weights(

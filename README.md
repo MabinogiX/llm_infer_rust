@@ -41,6 +41,8 @@ VENV_DIR=/path/to/cuda-venv ./scripts/run-debug.sh \
 
 如果服务器使用 CUDA 兼容驱动，启动前先设置 `export LD_LIBRARY_PATH="/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"`，再运行上述脚本。
 
+诊断请求延迟时，在启动命令前设置 `SGLANG_PROFILE_STEPS=1`。日志会按请求 UID 和输出 token 序号打印 `request step timing`，包含批次准备、模型前向、采样和 KV 状态更新的微秒耗时；`model forward timing` 汇总规划、各 decoder 层、RoPE、归一化、MLP 和 attention backend 等耗时。非流式请求还会打印入口及输出处理耗时。诊断模式会在阶段边界同步 CUDA，可能降低吞吐；正常运行时不设置该变量。
+
 Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-debug.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
 
 模型专有代码集中在 `src/models/<模型名>/`：`model.rs` 实现模型结构，`template.rs` 处理输入模板，`output.rs` 解析输出，`components.rs` 组装 tokenizer、engine、scheduler 和输出解析器。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择一次模型；不支持的模型会在加载权重前报错。新增模型时只需在 `src/models/` 下增加目录并登记，无须修改服务端和 tokenizer 的模型分支；请求处理过程不切换模型。

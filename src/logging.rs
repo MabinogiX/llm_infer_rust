@@ -1,6 +1,6 @@
 //! Application-wide tracing setup with daily file rotation.
 
-use std::{error::Error, fmt, fs, path::PathBuf, time::Duration};
+use std::{error::Error, fmt, fs, path::PathBuf, sync::OnceLock, time::Duration};
 
 use tracing::{Event, Subscriber};
 use tracing_appender::{
@@ -19,6 +19,12 @@ use tracing_subscriber::{
 };
 
 pub const SERVICE_NAME: &str = "llm-infer-rust";
+
+/// Opt-in profiling synchronizes CUDA between stages, so it changes throughput.
+pub(crate) fn step_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SGLANG_PROFILE_STEPS").as_deref() == Ok("1"))
+}
 
 pub(crate) fn format_duration(duration: Duration) -> String {
     format!("{:.3} s", duration.as_secs_f64())
