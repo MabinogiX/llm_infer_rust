@@ -5,7 +5,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_flashinfer)");
     println!("cargo:rerun-if-changed=src/engine/cuda_graph_bridge.cpp");
     println!("cargo:rerun-if-changed=src/models/attention/flashinfer_bridge.cpp");
-    println!("cargo:rerun-if-changed=src/models/attention/flashinfer_decode.cu");
+    println!("cargo:rerun-if-changed=src/models/attention/flashinfer_plan_run.cu");
     println!("cargo:rerun-if-env-changed=VIRTUAL_ENV");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=FLASHINFER_CUDA_ARCH");
@@ -46,8 +46,7 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=c10_cuda");
     println!("cargo:rustc-cfg=has_cuda_graph");
 
-    // The wheel supplies CUDA headers and sources; the server links a native
-    // kernel instead of embedding CPython or calling FlashInfer's Python API.
+    // Compile the thin native adapter against the wheel's official CUDA headers.
     let Ok(venv) = env::var("VIRTUAL_ENV") else {
         return;
     };
@@ -80,7 +79,7 @@ fn main() {
         .cuda(true)
         .debug(false)
         .opt_level(3)
-        .file("src/models/attention/flashinfer_decode.cu")
+        .file("src/models/attention/flashinfer_plan_run.cu")
         .include(&flashinfer_include)
         .include(flashinfer_data.join("cutlass/include"))
         .include(flashinfer_data.join("cccl/libcudacxx/include"))
@@ -89,6 +88,6 @@ fn main() {
         .flag("-std=c++17")
         .flag(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
         .warnings(false);
-    kernel.compile("sglang_flashinfer_decode");
+    kernel.compile("sglang_flashinfer_plan_run");
     println!("cargo:rustc-cfg=has_flashinfer");
 }

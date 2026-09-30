@@ -13,9 +13,7 @@ struct FlashInferPlan {
   at::Tensor indices;
   at::Tensor indptr;
   at::Tensor last_page_len;
-  at::Tensor request_indices;
-  at::Tensor kv_tile_indices;
-  at::Tensor kv_chunk_size;
+  void* native_plan = nullptr;
   int64_t num_q_heads;
   int64_t num_kv_heads;
   int64_t head_dim;
@@ -23,13 +21,16 @@ struct FlashInferPlan {
   int64_t dtype_code;
 };
 
-extern "C" const char* sglang_flashinfer_launch(
-    const void* query, const void* key_cache, const void* value_cache,
-    const int32_t* page_indices, const int32_t* page_indptr,
-    const int32_t* page_last_len, const int32_t* request_indices,
-    const int32_t* kv_tile_indices, const int32_t* kv_chunk_size,
-    void* output, int32_t batch_size,
-    int32_t num_q_heads, int32_t num_kv_heads, int32_t head_dim,
+extern "C" void* sglang_flashinfer_native_plan(
+    const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,
+    int32_t num_kv_heads, int32_t page_size, int32_t dtype_code,
+    void* stream, const char** error);
+extern "C" void sglang_flashinfer_native_plan_drop(void* plan);
+extern "C" const char* sglang_flashinfer_native_run(
+    const void* plan, const void* query, const void* key_cache,
+    const void* value_cache, const int32_t* page_indices,
+    const int32_t* page_indptr, const int32_t* page_last_len, void* output,
+    int32_t batch_size, int32_t num_q_heads, int32_t num_kv_heads,
     int32_t page_size, int32_t dtype_code, void* stream);
 }  // namespace
 
@@ -60,9 +61,15 @@ extern "C" void* sglang_flashinfer_prepare(
                         .to(at::kInt)
                         .contiguous();
     plan->last_page_len = ((sequence_lengths->to(at::kInt) - 1) % page_size + 1).contiguous();
-    plan->request_indices = at::arange(block_table->size(0), pages.options());
-    plan->kv_tile_indices = at::zeros_like(plan->request_indices);
-    plan->kv_chunk_size = at::ones({1}, pages.options());
+    auto indptr_host = plan->indptr.to(at::kCPU).contiguous();
+    const char* native_error = nullptr;
+    auto stream = c10::cuda::getCurrentCUDAStream(block_table->get_device()).stream();
+    plan->native_plan = sglang_flashinfer_native_plan(
+        indptr_host.data_ptr<int32_t>(), block_table->size(0), num_q_heads,
+        num_kv_heads, page_size, dtype_code, stream, &native_error);
+    if (!plan->native_plan) {
+      throw std::runtime_error(native_error ? native_error : "FlashInfer plan failed");
+    }
     plan->num_q_heads = num_q_heads;
     plan->num_kv_heads = num_kv_heads;
     plan->head_dim = head_dim;
@@ -76,7 +83,9 @@ extern "C" void* sglang_flashinfer_prepare(
 }
 
 extern "C" void sglang_flashinfer_plan_drop(void* plan) {
-  delete static_cast<FlashInferPlan*>(plan);
+  auto* prepared = static_cast<FlashInferPlan*>(plan);
+  if (prepared) sglang_flashinfer_native_plan_drop(prepared->native_plan);
+  delete prepared;
 }
 
 extern "C" at::Tensor* sglang_flashinfer_decode(
@@ -100,18 +109,16 @@ extern "C" at::Tensor* sglang_flashinfer_decode(
     const int32_t dtype_code = query->scalar_type() == at::kBFloat16 ? 0 : 1;
     if (num_q_heads != plan.num_q_heads || num_kv_heads != plan.num_kv_heads ||
         head_dim != plan.head_dim || page_size != plan.page_size ||
-        dtype_code != plan.dtype_code || batch_size != plan.request_indices.size(0)) {
+        dtype_code != plan.dtype_code || batch_size != plan.last_page_len.size(0)) {
       throw std::runtime_error("FlashInfer decode tensors do not match the prepared batch");
     }
     auto output = at::empty_like(*query);
     auto stream = c10::cuda::getCurrentCUDAStream(query->get_device()).stream();
-    const char* error = sglang_flashinfer_launch(
-        query->data_ptr(), key_cache->data_ptr(), value_cache->data_ptr(),
+    const char* error = sglang_flashinfer_native_run(
+        plan.native_plan, query->data_ptr(), key_cache->data_ptr(), value_cache->data_ptr(),
         plan.indices.data_ptr<int32_t>(), plan.indptr.data_ptr<int32_t>(),
-        plan.last_page_len.data_ptr<int32_t>(), plan.request_indices.data_ptr<int32_t>(),
-        plan.kv_tile_indices.data_ptr<int32_t>(), plan.kv_chunk_size.data_ptr<int32_t>(),
-        output.data_ptr(), batch_size,
-        num_q_heads, num_kv_heads, head_dim, page_size, dtype_code, stream);
+        plan.last_page_len.data_ptr<int32_t>(), output.data_ptr(), batch_size,
+        num_q_heads, num_kv_heads, page_size, dtype_code, stream);
     if (error) {
       throw std::runtime_error(error);
     }

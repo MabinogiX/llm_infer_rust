@@ -37,7 +37,9 @@ VENV_DIR=/path/to/cuda-venv ./scripts/run-debug.sh \
   --max-running-req 4 --max-seq-len 40960
 ```
 
-这里直接调用 FlashInfer 的 C++/CUDA 分页 decode 内核；每轮 decode 构造一次分页元数据，所有模型层复用。当前采用不拆分 KV 的内核路径，长上下文性能尚需进一步优化。若构建环境缺少 FlashInfer 头文件，服务会在模型初始化时报错，不会静默回退到原先的 SDPA decode。
+这里调用 FlashInfer 官方的 `DecodePlan` 与分页 decode dispatch；每轮 decode 构造一次分页元数据，规划结果和工作区供所有模型层复用。FlashInfer 的规划器会按请求长度和 GPU 并行度决定是否拆分 KV。若构建环境缺少 FlashInfer 头文件，服务会在模型初始化时报错，不会静默回退到原先的 SDPA decode。
+
+如果服务器使用 CUDA 兼容驱动，启动前先设置 `export LD_LIBRARY_PATH="/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"`，再运行上述脚本。
 
 Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-debug.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
 
