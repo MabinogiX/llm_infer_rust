@@ -30,6 +30,13 @@ impl BaseAttention {
         self.k_cache.is_some()
     }
 
+    pub fn cache_tensors(&self) -> Result<(&Tensor, &Tensor)> {
+        match (&self.k_cache, &self.v_cache) {
+            (Some(k), Some(v)) => Ok((k, v)),
+            _ => Err(model_error("paged-KV attention requires a bound KV cache")),
+        }
+    }
+
     /// Writes `(tokens, kv_heads, head_dim)` K/V values to flattened page slots.
     /// `-1` write locations are deliberately skipped.
     pub fn write_kv(

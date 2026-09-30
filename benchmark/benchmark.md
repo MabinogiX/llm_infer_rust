@@ -1,6 +1,9 @@
 # Benchmark优化记录
 
 ## 2026.09.30
+从LibTorch SDPA切换到了FlashInfer，导致无法使用graph，单个请求速度下降至23s左右，gpu利用率约40%；
+
+## 2026.09.30
 发现昨天的测试有误，启动参数变成了--max-running-req 4 --max-seq-len 512，因而单个请求变快。优化prefill kv cache不再跟cpu通讯，单个请求依然3s左右。使用--max-running-req 4 --max-seq-len 40960单个请求长达86s，出现显著性能回退。cpu和gpu利用率接近100%
 
 ## 2026.09.29

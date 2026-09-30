@@ -20,7 +20,7 @@ Options:\n\
   --cuda-graph-bs N         Maximum CUDA decode graph batch (0 disables)\n\
   --max-seq-len N           Maximum sequence length (default 8192; must not exceed model config)\n\
   --page-size N             KV cache page size (default 16)\n\
-  --attention-backend NAME  Attention backend: fa or pt (default fa)\n\
+  --attention-backend NAME  Attention backend: fa, pt, or flashinfer (CUDA eager decode)\n\
   --dtype NAME              Model dtype: auto, bfloat16, float16, float32\n\
   --device NAME             Device: auto, cpu, or cuda (default auto)\n\
   --trust-remote-code       Request Hugging Face remote code\n\

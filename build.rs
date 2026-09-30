@@ -1,10 +1,14 @@
-use std::{env, process::Command};
+use std::{env, fs, path::Path, process::Command};
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_cuda_graph)");
+    println!("cargo:rustc-check-cfg=cfg(has_flashinfer)");
     println!("cargo:rerun-if-changed=src/engine/cuda_graph_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/models/attention/flashinfer_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/models/attention/flashinfer_decode.cu");
     println!("cargo:rerun-if-env-changed=VIRTUAL_ENV");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=FLASHINFER_CUDA_ARCH");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
@@ -32,7 +36,8 @@ fn main() {
     build.cpp(true).file("src/engine/cuda_graph_bridge.cpp");
     build.flag_if_supported("-std=c++20");
     build.define("_GLIBCXX_USE_CXX11_ABI", abi);
-    for include in lines {
+    let torch_includes: Vec<String> = lines.map(str::to_owned).collect();
+    for include in &torch_includes {
         build.include(include);
     }
     build.compile("sglang_cuda_graph_bridge");
@@ -40,4 +45,50 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=torch_cuda");
     println!("cargo:rustc-link-lib=dylib=c10_cuda");
     println!("cargo:rustc-cfg=has_cuda_graph");
+
+    // The wheel supplies CUDA headers and sources; the server links a native
+    // kernel instead of embedding CPython or calling FlashInfer's Python API.
+    let Ok(venv) = env::var("VIRTUAL_ENV") else {
+        return;
+    };
+    let Ok(python_libs) = fs::read_dir(Path::new(&venv).join("lib")) else {
+        return;
+    };
+    let flashinfer_include = python_libs
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("site-packages/flashinfer/data/include"))
+        .find(|path| path.join("flashinfer/attention/decode.cuh").exists());
+    let Some(flashinfer_include) = flashinfer_include else {
+        return;
+    };
+    let flashinfer_data = flashinfer_include.parent().unwrap();
+    let mut flashinfer_build = cc::Build::new();
+    flashinfer_build
+        .cpp(true)
+        .file("src/models/attention/flashinfer_bridge.cpp")
+        .flag_if_supported("-std=c++20")
+        .warnings(false)
+        .define("_GLIBCXX_USE_CXX11_ABI", abi);
+    for include in &torch_includes {
+        flashinfer_build.include(include);
+    }
+    flashinfer_build.compile("sglang_flashinfer_bridge");
+
+    let arch = env::var("FLASHINFER_CUDA_ARCH").unwrap_or_else(|_| "80".to_owned());
+    let mut kernel = cc::Build::new();
+    kernel
+        .cuda(true)
+        .debug(false)
+        .opt_level(3)
+        .file("src/models/attention/flashinfer_decode.cu")
+        .include(&flashinfer_include)
+        .include(flashinfer_data.join("cutlass/include"))
+        .include(flashinfer_data.join("cccl/libcudacxx/include"))
+        .include(flashinfer_data.join("cccl/cub"))
+        .include(flashinfer_data.join("cccl/thrust"))
+        .flag("-std=c++17")
+        .flag(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+        .warnings(false);
+    kernel.compile("sglang_flashinfer_decode");
+    println!("cargo:rustc-cfg=has_flashinfer");
 }

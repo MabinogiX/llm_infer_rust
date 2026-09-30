@@ -76,6 +76,11 @@ impl Batch {
 
 /// Boundary implemented by the future Rust model architecture.
 pub trait ModelExecutor {
+    /// Whether decode forwards can be safely captured as CUDA Graphs.
+    fn supports_cuda_graph(&self) -> bool {
+        true
+    }
+
     fn forward(
         &self,
         input_ids: &Tensor,
@@ -159,6 +164,10 @@ impl ModelRunner {
 
     pub fn device(&self) -> Device {
         self.device
+    }
+
+    pub fn supports_cuda_graph(&self) -> bool {
+        self.model.supports_cuda_graph()
     }
 
     /// Hands loaded Hugging Face tensors to the concrete model architecture.

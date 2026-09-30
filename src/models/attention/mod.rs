@@ -3,5 +3,5 @@
 mod backend;
 mod base;
 
-pub use backend::{AttentionBackend, AttentionBackendKind, create_attention_backend};
+pub use backend::{Attention, AttentionBatch, AttentionSpec};
 pub use base::BaseAttention;
