@@ -138,7 +138,7 @@ engine.load_model_weights()?;
 
 当前 dense Qwen3 支持 eager prefill、带缓存前缀的 prefill 和 paged-KV decode；模型接入 `Engine` 时会自动绑定 `KVCachePool` 的逐层 K/V 切片。Qwen3-MoE 与张量并行尚未迁移，调用时会返回明确错误。
 
-Attention 通过 `ServerArgs::attention_backend` 选择后端，默认 `"fa"` 使用 LibTorch 的 scaled dot product attention；符合条件的 CUDA BF16/FP16 输入由 LibTorch 选择 fused FlashAttention kernel。不符合条件时 LibTorch 会使用其他 SDPA kernel。`"pt"` 保留原有 eager 实现。`--dtype auto` 读取模型 `config.json` 中的 `torch_dtype`（或 `dtype`），CPU 推理回退到 float32。
+Attention 通过 `ServerArgs::attention_backend` 选择后端，默认 `"fa"` 使用 LibTorch 的 scaled dot product attention。Prefill 会把不同长度的请求填充成一个 batch，每层调用一次 SDPA，再还原输出顺序；无缓存前缀时使用 causal mask，让符合条件的 CUDA BF16/FP16 输入可由 LibTorch 选择 fused FlashAttention kernel。带缓存前缀时使用显式掩码，LibTorch 可能选择其他 SDPA kernel。`"pt"` 保留原有 eager 实现。`--dtype auto` 读取模型 `config.json` 中的 `torch_dtype`（或 `dtype`），CPU 推理回退到 float32。
 
 ## TokenizerWorker
 
