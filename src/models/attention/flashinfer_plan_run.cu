@@ -23,6 +23,30 @@ struct NativePlan {
   void* float_workspace = nullptr;
   void* int_workspace = nullptr;
   void* pinned_int_workspace = nullptr;
+  size_t float_capacity = 0;
+  size_t int_capacity = 0;
+  size_t pinned_capacity = 0;
+  uint64_t allocations = 0;
+
+  cudaError_t reserve(void*& buffer, size_t& capacity, size_t bytes, bool pinned) {
+    if (bytes <= capacity) return cudaSuccess;
+    size_t grown = std::max(bytes, capacity ? capacity * 2 : size_t(65536));
+    void* replacement = nullptr;
+    auto status = pinned ? cudaMallocHost(&replacement, grown)
+                         : cudaMalloc(&replacement, grown);
+    if (status != cudaSuccess) return status;
+    if (buffer) {
+      status = pinned ? cudaFreeHost(buffer) : cudaFree(buffer);
+      if (status != cudaSuccess) {
+        if (pinned) cudaFreeHost(replacement); else cudaFree(replacement);
+        return status;
+      }
+    }
+    buffer = replacement;
+    capacity = grown;
+    ++allocations;
+    return cudaSuccess;
+  }
 
   ~NativePlan() {
     if (float_workspace) cudaFree(float_workspace);
@@ -52,15 +76,15 @@ cudaError_t make_plan(NativePlan& plan, const int32_t* indptr_host,
   const size_t float_bytes = split_kv
       ? size_t(num_q_heads) * padded * (128 * sizeof(float) + sizeof(float)) + 64
       : 1;
-  if ((status = cudaMalloc(&plan.float_workspace, float_bytes)) != cudaSuccess ||
-      (status = cudaMalloc(&plan.int_workspace, int_bytes)) != cudaSuccess ||
-      (status = cudaMallocHost(&plan.pinned_int_workspace, int_bytes)) != cudaSuccess) {
+  if ((status = plan.reserve(plan.float_workspace, plan.float_capacity, float_bytes, false)) != cudaSuccess ||
+      (status = plan.reserve(plan.int_workspace, plan.int_capacity, int_bytes, false)) != cudaSuccess ||
+      (status = plan.reserve(plan.pinned_int_workspace, plan.pinned_capacity, int_bytes, true)) != cudaSuccess) {
     return status;
   }
   return flashinfer::DecodePlan<128, flashinfer::PosEncodingMode::kNone,
                                 Variant, Params>(
-      plan.float_workspace, float_bytes, plan.int_workspace,
-      plan.pinned_int_workspace, int_bytes, plan.info,
+      plan.float_workspace, plan.float_capacity, plan.int_workspace,
+      plan.pinned_int_workspace, plan.int_capacity, plan.info,
       const_cast<int32_t*>(indptr_host), batch_size, num_q_heads,
       page_size, false, stream, estimate);
 }
@@ -124,11 +148,12 @@ cudaError_t run(const NativePlan& plan, const void* query,
 }  // namespace
 
 extern "C" void* sglang_flashinfer_native_plan(
-    const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,
+    void* existing, const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,
     int32_t num_kv_heads, int32_t page_size, int32_t dtype_code,
     void* stream, const char** error) {
   try {
-    auto plan = std::make_unique<NativePlan>();
+    auto created = existing ? nullptr : std::make_unique<NativePlan>();
+    auto* plan = existing ? static_cast<NativePlan*>(existing) : created.get();
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     cudaError_t status = dtype_code == 0
         ? dispatch_plan<__nv_bfloat16>(*plan, indptr_host, batch_size,
@@ -141,13 +166,17 @@ extern "C" void* sglang_flashinfer_native_plan(
       *error = cudaGetErrorString(status);
       return nullptr;
     }
-    return plan.release();
+    return existing ? existing : created.release();
   } catch (const std::exception& e) {
     static thread_local std::string message;
     message = e.what();
     *error = message.c_str();
     return nullptr;
   }
+}
+
+extern "C" uint64_t sglang_flashinfer_native_allocations(const void* plan) {
+  return static_cast<const NativePlan*>(plan)->allocations;
 }
 
 extern "C" void sglang_flashinfer_native_plan_drop(void* plan) {

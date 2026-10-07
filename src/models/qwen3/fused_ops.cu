@@ -80,6 +80,25 @@ __global__ void qk_norm_kernel(
 }
 
 template <typename T>
+__global__ void add_norm_kernel(T* x, T* residual, const T* weight,
+                                int64_t width, int64_t x_stride,
+                                int64_t residual_stride, float eps) {
+  T* input = x + blockIdx.x * x_stride;
+  T* sum_row = residual + blockIdx.x * residual_stride;
+  float sum = 0.0f;
+  for (int64_t i = threadIdx.x; i < width; i += blockDim.x) {
+    // Match the existing separate BF16/FP16 add before the FP32 RMS reduction.
+    const T rounded = from_float<T>(as_float(input[i]) + as_float(sum_row[i]));
+    sum_row[i] = rounded;
+    const float value = as_float(rounded);
+    sum += value * value;
+  }
+  const float scale = rsqrtf(block_sum(sum) / width + eps);
+  for (int64_t i = threadIdx.x; i < width; i += blockDim.x)
+    input[i] = from_float<T>(as_float(sum_row[i]) * scale * as_float(weight[i]));
+}
+
+template <typename T>
 __global__ void rope_kernel(
     T* q, T* k, const int64_t* positions, const float* cos,
     const float* sin, int64_t tokens, int64_t qheads,
@@ -189,6 +208,25 @@ extern "C" const char* sglang_qwen3_native_qk_norm(
         static_cast<const __half*>(qw), static_cast<const __half*>(kw),
         tokens, qheads, kheads, width, q_token_stride, q_head_stride,
         k_token_stride, k_head_stride, static_cast<float>(eps));
+  return launch_error();
+}
+
+extern "C" const char* sglang_qwen3_native_add_norm(
+    void* x, void* residual, const void* weight, int64_t tokens,
+    int64_t width, int64_t x_stride, int64_t residual_stride,
+    double eps, int dtype, void* stream) {
+  if (tokens == 0) return nullptr;
+  auto cuda_stream = static_cast<cudaStream_t>(stream);
+  if (dtype == 0)
+    add_norm_kernel<<<tokens, 256, 0, cuda_stream>>>(
+        static_cast<__nv_bfloat16*>(x), static_cast<__nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(weight), width, x_stride, residual_stride,
+        static_cast<float>(eps));
+  else
+    add_norm_kernel<<<tokens, 256, 0, cuda_stream>>>(
+        static_cast<__half*>(x), static_cast<__half*>(residual),
+        static_cast<const __half*>(weight), width, x_stride, residual_stride,
+        static_cast<float>(eps));
   return launch_error();
 }
 

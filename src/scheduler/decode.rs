@@ -23,6 +23,16 @@ pub struct DecodeManager {
     cache_seqlens_buf: Tensor,
     block_table_buf: Tensor,
     req_to_token_buf: Tensor,
+    row_mappings: Vec<RowMapping>,
+    #[cfg(test)]
+    mapped_tokens: usize,
+}
+
+#[derive(Default)]
+struct RowMapping {
+    uid: Option<RequestId>,
+    pages: Vec<usize>,
+    len: usize,
 }
 
 impl DecodeManager {
@@ -47,6 +57,11 @@ impl DecodeManager {
             cache_seqlens_buf: Tensor::zeros([rows], (Kind::Int, device)),
             block_table_buf: Tensor::full([rows, blocks], -1, (Kind::Int, device)),
             req_to_token_buf: Tensor::full([rows, sequence], -1, (Kind::Int, device)),
+            row_mappings: (0..args.max_running_req)
+                .map(|_| RowMapping::default())
+                .collect(),
+            #[cfg(test)]
+            mapped_tokens: 0,
         })
     }
 
@@ -74,8 +89,6 @@ impl DecodeManager {
         let mut cache_seqlens = Vec::with_capacity(rows);
         let mut max_seqlen = 0;
         let rows_i64 = to_i64(rows, "request count")?;
-        let _ = self.block_table_buf.narrow(0, 0, rows_i64).fill_(-1);
-        let _ = self.req_to_token_buf.narrow(0, 0, rows_i64).fill_(-1);
 
         for (row, request) in active.into_iter().enumerate() {
             let len = request.input_ids.len();
@@ -107,30 +120,81 @@ impl DecodeManager {
             write_loc.push(location);
 
             if let Some(handle) = handle {
-                let pages = handle
-                    .page_ids
+                let pages = &handle.page_ids[..handle.page_ids.len().min(self.max_blocks)];
+                let previous = &self.row_mappings[row];
+                let reset = previous.uid != Some(request.uid);
+                let changed_page = if reset {
+                    0
+                } else {
+                    previous
+                        .pages
+                        .iter()
+                        .zip(pages)
+                        .position(|(old, new)| old != new)
+                        .unwrap_or(previous.pages.len().min(pages.len()))
+                };
+                let page_values = pages[changed_page..]
                     .iter()
-                    .take(self.max_blocks)
                     .map(|&page| to_i32(page, "page ID"))
                     .collect::<Result<Vec<_>>>()?;
-                if !pages.is_empty() {
+                let start = if reset {
+                    0
+                } else {
+                    previous.len.min(changed_page * self.page_size).min(len)
+                };
+                let mut locations = Vec::with_capacity(len - start);
+                for position in start..len {
+                    locations.push(self.cache_location(
+                        pages[position / self.page_size],
+                        position % self.page_size,
+                    )?);
+                }
+                if reset {
+                    let _ = self.block_table_buf.get(row as i64).fill_(-1);
+                    let _ = self.req_to_token_buf.get(row as i64).fill_(-1);
+                } else {
+                    if pages.len() < previous.pages.len() {
+                        let _ = self
+                            .block_table_buf
+                            .get(row as i64)
+                            .narrow(
+                                0,
+                                pages.len() as i64,
+                                (previous.pages.len() - pages.len()) as i64,
+                            )
+                            .fill_(-1);
+                    }
+                    if len < previous.len {
+                        let _ = self
+                            .req_to_token_buf
+                            .get(row as i64)
+                            .narrow(0, len as i64, (previous.len - len) as i64)
+                            .fill_(-1);
+                    }
+                }
+                if !page_values.is_empty() {
                     self.block_table_buf
                         .get(row as i64)
-                        .narrow(0, 0, to_i64(pages.len(), "page count")?)
-                        .copy_(&Tensor::from_slice(&pages).to_device(self.device));
-                }
-                let filled = len.min(handle.page_ids.len().saturating_mul(self.page_size));
-                let mut locations = Vec::with_capacity(filled);
-                for position in 0..filled {
-                    let page = handle.page_ids[position / self.page_size];
-                    locations.push(self.cache_location(page, position % self.page_size)?);
+                        .narrow(0, changed_page as i64, page_values.len() as i64)
+                        .copy_(&Tensor::from_slice(&page_values).to_device(self.device));
                 }
                 if !locations.is_empty() {
                     self.req_to_token_buf
                         .get(row as i64)
-                        .narrow(0, 0, to_i64(locations.len(), "filled token count")?)
+                        .narrow(0, start as i64, locations.len() as i64)
                         .copy_(&Tensor::from_slice(&locations).to_device(self.device));
                 }
+                #[cfg(test)]
+                {
+                    self.mapped_tokens += locations.len();
+                }
+                let previous = &mut self.row_mappings[row];
+                previous.uid = Some(request.uid);
+                if previous.pages != pages {
+                    previous.pages.clear();
+                    previous.pages.extend_from_slice(pages);
+                }
+                previous.len = len;
             }
         }
 
@@ -299,5 +363,81 @@ mod tests {
             manager().schedule_decode(&[request]),
             Err(SchedulerError::InvalidDecode(_))
         ));
+    }
+
+    #[test]
+    fn growing_decode_only_maps_new_tokens_and_handles_page_changes() {
+        let mut manager = manager();
+        let mut request = running(1, vec![1, 2], vec![5, 6, 7]);
+        drop(
+            manager
+                .schedule_decode(std::slice::from_ref(&request))
+                .unwrap(),
+        );
+        assert_eq!(manager.mapped_tokens, 2);
+        request.input_ids.push(3);
+        drop(
+            manager
+                .schedule_decode(std::slice::from_ref(&request))
+                .unwrap(),
+        );
+        assert_eq!(manager.mapped_tokens, 3);
+        request.input_ids.push(4);
+        drop(
+            manager
+                .schedule_decode(std::slice::from_ref(&request))
+                .unwrap(),
+        );
+        assert_eq!(manager.mapped_tokens, 4);
+        request.cache_handle.as_mut().unwrap().page_ids[0] = 9;
+        drop(
+            manager
+                .schedule_decode(std::slice::from_ref(&request))
+                .unwrap(),
+        );
+        assert_eq!(manager.mapped_tokens, 8);
+        assert_eq!(
+            Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
+            vec![18, 19, 12, 13, -1, -1]
+        );
+        request.input_ids.truncate(1);
+        request.cache_handle.as_mut().unwrap().page_ids.truncate(1);
+        drop(
+            manager
+                .schedule_decode(std::slice::from_ref(&request))
+                .unwrap(),
+        );
+        assert_eq!(
+            Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
+            vec![18, -1, -1, -1, -1, -1]
+        );
+        assert_eq!(
+            Vec::<i32>::try_from(&manager.block_table_buf.get(0)).unwrap(),
+            vec![9, -1, -1]
+        );
+    }
+
+    #[test]
+    fn compacting_rows_and_reusing_pages_preserves_request_mappings() {
+        let mut manager = manager();
+        let a = running(1, vec![1, 2], vec![5]);
+        let mut b = running(2, vec![3, 4], vec![6]);
+        drop(manager.schedule_decode(&[a, b]).unwrap());
+        b = running(2, vec![3, 4, 5], vec![6, 7]);
+        drop(manager.schedule_decode(std::slice::from_ref(&b)).unwrap());
+        assert_eq!(
+            Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
+            vec![12, 13, 14, -1, -1, -1]
+        );
+        let c = running(3, vec![9], vec![6]);
+        drop(manager.schedule_decode(&[c, b]).unwrap());
+        assert_eq!(
+            Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
+            vec![12, -1, -1, -1, -1, -1]
+        );
+        assert_eq!(
+            Vec::<i32>::try_from(&manager.req_to_token_buf.get(1)).unwrap(),
+            vec![12, 13, 14, -1, -1, -1]
+        );
     }
 }

@@ -1,5 +1,6 @@
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <cstdint>
 #include <memory>
@@ -19,13 +20,15 @@ struct FlashInferPlan {
   int64_t head_dim;
   int64_t page_size;
   int64_t dtype_code;
+  int device_index;
 };
 
 extern "C" void* sglang_flashinfer_native_plan(
-    const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,
+    void* existing, const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,
     int32_t num_kv_heads, int32_t page_size, int32_t dtype_code,
     void* stream, const char** error);
 extern "C" void sglang_flashinfer_native_plan_drop(void* plan);
+extern "C" uint64_t sglang_flashinfer_native_allocations(const void* plan);
 extern "C" const char* sglang_flashinfer_native_run(
     const void* plan, const void* query, const void* key_cache,
     const void* value_cache, const int32_t* page_indices,
@@ -37,13 +40,16 @@ extern "C" const char* sglang_flashinfer_native_run(
 extern "C" const char* sglang_flashinfer_error() { return last_error.c_str(); }
 
 extern "C" void* sglang_flashinfer_prepare(
-    const at::Tensor* block_table, const at::Tensor* sequence_lengths,
+    void* existing, const at::Tensor* block_table, const at::Tensor* sequence_lengths,
     int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
     int64_t page_size, int64_t dtype_code) {
   try {
     if (!block_table->is_cuda() || !sequence_lengths->is_cuda()) {
       throw std::runtime_error("FlashInfer metadata must be CUDA tensors");
     }
+    c10::cuda::CUDAGuard guard(block_table->device());
+    if (sequence_lengths->get_device() != block_table->get_device())
+      throw std::runtime_error("FlashInfer metadata devices do not match");
     if (block_table->dim() != 2 || sequence_lengths->dim() != 1 ||
         block_table->size(0) != sequence_lengths->size(0)) {
       throw std::runtime_error("invalid FlashInfer block table or lengths");
@@ -52,7 +58,13 @@ extern "C" void* sglang_flashinfer_prepare(
         head_dim != 128 || page_size <= 0 || (dtype_code != 0 && dtype_code != 1)) {
       throw std::runtime_error("unsupported FlashInfer attention configuration");
     }
-    auto plan = std::make_unique<FlashInferPlan>();
+    auto created = existing ? nullptr : std::make_unique<FlashInferPlan>();
+    auto* plan = existing ? static_cast<FlashInferPlan*>(existing) : created.get();
+    if (existing && (plan->device_index != block_table->get_device() ||
+        plan->num_q_heads != num_q_heads || plan->num_kv_heads != num_kv_heads ||
+        plan->head_dim != head_dim || plan->page_size != page_size ||
+        plan->dtype_code != dtype_code))
+      throw std::runtime_error("FlashInfer workspace geometry changed");
     auto pages = at::floor_divide(sequence_lengths->to(at::kInt) + page_size - 1,
                                   page_size);
     plan->indptr = at::cat({at::zeros({1}, pages.options()), pages.cumsum(0, at::kInt)});
@@ -62,29 +74,41 @@ extern "C" void* sglang_flashinfer_prepare(
                         .contiguous();
     plan->last_page_len = ((sequence_lengths->to(at::kInt) - 1) % page_size + 1).contiguous();
     auto indptr_host = plan->indptr.to(at::kCPU).contiguous();
+    // This blocking read also drains earlier work on the same stream before
+    // DecodePlan overwrites its reusable pinned and device workspaces.
     const char* native_error = nullptr;
     auto stream = c10::cuda::getCurrentCUDAStream(block_table->get_device()).stream();
-    plan->native_plan = sglang_flashinfer_native_plan(
-        indptr_host.data_ptr<int32_t>(), block_table->size(0), num_q_heads,
+    auto* native_plan = sglang_flashinfer_native_plan(
+        plan->native_plan, indptr_host.data_ptr<int32_t>(), block_table->size(0), num_q_heads,
         num_kv_heads, page_size, dtype_code, stream, &native_error);
-    if (!plan->native_plan) {
+    if (!native_plan) {
       throw std::runtime_error(native_error ? native_error : "FlashInfer plan failed");
     }
+    plan->native_plan = native_plan;
     plan->num_q_heads = num_q_heads;
     plan->num_kv_heads = num_kv_heads;
     plan->head_dim = head_dim;
     plan->page_size = page_size;
     plan->dtype_code = dtype_code;
-    return plan.release();
+    plan->device_index = block_table->get_device();
+    return existing ? existing : created.release();
   } catch (const std::exception& error) {
     last_error = error.what();
     return nullptr;
   }
 }
 
+extern "C" uint64_t sglang_flashinfer_workspace_allocations(const void* prepared) {
+  return sglang_flashinfer_native_allocations(
+      static_cast<const FlashInferPlan*>(prepared)->native_plan);
+}
+
 extern "C" void sglang_flashinfer_plan_drop(void* plan) {
   auto* prepared = static_cast<FlashInferPlan*>(plan);
-  if (prepared) sglang_flashinfer_native_plan_drop(prepared->native_plan);
+  if (prepared) {
+    c10::cuda::CUDAGuard guard(prepared->device_index);
+    sglang_flashinfer_native_plan_drop(prepared->native_plan);
+  }
   delete prepared;
 }
 

@@ -12,6 +12,8 @@ thread_local std::string last_error;
 extern "C" const char* sglang_qwen3_native_norm(
     const void*, const void*, void*, int64_t, int64_t, int64_t, int64_t,
     int64_t, double, int, void*);
+extern "C" const char* sglang_qwen3_native_add_norm(
+    void*, void*, const void*, int64_t, int64_t, int64_t, int64_t, double, int, void*);
 extern "C" const char* sglang_qwen3_native_qk_norm(
     void*, void*, const void*, const void*, int64_t, int64_t, int64_t,
     int64_t, int64_t, int64_t, int64_t, int64_t, double, int, void*);
@@ -69,6 +71,28 @@ extern "C" at::Tensor* sglang_qwen3_rms_norm(
   } catch (const std::exception& error) {
     last_error = error.what();
     return nullptr;
+  }
+}
+
+extern "C" bool sglang_qwen3_add_rms_norm_inplace(
+    const at::Tensor* x, const at::Tensor* residual, const at::Tensor* weight, double eps) {
+  try {
+    const int dtype = dtype_code(*x);
+    if (x->dim() != 2 || x->stride(1) != 1 ||
+        !residual->is_cuda() || residual->get_device() != x->get_device() ||
+        residual->scalar_type() != x->scalar_type() ||
+        residual->sizes() != x->sizes() || residual->stride(1) != 1 ||
+        x->data_ptr() == residual->data_ptr())
+      throw std::runtime_error("invalid Qwen3 fused add-RMSNorm inputs");
+    check_weight(*x, *weight, x->size(1));
+    auto stream = c10::cuda::getCurrentCUDAStream(x->get_device()).stream();
+    check(sglang_qwen3_native_add_norm(
+        x->data_ptr(), residual->data_ptr(), weight->data_ptr(),
+        x->size(0), x->size(1), x->stride(0), residual->stride(0), eps, dtype, stream));
+    return true;
+  } catch (const std::exception& error) {
+    last_error = error.what();
+    return false;
   }
 }
 

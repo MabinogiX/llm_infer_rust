@@ -46,7 +46,7 @@ VENV_DIR=/path/to/cuda-venv ./scripts/run-server.sh \
   --max-running-req 4 --max-seq-len 40960
 ```
 
-这里调用 FlashInfer 官方的 `DecodePlan` 与分页 decode dispatch；每轮 decode 构造一次分页元数据，规划结果和工作区供所有模型层复用。FlashInfer 的规划器会按请求长度和 GPU 并行度决定是否拆分 KV。若构建环境缺少 FlashInfer 头文件，服务会在模型初始化时报错，不会静默回退到原先的 SDPA decode。
+这里调用 FlashInfer 官方的 `DecodePlan` 与分页 decode dispatch；每轮 decode 更新分页元数据和规划，供所有模型层复用。工作区由 attention backend 持有，跨 decode step 复用，仅在容量不足时扩容、backend 销毁时释放；前一批仍持有规划时不允许覆盖。FlashInfer 的规划器会按请求长度和 GPU 并行度决定是否拆分 KV。若构建环境缺少 FlashInfer 头文件，服务会在模型初始化时报错，不会静默回退到原先的 SDPA decode。
 
 如果服务器使用 CUDA 兼容驱动，启动前先设置 `export LD_LIBRARY_PATH="/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"`，再运行上述脚本。
 
@@ -165,6 +165,8 @@ engine.load_model_weights()?;
 ```
 
 当前 dense Qwen3 支持 eager prefill、带缓存前缀的 prefill 和 paged-KV decode；模型接入 `Engine` 时会自动绑定 `KVCachePool` 的逐层 K/V 切片。Qwen3-MoE 与张量并行尚未迁移，调用时会返回明确错误。
+
+Decode 的 KV 映射按请求 ID、已有长度和页号快照增量更新；稳定请求只上传新增 token 的映射，换行、页号变化或序列回退时更新相应区间。CUDA BF16/FP16 的 Qwen3 decoder 通过独立 residual 流使用原位 fused add-RMSNorm，保留残差和先舍入到激活类型、再执行 FP32 归一化的计算顺序。
 
 Attention 通过 `ServerArgs::attention_backend` 选择后端，默认 `"fa"` 使用 LibTorch 的 scaled dot product attention。Prefill 会把不同长度的请求填充成一个 batch，每层调用一次 SDPA，再还原输出顺序；无缓存前缀时使用 causal mask，让符合条件的 CUDA BF16/FP16 输入可由 LibTorch 选择 fused FlashAttention kernel。带缓存前缀时使用显式掩码，LibTorch 可能选择其他 SDPA kernel。`"pt"` 保留原有 eager 实现。`--dtype auto` 读取模型 `config.json` 中的 `torch_dtype`（或 `dtype`），CPU 推理回退到 float32。
 

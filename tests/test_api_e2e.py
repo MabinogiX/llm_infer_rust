@@ -7,6 +7,7 @@ Start the server first, then run:
 import json
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from openai import BadRequestError, OpenAI
@@ -134,6 +135,33 @@ class ApiE2ETest(unittest.TestCase):
             "".join(chunk.choices[0].text for chunk in chunks),
             full.choices[0].text,
         )
+
+    def test_concurrent_chat_limits_and_usage(self):
+        # Run with max-running-req >= 2 to exercise packed QKV decode and
+        # row compaction; a single-request server also validates queue reuse.
+        def generate(item):
+            index, limit = item
+            result = self.client.chat.completions.create(
+                model=MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": f"Explain topic {index}: "
+                    + "the blue sky and atmosphere " * (1 + index * 12),
+                }],
+                temperature=0,
+                max_completion_tokens=limit,
+                extra_body={"ignore_eos": True},
+            )
+            return limit, result
+
+        limits = [1, 3, 16, 48, 32, 8, 64, 17, 2, 24, 4, 80]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for limit, result in pool.map(generate, enumerate(limits)):
+                self.assertEqual(result.choices[0].finish_reason, "length")
+                self.assertEqual(result.usage.completion_tokens, limit)
+                self.assertEqual(
+                    result.usage.total_tokens, result.usage.prompt_tokens + limit
+                )
 
     def test_chat_matches_hugging_face_golden_prompts(self):
         cases = json.loads(FIXTURE.read_text(encoding="utf-8"))

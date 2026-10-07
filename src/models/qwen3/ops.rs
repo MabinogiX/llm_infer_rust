@@ -15,6 +15,22 @@ pub(super) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
     (x_float * (variance + eps).rsqrt() * weight.to_kind(Kind::Float)).to_kind(x.kind())
 }
 
+/// Consumes layer-owned activations; CUDA updates both buffers in place.
+/// The residual sum is rounded to the activation dtype before normalization.
+pub(super) fn add_rms_norm(
+    x: Tensor,
+    residual: Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> (Tensor, Tensor) {
+    #[cfg(has_qwen3_cuda)]
+    if supports_cuda(&x) {
+        return cuda::add_rms_norm(x, residual, weight, eps);
+    }
+    let residual = x + residual;
+    (rms_norm(&residual, weight, eps), residual)
+}
+
 pub(super) fn qk_norm(
     q: &Tensor,
     k: &Tensor,
@@ -110,6 +126,12 @@ mod cuda {
 
     unsafe extern "C" {
         fn sglang_qwen3_rms_norm(x: *const c_void, weight: *const c_void, eps: f64) -> *mut c_void;
+        fn sglang_qwen3_add_rms_norm_inplace(
+            x: *const c_void,
+            residual: *const c_void,
+            weight: *const c_void,
+            eps: f64,
+        ) -> bool;
         fn sglang_qwen3_qk_norm_inplace(
             q: *const c_void,
             k: *const c_void,
@@ -145,6 +167,23 @@ mod cuda {
 
     pub(super) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
         check(unsafe { sglang_qwen3_rms_norm(x.as_ptr().cast(), weight.as_ptr().cast(), eps) })
+    }
+
+    pub(super) fn add_rms_norm(
+        x: Tensor,
+        residual: Tensor,
+        weight: &Tensor,
+        eps: f64,
+    ) -> (Tensor, Tensor) {
+        check_inplace(unsafe {
+            sglang_qwen3_add_rms_norm_inplace(
+                x.as_ptr().cast(),
+                residual.as_ptr().cast(),
+                weight.as_ptr().cast(),
+                eps,
+            )
+        });
+        (x, residual)
     }
 
     pub(super) fn qk_norm(
@@ -265,5 +304,31 @@ mod tests {
         let unaligned = Tensor::randn([3, 26], (Kind::BFloat16, device));
         let expected_unaligned = unaligned.narrow(1, 0, 13).silu() * unaligned.narrow(1, 13, 13);
         assert!(max_error(&silu_and_mul(&unaligned), &expected_unaligned) <= 0.03125);
+    }
+
+    #[test]
+    fn fused_add_norm_matches_rounded_residual_for_both_cuda_dtypes() {
+        if !Cuda::is_available() {
+            return;
+        }
+        tch::manual_seed(19);
+        for kind in [Kind::BFloat16, Kind::Half] {
+            for tokens in [1, 3, 65] {
+                for width in [13, 1024] {
+                    let x = Tensor::randn([tokens, width], (kind, Device::Cuda(0)));
+                    let residual = Tensor::randn_like(&x);
+                    let weight = Tensor::randn([width], (kind, Device::Cuda(0)));
+                    let expected_residual = &x + &residual;
+                    let expected = rms_norm(&expected_residual, &weight, 1e-6);
+                    let x_ptr = x.data_ptr();
+                    let residual_ptr = residual.data_ptr();
+                    let (actual, summed) = add_rms_norm(x, residual, &weight, 1e-6);
+                    assert_eq!(actual.data_ptr(), x_ptr);
+                    assert_eq!(summed.data_ptr(), residual_ptr);
+                    assert_eq!(max_error(&summed, &expected_residual), 0.0);
+                    assert_eq!(max_error(&actual, &expected), 0.0);
+                }
+            }
+        }
     }
 }
