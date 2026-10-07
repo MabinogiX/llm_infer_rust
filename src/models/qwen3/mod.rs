@@ -1,5 +1,6 @@
 mod components;
 mod model;
+mod ops;
 mod output;
 mod template;
 

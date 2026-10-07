@@ -7,6 +7,7 @@ use std::{cell::RefCell, collections::HashMap};
 
 use tch::{Device, Kind, Tensor};
 
+use super::ops::{RopeCache, qk_norm, rms_norm, silu_and_mul};
 use crate::engine::{
     AttentionMetadata, BatchPhase, ModelArgs, ModelExecutor, ModelFactory, ModelRunnerError,
     ModelWeights,
@@ -258,15 +259,12 @@ impl ModelExecutor for Qwen3ForCausalLM {
 struct DecoderLayer {
     base_attention: RefCell<BaseAttention>,
     input_layernorm: Tensor,
-    q_proj: Tensor,
-    k_proj: Tensor,
-    v_proj: Tensor,
+    qkv_proj: Tensor,
     o_proj: Tensor,
     q_norm: Tensor,
     k_norm: Tensor,
     post_attention_layernorm: Tensor,
-    gate_proj: Tensor,
-    up_proj: Tensor,
+    gate_up_proj: Tensor,
     down_proj: Tensor,
     num_heads: i64,
     num_kv_heads: i64,
@@ -286,15 +284,16 @@ impl DecoderLayer {
         Self {
             base_attention: RefCell::new(BaseAttention::default()),
             input_layernorm: parameter([hidden], kind, device),
-            q_proj: parameter([num_heads * head_dim, hidden], kind, device),
-            k_proj: parameter([num_kv_heads * head_dim, hidden], kind, device),
-            v_proj: parameter([num_kv_heads * head_dim, hidden], kind, device),
+            qkv_proj: parameter(
+                [(num_heads + 2 * num_kv_heads) * head_dim, hidden],
+                kind,
+                device,
+            ),
             o_proj: parameter([hidden, num_heads * head_dim], kind, device),
             q_norm: parameter([head_dim], kind, device),
             k_norm: parameter([head_dim], kind, device),
             post_attention_layernorm: parameter([hidden], kind, device),
-            gate_proj: parameter([intermediate, hidden], kind, device),
-            up_proj: parameter([intermediate, hidden], kind, device),
+            gate_up_proj: parameter([2 * intermediate, hidden], kind, device),
             down_proj: parameter([hidden, intermediate], kind, device),
             num_heads,
             num_kv_heads,
@@ -331,7 +330,8 @@ impl DecoderLayer {
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::Mlp);
-        let mlp = linear(&normalized, &self.gate_proj).silu() * linear(&normalized, &self.up_proj);
+        let gate_up = linear(&normalized, &self.gate_up_proj);
+        let mlp = silu_and_mul(&gate_up);
         let output = linear(&mlp, &self.down_proj) + residual;
         profiler.finish(timer);
         Ok(output)
@@ -349,14 +349,18 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let timer = profiler.start(ModelStage::QkvLinear);
         let total_tokens = hidden_states.size()[0];
-        let q =
-            linear(hidden_states, &self.q_proj).view([total_tokens, self.num_heads, self.head_dim]);
-        let k = linear(hidden_states, &self.k_proj).view([
+        let qkv = linear(hidden_states, &self.qkv_proj);
+        let q_width = self.num_heads * self.head_dim;
+        let kv_width = self.num_kv_heads * self.head_dim;
+        let q = qkv
+            .narrow(-1, 0, q_width)
+            .view([total_tokens, self.num_heads, self.head_dim]);
+        let k = qkv.narrow(-1, q_width, kv_width).view([
             total_tokens,
             self.num_kv_heads,
             self.head_dim,
         ]);
-        let v = linear(hidden_states, &self.v_proj).view([
+        let v = qkv.narrow(-1, q_width + kv_width, kv_width).view([
             total_tokens,
             self.num_kv_heads,
             self.head_dim,
@@ -364,8 +368,7 @@ impl DecoderLayer {
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::QkNorm);
-        let q = rms_norm(&q, &self.q_norm, eps);
-        let k = rms_norm(&k, &self.k_norm, eps);
+        let (q, k) = qk_norm(&q, &k, &self.q_norm, &self.k_norm, eps);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::Rope);
@@ -403,9 +406,6 @@ impl DecoderLayer {
         let prefix = format!("model.layers.{index}");
         for (parameter, suffix) in [
             (&mut self.input_layernorm, "input_layernorm.weight"),
-            (&mut self.q_proj, "self_attn.q_proj.weight"),
-            (&mut self.k_proj, "self_attn.k_proj.weight"),
-            (&mut self.v_proj, "self_attn.v_proj.weight"),
             (&mut self.o_proj, "self_attn.o_proj.weight"),
             (&mut self.q_norm, "self_attn.q_norm.weight"),
             (&mut self.k_norm, "self_attn.k_norm.weight"),
@@ -413,8 +413,6 @@ impl DecoderLayer {
                 &mut self.post_attention_layernorm,
                 "post_attention_layernorm.weight",
             ),
-            (&mut self.gate_proj, "mlp.gate_proj.weight"),
-            (&mut self.up_proj, "mlp.up_proj.weight"),
             (&mut self.down_proj, "mlp.down_proj.weight"),
         ] {
             load_parameter(
@@ -425,6 +423,33 @@ impl DecoderLayer {
                 device,
             )?;
         }
+        load_packed_parameter(
+            &mut self.qkv_proj,
+            &prefix,
+            &[
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+            ],
+            &[
+                self.num_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+            ],
+            weights,
+            kind,
+            device,
+        )?;
+        let intermediate = self.gate_up_proj.size()[0] / 2;
+        load_packed_parameter(
+            &mut self.gate_up_proj,
+            &prefix,
+            &["mlp.gate_proj.weight", "mlp.up_proj.weight"],
+            &[intermediate, intermediate],
+            weights,
+            kind,
+            device,
+        )?;
         Ok(11)
     }
 }
@@ -459,56 +484,6 @@ fn validate_config(config: ModelArgs) -> Result<()> {
     Ok(())
 }
 
-fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
-    let x_float = x.to_kind(Kind::Float);
-    let variance = x_float
-        .pow_tensor_scalar(2)
-        .mean_dim(&[-1i64][..], true, Kind::Float);
-    (x_float * (variance + eps).rsqrt() * weight.to_kind(Kind::Float)).to_kind(x.kind())
-}
-
-/// Shared by every decoder layer; values depend only on position and model config.
-struct RopeCache {
-    cos: Tensor,
-    sin: Tensor,
-    half_dim: i64,
-}
-
-impl RopeCache {
-    fn new(max_positions: i64, head_dim: i64, rope_theta: f64, kind: Kind, device: Device) -> Self {
-        let inv_freq = (Tensor::arange_start_step(0, head_dim, 2, (Kind::Float, device))
-            * (-(rope_theta.ln() / head_dim as f64)))
-            .exp();
-        let positions = Tensor::arange(max_positions, (Kind::Float, device));
-        let frequencies = positions.unsqueeze(-1) * inv_freq.unsqueeze(0);
-        let cos = frequencies.cos().to_kind(kind);
-        let sin = frequencies.sin().to_kind(kind);
-        Self {
-            cos,
-            sin,
-            half_dim: head_dim / 2,
-        }
-    }
-
-    fn apply(&self, q: &Tensor, k: &Tensor, positions: &Tensor) -> (Tensor, Tensor) {
-        let cos = self.cos.index_select(0, positions).unsqueeze(1);
-        let sin = self.sin.index_select(0, positions).unsqueeze(1);
-        (
-            rotate_half(q, &cos, &sin, self.half_dim),
-            rotate_half(k, &cos, &sin, self.half_dim),
-        )
-    }
-}
-
-fn rotate_half(x: &Tensor, cos: &Tensor, sin: &Tensor, half_dim: i64) -> Tensor {
-    let first = x.narrow(-1, 0, half_dim);
-    let second = x.narrow(-1, half_dim, half_dim);
-    Tensor::cat(
-        &[&first * cos - &second * sin, &second * cos + &first * sin],
-        -1,
-    )
-}
-
 fn linear(x: &Tensor, weight: &Tensor) -> Tensor {
     x.matmul(&weight.transpose(0, 1))
 }
@@ -538,6 +513,34 @@ fn load_parameter(
     Ok(())
 }
 
+fn load_packed_parameter(
+    target: &mut Tensor,
+    prefix: &str,
+    suffixes: &[&str],
+    rows: &[i64],
+    weights: &mut HashMap<String, Tensor>,
+    kind: Kind,
+    device: Device,
+) -> Result<()> {
+    let mut parts = Vec::with_capacity(suffixes.len());
+    for (&suffix, &row_count) in suffixes.iter().zip(rows) {
+        let name = format!("{prefix}.{suffix}");
+        let weight = weights
+            .remove(&name)
+            .ok_or_else(|| model_error(&format!("checkpoint is missing {name}")))?;
+        let expected = vec![row_count, target.size()[1]];
+        if weight.size() != expected {
+            return Err(model_error(&format!(
+                "checkpoint tensor {name} has shape {:?}, expected {expected:?}",
+                weight.size()
+            )));
+        }
+        parts.push(weight.to_device(device).to_kind(kind));
+    }
+    *target = Tensor::cat(&parts, 0);
+    Ok(())
+}
+
 fn as_i64(value: usize, field: &str) -> Result<i64> {
     i64::try_from(value).map_err(|_| model_error(&format!("{field} exceeds i64")))
 }
@@ -554,6 +557,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use super::super::ops::rotate_half;
     use super::*;
     use crate::engine::load_hf_safetensors;
 
@@ -819,5 +823,32 @@ mod tests {
             14
         );
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn packed_projections_match_separate_projections() {
+        let x = Tensor::arange(12, (Kind::Float, Device::Cpu)).view([3, 4]) / 10.0;
+        let q = Tensor::arange(16, (Kind::Float, Device::Cpu)).view([4, 4]);
+        let k = &q + 100.0;
+        let v = &q + 200.0;
+        let packed = Tensor::cat(&[&q, &k, &v], 0);
+        let output = linear(&x, &packed);
+        for (offset, weight) in [(0, &q), (4, &k), (8, &v)] {
+            let difference = (output.narrow(1, offset, 4) - linear(&x, weight))
+                .abs()
+                .max()
+                .double_value(&[]);
+            assert!(difference < 1e-4);
+        }
+
+        let gate = &q / 10.0;
+        let up = &k / 10.0;
+        let gate_up = linear(&x, &Tensor::cat(&[&gate, &up], 0));
+        let expected = linear(&x, &gate).silu() * linear(&x, &up);
+        let difference = (silu_and_mul(&gate_up) - expected)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(difference < 1e-4);
     }
 }

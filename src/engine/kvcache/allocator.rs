@@ -135,7 +135,7 @@ fn cuda_cache_budget(free: usize, total: usize, memory_ratio: f64) -> usize {
 }
 
 fn cuda_memory_info(index: usize) -> Result<(usize, usize)> {
-    // run-debug.sh puts the same PyTorch environment used by libtorch on PATH.
+    // run-server.sh puts the same PyTorch environment used by libtorch on PATH.
     // Querying through torch preserves CUDA_VISIBLE_DEVICES index remapping.
     let output = Command::new("python")
         .args([
@@ -146,7 +146,7 @@ fn cuda_memory_info(index: usize) -> Result<(usize, usize)> {
         .output()
         .map_err(|error| {
             KVCacheError::MemoryQuery(format!(
-                "无法运行 python/PyTorch：{error}；请使用 scripts/run-debug.sh 启动"
+                "无法运行 python/PyTorch：{error}；请使用 scripts/run-server.sh 启动"
             ))
         })?;
     if !output.status.success() {
