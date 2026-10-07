@@ -3,9 +3,12 @@ use std::{env, fs, path::Path, process::Command};
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_cuda_graph)");
     println!("cargo:rustc-check-cfg=cfg(has_flashinfer)");
+    println!("cargo:rustc-check-cfg=cfg(has_qwen3_cuda)");
     println!("cargo:rerun-if-changed=src/engine/cuda_graph_bridge.cpp");
     println!("cargo:rerun-if-changed=src/models/attention/flashinfer_bridge.cpp");
     println!("cargo:rerun-if-changed=src/models/attention/flashinfer_plan_run.cu");
+    println!("cargo:rerun-if-changed=src/models/qwen3/fused_ops_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/models/qwen3/fused_ops.cu");
     println!("cargo:rerun-if-env-changed=VIRTUAL_ENV");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=FLASHINFER_CUDA_ARCH");
@@ -46,6 +49,30 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=c10_cuda");
     println!("cargo:rustc-cfg=has_cuda_graph");
 
+    let arch = env::var("FLASHINFER_CUDA_ARCH").unwrap_or_else(|_| "80".to_owned());
+    let mut fused_bridge = cc::Build::new();
+    fused_bridge
+        .cpp(true)
+        .file("src/models/qwen3/fused_ops_bridge.cpp")
+        .flag_if_supported("-std=c++20")
+        .warnings(false)
+        .define("_GLIBCXX_USE_CXX11_ABI", abi);
+    for include in &torch_includes {
+        fused_bridge.include(include);
+    }
+    fused_bridge.compile("sglang_qwen3_fused_bridge");
+    let mut fused_kernels = cc::Build::new();
+    fused_kernels
+        .cuda(true)
+        .debug(false)
+        .opt_level(3)
+        .file("src/models/qwen3/fused_ops.cu")
+        .flag("-std=c++17")
+        .flag(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+        .warnings(false);
+    fused_kernels.compile("sglang_qwen3_fused_kernels");
+    println!("cargo:rustc-cfg=has_qwen3_cuda");
+
     // Compile the thin native adapter against the wheel's official CUDA headers.
     let Ok(venv) = env::var("VIRTUAL_ENV") else {
         return;
@@ -73,7 +100,6 @@ fn main() {
     }
     flashinfer_build.compile("sglang_flashinfer_bridge");
 
-    let arch = env::var("FLASHINFER_CUDA_ARCH").unwrap_or_else(|_| "80".to_owned());
     let mut kernel = cc::Build::new();
     kernel
         .cuda(true)

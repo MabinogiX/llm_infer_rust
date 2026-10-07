@@ -3,6 +3,15 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 venv_dir="${VENV_DIR:-${repo_dir}/.venv}"
+build_profile="${SGLANG_BUILD_PROFILE:-debug}"
+case "${build_profile}" in
+    debug) cargo_profile_args=() ;;
+    release) cargo_profile_args=(--release) ;;
+    *)
+        echo "SGLANG_BUILD_PROFILE 必须是 debug 或 release，当前为：${build_profile}" >&2
+        exit 2
+        ;;
+esac
 
 if [[ ! -x "${venv_dir}/bin/python" ]]; then
     echo "找不到 Python 虚拟环境：${venv_dir}（可通过 VENV_DIR 指定）" >&2
@@ -91,16 +100,16 @@ if [[ "${attention_backend,,}" == "flashinfer" ]]; then
 fi
 
 cd "${repo_dir}"
-echo "正在编译 debug 版本..."
-cargo build --bin sglang-rust
+echo "正在编译 ${build_profile} 版本..."
+cargo build "${cargo_profile_args[@]}" --bin sglang-rust
 
 target_dir="${CARGO_TARGET_DIR:-${repo_dir}/target}"
 if [[ "${target_dir}" != /* ]]; then
     target_dir="${repo_dir}/${target_dir}"
 fi
 
-echo "正在启动服务（默认 max-running-req=4、max-seq-len=512；可用命令行参数覆盖）..."
-set -- "${target_dir}/debug/sglang-rust" --max-running-req 4 --max-seq-len 512 "${server_args[@]}"
+echo "正在启动 ${build_profile} 服务（默认 max-running-req=4、max-seq-len=512；可用命令行参数覆盖）..."
+set -- "${target_dir}/${build_profile}/sglang-rust" --max-running-req 4 --max-seq-len 512 "${server_args[@]}"
 if [[ -n "${runtime_env[0]-}" ]]; then
     exec env "${runtime_env[@]}" "$@"
 fi

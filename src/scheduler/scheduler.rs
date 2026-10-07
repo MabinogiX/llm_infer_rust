@@ -11,6 +11,7 @@ use crate::engine::kvcache::{CacheManager, NaiveCacheManager, RadixCacheManager}
 use crate::engine::{
     Batch, BatchContext, BatchPhase, Engine, EngineError, SamplingParams, ServerArgs,
 };
+use crate::profiling::{StepProfiler, StepStage, time_schedule};
 
 use super::{
     DecodeManager, FinishReason, OutputToken, PrefillManager, Request, RequestId, Result,
@@ -140,13 +141,16 @@ impl Scheduler {
     /// Runs prefill followed by decode for every request still running.
     pub fn step(&mut self) -> Result<Vec<OutputToken>> {
         self.last_step_error = None;
-        let batch = self.prefill.schedule_prefill()?;
+        let (batch, schedule_us) =
+            time_schedule(self.engine.device(), || self.prefill.schedule_prefill());
+        let batch = batch?;
         let mut results: Vec<_> = self.aborted.drain(..).collect();
         if let Some(batch) = batch {
             self.run_phase(
                 batch.request_ids,
                 batch.model_batch,
                 BatchPhase::Prefill,
+                schedule_us,
                 &mut results,
             )?;
         }
@@ -156,14 +160,16 @@ impl Scheduler {
                 .into_iter()
                 .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
         );
-        if let Some(batch) = self
-            .decode
-            .schedule_decode(self.prefill.running_requests())?
-        {
+        let (decode_batch, schedule_us) = time_schedule(self.engine.device(), || {
+            self.decode.schedule_decode(self.prefill.running_requests())
+        });
+        let decode_batch = decode_batch?;
+        if let Some(batch) = decode_batch {
             self.run_phase(
                 batch.request_ids,
                 batch.model_batch,
                 BatchPhase::Decode,
+                schedule_us,
                 &mut results,
             )?;
         }
@@ -175,31 +181,52 @@ impl Scheduler {
         request_ids: Vec<RequestId>,
         model_batch: Batch,
         phase: BatchPhase,
+        schedule_us: u128,
         results: &mut Vec<OutputToken>,
     ) -> Result<()> {
-        let params = request_ids
-            .iter()
-            .map(|uid| {
-                self.prefill
-                    .running_request(*uid)
-                    .expect("scheduled request is running")
-                    .sampling_params
-            })
-            .collect::<Vec<_>>();
-        let sampled = self
-            .engine
-            .forward(&model_batch)
-            .and_then(|logits| self.engine.sample(&logits, &params))
-            .and_then(|tokens| {
-                if tokens.len() == request_ids.len() {
-                    Ok(tokens)
-                } else {
-                    Err(EngineError::InvalidArgument(
-                        "sampled token count differs from batch size".to_owned(),
-                    ))
-                }
-            });
-        match sampled {
+        let mut profiler = StepProfiler::new(self.engine.device(), schedule_us);
+        let profile_requests = profiler.enabled().then(|| {
+            request_ids
+                .iter()
+                .map(|uid| {
+                    (
+                        *uid,
+                        self.prefill
+                            .running_request(*uid)
+                            .expect("scheduled request is running")
+                            .output_len
+                            + 1,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let params = profiler.measure(StepStage::Params, || {
+            request_ids
+                .iter()
+                .map(|uid| {
+                    self.prefill
+                        .running_request(*uid)
+                        .expect("scheduled request is running")
+                        .sampling_params
+                })
+                .collect::<Vec<_>>()
+        });
+        let logits = profiler.measure(StepStage::Forward, || self.engine.forward(&model_batch));
+        let sampled = profiler.measure(StepStage::Sample, || {
+            logits
+                .and_then(|logits| self.engine.sample(&logits, &params))
+                .and_then(|tokens| {
+                    if tokens.len() == request_ids.len() {
+                        Ok(tokens)
+                    } else {
+                        Err(EngineError::InvalidArgument(
+                            "sampled token count differs from batch size".to_owned(),
+                        ))
+                    }
+                })
+        });
+        let success = sampled.is_ok();
+        profiler.measure(StepStage::Publish, || match sampled {
             Ok(tokens) => {
                 let mut finished = Vec::new();
                 for (uid, token_id) in request_ids.into_iter().zip(tokens) {
@@ -260,7 +287,8 @@ impl Scheduler {
                         .map(|uid| self.terminal_result(uid, FinishReason::Error)),
                 );
             }
-        }
+        });
+        profiler.log(phase, profile_requests.as_deref().unwrap_or(&[]), success);
         Ok(())
     }
 

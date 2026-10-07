@@ -26,7 +26,22 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    tracing::info!(model_path = %args.engine.model_path.display(), log_dir = %args.logging.directory.display(), "starting model server");
+    let engine = &args.engine;
+    tracing::info!(
+        model_path = %engine.model_path.display(),
+        bind = %args.bind,
+        tp_size = engine.tp_size,
+        attention_backend = %engine.attention_backend,
+        max_seq_len = engine.max_seq_len,
+        max_running_req = engine.max_running_req,
+        page_size = engine.page_size,
+        memory_ratio = engine.memory_ratio,
+        cuda_graph_bs_limit = engine.cuda_graph_bs.unwrap_or(engine.max_running_req),
+        requested_dtype = %engine.dtype,
+        requested_device = %engine.device,
+        log_dir = %args.logging.directory.display(),
+        "starting model server"
+    );
     match serve(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

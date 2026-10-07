@@ -4,16 +4,25 @@ Rust 版本的 mini-sglang 推理服务。目前支持本地 dense Qwen3 模型�
 
 ## 运行
 
-本机可以用脚本编译 debug 版本并启动服务，默认读取相邻 `mini-sglang/Qwen/Qwen3-0.6B` 模型：
+本机可以用脚本编译并启动服务，默认构建 debug 版本、读取相邻 `mini-sglang/Qwen/Qwen3-0.6B` 模型：
 
 ```bash
-./scripts/run-debug.sh
+./scripts/run-server.sh
 ```
+
+设置 `SGLANG_BUILD_PROFILE=release` 可构建并运行 `target/release/sglang-rust`；`debug` 对应 `target/debug/sglang-rust`。例如在自己的 `tmp.sh` 中先导出环境变量，再调用同一个脚本：
+
+```bash
+export SGLANG_BUILD_PROFILE=release
+./scripts/run-server.sh --model-path /path/to/Qwen3-0.6B
+```
+
+性能测试时不要设置 `SGLANG_PROFILE_STEPS=1`，它会在阶段边界同步 CUDA。
 
 指定其他模型或端口时，直接传入服务参数；脚本默认设置 `max-running-req=4` 和 `max-seq-len=512`，也可在命令行覆盖：
 
 ```bash
-./scripts/run-debug.sh --model-path /path/to/Qwen3-0.6B --port 8001 --max-seq-len 1024
+./scripts/run-server.sh --model-path /path/to/Qwen3-0.6B --port 8001 --max-seq-len 1024
 ```
 
 脚本使用项目的 `.venv` 查找 PyTorch/libtorch；需要使用其他虚拟环境时设置 `VENV_DIR`。也可以手动配置下文的 libtorch 环境后运行：
@@ -31,7 +40,7 @@ Linux CUDA 环境中，模型权重和 KV cache 绑定后会捕获 decode CUDA G
 在 Linux CUDA 环境中，可以将 `--attention-backend flashinfer` 用于 BF16/FP16、head_dim=128 的模型。构建时需要在 `VENV_DIR` 指向的环境中安装带 CUDA 头文件的 `flashinfer-python` 和与 `tch` 一致的 PyTorch/libtorch。构建脚本从 FlashInfer 包中编译 CUDA 内核；服务运行时不加载 Python。默认编译目标为 A100（sm_80），其他架构可设置 `FLASHINFER_CUDA_ARCH`。FlashInfer 后端的 decode 直接使用现有 KV cache 的分页视图、页表和请求实际长度，prefill 仍使用 libtorch SDPA。当前原生桥接仅支持 eager decode，因此选择它时会跳过 CUDA Graph 捕获。
 
 ```bash
-VENV_DIR=/path/to/cuda-venv ./scripts/run-debug.sh \
+VENV_DIR=/path/to/cuda-venv ./scripts/run-server.sh \
   --model-path /path/to/Qwen3-0.6B \
   --attention-backend flashinfer \
   --max-running-req 4 --max-seq-len 40960
@@ -41,7 +50,9 @@ VENV_DIR=/path/to/cuda-venv ./scripts/run-debug.sh \
 
 如果服务器使用 CUDA 兼容驱动，启动前先设置 `export LD_LIBRARY_PATH="/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"`，再运行上述脚本。
 
-Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-debug.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
+诊断请求延迟时，在启动命令前设置 `SGLANG_PROFILE_STEPS=1`。日志会按请求 UID 和输出 token 序号打印 `request step timing`，包含批次准备、模型前向、采样和 KV 状态更新的微秒耗时；`model forward timing` 汇总规划、各 decoder 层、RoPE、归一化、MLP 和 attention backend 等耗时。非流式请求还会打印入口及输出处理耗时。诊断模式会在阶段边界同步 CUDA，可能降低吞吐；正常运行时不设置该变量。
+
+Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-server.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
 
 模型专有代码集中在 `src/models/<模型名>/`：`model.rs` 实现模型结构，`template.rs` 处理输入模板，`output.rs` 解析输出，`components.rs` 组装 tokenizer、engine、scheduler 和输出解析器。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择一次模型；不支持的模型会在加载权重前报错。新增模型时只需在 `src/models/` 下增加目录并登记，无须修改服务端和 tokenizer 的模型分支；请求处理过程不切换模型。
 
@@ -68,7 +79,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 先启动默认 Qwen3 模型服务，再在另一个终端安装测试依赖并运行：
 
 ```bash
-./scripts/run-debug.sh --port 8000
+./scripts/run-server.sh --port 8000
 ```
 
 ```bash
@@ -90,10 +101,10 @@ SGLANG_E2E_BASE_URL=http://127.0.0.1:8000/v1 \
 可通过启动参数设置目录和等级：
 
 ```bash
-./scripts/run-debug.sh --log-dir ./logs --log-level debug
+./scripts/run-server.sh --log-dir ./logs --log-level debug
 ```
 
-日志等级优先级为 `--log-level`、`RUST_LOG`、默认 `info`。例如 `RUST_LOG=sglang_rust=debug,info ./scripts/run-debug.sh` 可按模块过滤。文件由后台线程写入；队列满时对产生日志的线程施加反压，而非丢弃日志。正常退出时会刷新缓冲；旧日期文件不会自动删除。
+日志等级优先级为 `--log-level`、`RUST_LOG`、默认 `info`。例如 `RUST_LOG=sglang_rust=debug,info ./scripts/run-server.sh` 可按模块过滤。文件由后台线程写入；队列满时对产生日志的线程施加反压，而非丢弃日志。正常退出时会刷新缓冲；旧日期文件不会自动删除。
 
 ## 已迁移的 KV Cache 基础模块
 
