@@ -48,6 +48,24 @@ class ApiE2ETest(unittest.TestCase):
             extra_body={"ignore_eos": True},
         )
 
+    def test_non_greedy_mixed_batch(self):
+        settings = [(0.8, -1, 1.0), (0.8, 50, 0.9), (0.8, -1, 0.9),
+                    (0.0, -1, 1.0), (1.0, 1, 1.0), (0.8, 50, 0.0)]
+
+        def generate(item):
+            index, (temperature, top_k, top_p) = item
+            response = self.client.completions.create(
+                model=MODEL, prompt=f"Task {index}: Explain why the sky is blue.",
+                temperature=temperature, top_p=top_p, max_tokens=17,
+                extra_body={"top_k": top_k, "ignore_eos": True},
+            )
+            self.assertEqual(response.usage.completion_tokens, 17)
+            self.assertEqual(response.choices[0].finish_reason, "length")
+            self.assertTrue(response.choices[0].text)
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            list(executor.map(generate, enumerate(settings * 2)))
+
     def test_list_models(self):
         models = self.client.models.list()
         self.assertEqual(models.object, "list")

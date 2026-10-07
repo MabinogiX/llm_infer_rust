@@ -35,9 +35,9 @@ cargo run -- --model-path /path/to/Qwen3-0.6B --port 8000
 
 Linux CUDA 环境中，模型权重和 KV cache 绑定后会捕获 decode CUDA Graph；图捕获失败的批次回退到 eager。`--cuda-graph-bs N` 设置最大捕获批量（默认使用 `--max-running-req`），设为 `0` 可禁用。构建图桥接层需要与 PyTorch 对应的 CUDA Toolkit；缺少时服务仍使用 eager decode。CPU 不启用图捕获。
 
-### FlashInfer 分页 decode
+### FlashInfer 分页 decode 与 prefill
 
-在 Linux CUDA 环境中，可以将 `--attention-backend flashinfer` 用于 BF16/FP16、head_dim=128 的模型。构建时需要在 `VENV_DIR` 指向的环境中安装带 CUDA 头文件的 `flashinfer-python` 和与 `tch` 一致的 PyTorch/libtorch。构建脚本从 FlashInfer 包中编译 CUDA 内核；服务运行时不加载 Python。默认编译目标为 A100（sm_80），其他架构可设置 `FLASHINFER_CUDA_ARCH`。FlashInfer 后端的 decode 直接使用现有 KV cache 的分页视图、页表和请求实际长度，prefill 仍使用 libtorch SDPA。当前原生桥接仅支持 eager decode，因此选择它时会跳过 CUDA Graph 捕获。
+在 Linux CUDA 环境中，可以将 `--attention-backend flashinfer` 用于 BF16/FP16、head_dim=128 的模型。构建时需要在 `VENV_DIR` 指向的环境中安装带 CUDA 头文件的 `flashinfer-python` 和与 `tch` 一致的 PyTorch/libtorch。构建脚本从 FlashInfer 包中编译 CUDA 内核；服务运行时不加载 Python。默认编译目标为 A100（sm_80），其他架构可设置 `FLASHINFER_CUDA_ARCH`。FlashInfer 后端的 decode 直接使用现有 KV cache 的分页视图、页表和请求实际长度，prefill 无缓存前缀时使用 FlashInfer ragged KV，有前缀时使用 paged KV，避免 SDPA 的 padding、逐层缓存 gather 和显式注意力 mask。当前原生桥接使用 eager 执行，因此选择它时会跳过 CUDA Graph 捕获。
 
 ```bash
 VENV_DIR=/path/to/cuda-venv ./scripts/run-server.sh \
@@ -47,6 +47,10 @@ VENV_DIR=/path/to/cuda-venv ./scripts/run-server.sh \
 ```
 
 这里调用 FlashInfer 官方的 `DecodePlan` 与分页 decode dispatch；每轮 decode 更新分页元数据和规划，供所有模型层复用。工作区由 attention backend 持有，跨 decode step 复用，仅在容量不足时扩容、backend 销毁时释放；前一批仍持有规划时不允许覆盖。FlashInfer 的规划器会按请求长度和 GPU 并行度决定是否拆分 KV。若构建环境缺少 FlashInfer 头文件，服务会在模型初始化时报错，不会静默回退到原先的 SDPA decode。
+
+prefill 调用官方 `PrefillPlan` 与 ragged/paged causal dispatch，规划和工作区同样由 backend 持有、各层共享，按实际调度需求扩容。Q/K/V 使用实际 stride，支持 packed QKV 的非连续视图。CPU、`pt` 和 `fa` 后端继续使用原有实现。
+
+CUDA 非贪心采样在构建包含 FlashInfer 时，使用与原版 SGLang 相同的 joint top-k/top-p：在 temperature 缩放后的完整 softmax 分布上同时确定 top-k 与 top-p 截断，再从交集采样，不在两种过滤之间重新归一化。直接调用 FlashInfer `TopKTopPSamplingFromProb`，省去 libtorch topk、阈值 mask、全词表排序、cumsum 和 multinomial；同参数批次直接采样，避免分组拷贝。不限制 top-k 时走 top-p 或普通概率采样内核。并列概率按 FlashInfer 阈值语义处理。随机数来自 libtorch CUDA generator，可用 `tch::Cuda::manual_seed` 复现新实现，但不会与旧采样算法逐 token 一致。CPU 和未编入 FlashInfer 的构建以 libtorch 实现相同 joint 过滤语义。
 
 如果服务器使用 CUDA 兼容驱动，启动前先设置 `export LD_LIBRARY_PATH="/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"`，再运行上述脚本。
 

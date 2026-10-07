@@ -5,6 +5,8 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_flashinfer)");
     println!("cargo:rustc-check-cfg=cfg(has_qwen3_cuda)");
     println!("cargo:rerun-if-changed=src/engine/cuda_graph_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/engine/sampling_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/engine/sampling_flashinfer.cu");
     println!("cargo:rerun-if-changed=src/models/attention/flashinfer_bridge.cpp");
     println!("cargo:rerun-if-changed=src/models/attention/flashinfer_plan_run.cu");
     println!("cargo:rerun-if-changed=src/models/qwen3/fused_ops_bridge.cpp");
@@ -92,6 +94,7 @@ fn main() {
     flashinfer_build
         .cpp(true)
         .file("src/models/attention/flashinfer_bridge.cpp")
+        .file("src/engine/sampling_bridge.cpp")
         .flag_if_supported("-std=c++20")
         .warnings(false)
         .define("_GLIBCXX_USE_CXX11_ABI", abi);
@@ -115,5 +118,22 @@ fn main() {
         .flag(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
         .warnings(false);
     kernel.compile("sglang_flashinfer_plan_run");
+    // FlashInfer sampling launches 1024 threads on Ampere. Bound registers
+    // per thread so vectorized large-vocabulary kernels fit the SM register file.
+    let mut sampling = cc::Build::new();
+    sampling
+        .cuda(true)
+        .debug(false)
+        .opt_level(3)
+        .file("src/engine/sampling_flashinfer.cu")
+        .include(&flashinfer_include)
+        .include(flashinfer_data.join("cccl/libcudacxx/include"))
+        .include(flashinfer_data.join("cccl/cub"))
+        .include(flashinfer_data.join("cccl/thrust"))
+        .flag("-std=c++17")
+        .flag("-maxrregcount=64")
+        .flag(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+        .warnings(false);
+    sampling.compile("sglang_flashinfer_sampling");
     println!("cargo:rustc-cfg=has_flashinfer");
 }
