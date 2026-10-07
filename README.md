@@ -88,7 +88,9 @@ SGLANG_E2E_BASE_URL=http://127.0.0.1:8000/v1 \
   uv run --locked python -m unittest discover -s tests -p test_api_e2e.py -v
 ```
 
-可通过 `SGLANG_E2E_MODEL` 指定请求中的模型名。测试需要 Qwen3 tokenizer；它覆盖 `max_tokens`、`stream`、用量统计、`enable_thinking`、错误请求、思考内容和工具调用，并复用 `tests/fixtures/qwen3_chat_golden.json` 对照聊天模板。
+聊天接口支持 `max_completion_tokens` 和 `max_tokens`；两者同时提供时优先使用非空的 `max_completion_tokens`。新字段缺省或为 `null` 时使用 `max_tokens`，两者均未指定时默认生成上限为 1024。输出长度包含思考内容对应的 tokens，流式与非流式请求使用相同上限。
+
+可通过 `SGLANG_E2E_MODEL` 指定请求中的模型名。测试需要 Qwen3 tokenizer；它覆盖 `max_tokens`、`max_completion_tokens` 的优先级、`stream`、用量统计、`enable_thinking`、错误请求、思考内容和工具调用，并复用 `tests/fixtures/qwen3_chat_golden.json` 对照聊天模板。
 
 ## 日志
 

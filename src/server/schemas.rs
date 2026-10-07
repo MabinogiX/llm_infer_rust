@@ -41,9 +41,24 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i64,
     #[serde(default)]
+    pub max_completion_tokens: Option<i64>,
+    #[serde(default)]
     pub stream: bool,
     #[serde(default)]
     pub ignore_eos: bool,
+}
+
+impl ChatCompletionRequest {
+    /// The newer chat API limit takes precedence over the legacy `max_tokens`.
+    pub fn sampling_params(&self) -> SamplingParams {
+        sampling_params(
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.max_completion_tokens.unwrap_or(self.max_tokens),
+            self.ignore_eos,
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +110,46 @@ mod tests {
         let params = sampling_params(0.0, 2.0, -1, -4, false);
         assert_eq!(params.max_tokens, 1);
         assert_eq!(params.top_p, 1.0);
+    }
+
+    #[test]
+    fn resolves_chat_token_limits_into_sampling_params() {
+        for (fields, expected) in [
+            (serde_json::json!({}), 1024),
+            (serde_json::json!({"max_tokens": 7}), 7),
+            (serde_json::json!({"max_completion_tokens": 32}), 32),
+            (
+                serde_json::json!({"max_tokens": 7, "max_completion_tokens": 32}),
+                32,
+            ),
+            (
+                serde_json::json!({"max_tokens": 7, "max_completion_tokens": null}),
+                7,
+            ),
+            (serde_json::json!({"max_completion_tokens": null}), 1024),
+            (
+                serde_json::json!({"max_tokens": 7, "max_completion_tokens": 0}),
+                1,
+            ),
+            (
+                serde_json::json!({"max_tokens": 7, "max_completion_tokens": -4}),
+                1,
+            ),
+        ] {
+            let mut payload = fields.clone();
+            payload["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
+            payload["temperature"] = serde_json::json!(0.5);
+            payload["top_p"] = serde_json::json!(0.9);
+            payload["top_k"] = serde_json::json!(10);
+            payload["ignore_eos"] = serde_json::json!(true);
+            let request: ChatCompletionRequest = serde_json::from_value(payload).unwrap();
+            let params = request.sampling_params();
+            assert_eq!(params.max_tokens, expected, "{fields}");
+            assert_eq!(params.temperature, 0.5);
+            assert_eq!(params.top_p, 0.9);
+            assert_eq!(params.top_k, 10);
+            assert!(params.ignore_eos);
+        }
     }
 
     #[test]

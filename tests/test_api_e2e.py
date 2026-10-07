@@ -98,6 +98,30 @@ class ApiE2ETest(unittest.TestCase):
             getattr(full.choices[0].message, "reasoning_content", None) or "",
         )
 
+    def test_chat_max_completion_tokens_and_precedence(self):
+        cases = (
+            {"max_completion_tokens": 3},
+            {"max_tokens": 1, "max_completion_tokens": 3},
+            {"max_tokens": 3, "max_completion_tokens": None},
+        )
+        for stream in (False, True):
+            for limits in cases:
+                with self.subTest(stream=stream, limits=limits):
+                    response = self.client.chat.completions.create(
+                        model=MODEL,
+                        messages=[{"role": "user", "content": "Say hi"}],
+                        temperature=0,
+                        stream=stream,
+                        extra_body={"ignore_eos": True},
+                        **limits,
+                    )
+                    result = list(response)[-1] if stream else response
+                    self.assertEqual(result.choices[0].finish_reason, "length")
+                    self.assertEqual(result.usage.completion_tokens, 3)
+                    self.assertEqual(
+                        result.usage.total_tokens, result.usage.prompt_tokens + 3
+                    )
+
     def test_completion_stream_matches_non_stream(self):
         full = self.completion("Say hi", max_tokens=3)
         chunks = list(self.completion("Say hi", max_tokens=3, stream=True))
