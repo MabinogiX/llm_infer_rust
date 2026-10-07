@@ -7,7 +7,7 @@ use std::{cell::RefCell, collections::HashMap};
 
 use tch::{Device, Kind, Tensor};
 
-use super::ops::{RopeCache, qk_norm, rms_norm, silu_and_mul};
+use super::ops::{RopeCache, add_rms_norm, qk_norm, rms_norm, silu_and_mul};
 use crate::engine::{
     AttentionMetadata, BatchPhase, ModelArgs, ModelExecutor, ModelFactory, ModelRunnerError,
     ModelWeights,
@@ -140,9 +140,11 @@ impl Qwen3ForCausalLM {
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::Layers);
+        let mut residual = None;
         for layer in &self.layers {
-            hidden_states = layer.forward(
+            let (output, next_residual) = layer.forward(
                 &hidden_states,
+                residual,
                 &positions,
                 &attention,
                 attention_metadata,
@@ -150,11 +152,23 @@ impl Qwen3ForCausalLM {
                 &self.rope,
                 &mut profiler,
             )?;
+            hidden_states = output;
+            residual = Some(next_residual);
         }
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::Head);
-        hidden_states = rms_norm(&hidden_states, &self.norm, self.config.rms_norm_eps);
+        hidden_states = if let Some(residual) = residual {
+            add_rms_norm(
+                hidden_states,
+                residual,
+                &self.norm,
+                self.config.rms_norm_eps,
+            )
+            .0
+        } else {
+            rms_norm(&hidden_states, &self.norm, self.config.rms_norm_eps)
+        };
         if let Some(indices) = logits_indices {
             hidden_states = hidden_states.index_select(0, indices);
         }
@@ -304,16 +318,28 @@ impl DecoderLayer {
     fn forward(
         &self,
         hidden_states: &Tensor,
+        residual: Option<Tensor>,
         positions: &Tensor,
         attention_batch: &AttentionBatch<'_>,
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
         rope: &RopeCache,
         profiler: &mut ModelProfiler,
-    ) -> Result<Tensor> {
-        let residual = hidden_states.shallow_clone();
+    ) -> Result<(Tensor, Tensor)> {
         let timer = profiler.start(ModelStage::Norm);
-        let normalized = rms_norm(hidden_states, &self.input_layernorm, eps);
+        let (normalized, residual) = if let Some(residual) = residual {
+            add_rms_norm(
+                hidden_states.shallow_clone(),
+                residual,
+                &self.input_layernorm,
+                eps,
+            )
+        } else {
+            (
+                rms_norm(hidden_states, &self.input_layernorm, eps),
+                hidden_states.shallow_clone(),
+            )
+        };
         profiler.finish(timer);
         let attention = self.attention(
             &normalized,
@@ -325,16 +351,16 @@ impl DecoderLayer {
             profiler,
         )?;
         let timer = profiler.start(ModelStage::Norm);
-        let residual = attention + residual;
-        let normalized = rms_norm(&residual, &self.post_attention_layernorm, eps);
+        let (normalized, residual) =
+            add_rms_norm(attention, residual, &self.post_attention_layernorm, eps);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::Mlp);
         let gate_up = linear(&normalized, &self.gate_up_proj);
         let mlp = silu_and_mul(&gate_up);
-        let output = linear(&mlp, &self.down_proj) + residual;
+        let output = linear(&mlp, &self.down_proj);
         profiler.finish(timer);
-        Ok(output)
+        Ok((output, residual))
     }
 
     fn attention(

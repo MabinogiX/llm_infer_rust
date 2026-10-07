@@ -1,5 +1,7 @@
 //! Attention backend dispatch matching mini-sglang's `pt` / `fa` seam.
 
+#[cfg(has_flashinfer)]
+use std::{cell::RefCell, rc::Rc};
 use tch::{Device, Kind, Tensor};
 
 use crate::engine::{AttentionMetadata, BatchPhase, ModelRunnerError};
@@ -15,7 +17,7 @@ enum AttentionBackendKind {
     Pt,
     /// LibTorch SDPA, which selects the fused FlashAttention kernel on supported CUDA inputs.
     FlashAttention,
-    /// FlashInfer's paged CUDA decode; prefill uses LibTorch SDPA.
+    /// FlashInfer paged decode and paged/ragged prefill.
     FlashInfer,
 }
 
@@ -138,7 +140,9 @@ impl AttentionBatch<'_> {
 enum BackendPlan {
     None,
     #[cfg(has_flashinfer)]
-    FlashInfer(FlashInferPlan),
+    FlashInfer(Rc<FlashInferPlan>),
+    #[cfg(has_flashinfer)]
+    FlashInferPrefill(Rc<FlashInferPlan>, bool),
 }
 
 /// Internal seam for the three existing attention implementations.
@@ -176,11 +180,17 @@ fn create_attention_backend(kind: AttentionBackendKind) -> Box<dyn AttentionBack
     match kind {
         AttentionBackendKind::Pt => Box::new(PyTorchAttentionBackend),
         AttentionBackendKind::FlashAttention => Box::new(FlashAttentionBackend),
-        AttentionBackendKind::FlashInfer => Box::new(FlashInferAttentionBackend),
+        AttentionBackendKind::FlashInfer => Box::new(FlashInferAttentionBackend::default()),
     }
 }
 
-struct FlashInferAttentionBackend;
+#[derive(Default)]
+struct FlashInferAttentionBackend {
+    #[cfg(has_flashinfer)]
+    plan: RefCell<Option<Rc<FlashInferPlan>>>,
+    #[cfg(has_flashinfer)]
+    prefill_plan: RefCell<Option<Rc<FlashInferPlan>>>,
+}
 
 impl AttentionBackend for FlashInferAttentionBackend {
     fn supports_cuda_graph(&self) -> bool {
@@ -196,7 +206,49 @@ impl AttentionBackend for FlashInferAttentionBackend {
         if let Some(metadata) = metadata.filter(|meta| meta.forward_mode == BatchPhase::Decode) {
             let page_size =
                 page_size.ok_or_else(|| model_error("FlashInfer requires a bound KV cache"))?;
+            #[cfg(has_flashinfer)]
+            {
+                let mut cached = self.plan.borrow_mut();
+                if cached
+                    .as_ref()
+                    .is_some_and(|plan| Rc::strong_count(plan) != 1)
+                {
+                    return Err(model_error("previous FlashInfer batch is still in use"));
+                }
+                let prepared = prepare_flashinfer_decode(
+                    metadata,
+                    spec,
+                    page_size,
+                    cached.as_ref().map_or(std::ptr::null_mut(), |plan| plan.0),
+                )?;
+                let plan = cached.get_or_insert_with(|| Rc::new(FlashInferPlan(prepared)));
+                return Ok(BackendPlan::FlashInfer(Rc::clone(plan)));
+            }
+            #[cfg(not(has_flashinfer))]
             return prepare_flashinfer_decode(metadata, spec, page_size);
+        }
+        #[cfg(has_flashinfer)]
+        if let Some(metadata) = metadata {
+            let mut cached = self.prefill_plan.borrow_mut();
+            if cached
+                .as_ref()
+                .is_some_and(|plan| Rc::strong_count(plan) != 1)
+            {
+                return Err(model_error(
+                    "previous FlashInfer prefill batch is still in use",
+                ));
+            }
+            let prepared = prepare_flashinfer_prefill(
+                metadata,
+                spec,
+                page_size.ok_or_else(|| model_error("FlashInfer requires a bound KV cache"))?,
+                cached.as_ref().map_or(std::ptr::null_mut(), |plan| plan.0),
+            )?;
+            let plan = cached.get_or_insert_with(|| Rc::new(FlashInferPlan(prepared)));
+            return Ok(BackendPlan::FlashInferPrefill(
+                Rc::clone(plan),
+                has_cached_prefix(metadata)?,
+            ));
         }
         Ok(BackendPlan::None)
     }
@@ -216,6 +268,10 @@ impl AttentionBackend for FlashInferAttentionBackend {
     ) -> Result<Tensor> {
         if metadata.is_some_and(|meta| meta.forward_mode == BatchPhase::Decode) {
             return flashinfer_decode(q, cache, plan, head_dim);
+        }
+        #[cfg(has_flashinfer)]
+        if metadata.is_some() {
+            return flashinfer_prefill(q, k, v, cache, plan, head_dim);
         }
         FlashAttentionBackend.forward(
             q,
@@ -250,11 +306,13 @@ fn prepare_flashinfer_decode(
     metadata: &AttentionMetadata,
     spec: AttentionSpec,
     page_size: i64,
-) -> Result<BackendPlan> {
+    existing: *mut std::ffi::c_void,
+) -> Result<*mut std::ffi::c_void> {
     use std::ffi::{CStr, c_void};
 
     unsafe extern "C" {
         fn sglang_flashinfer_prepare(
+            existing: *mut c_void,
             block_table: *const c_void,
             sequence_lengths: *const c_void,
             num_q_heads: i64,
@@ -280,6 +338,7 @@ fn prepare_flashinfer_decode(
     };
     let prepared = unsafe {
         sglang_flashinfer_prepare(
+            existing,
             table.as_ptr().cast(),
             lengths.as_ptr().cast(),
             spec.num_heads,
@@ -296,7 +355,7 @@ fn prepare_flashinfer_decode(
             error.to_string_lossy()
         )));
     }
-    Ok(BackendPlan::FlashInfer(FlashInferPlan(prepared)))
+    Ok(prepared)
 }
 
 #[cfg(not(has_flashinfer))]
@@ -336,6 +395,9 @@ fn flashinfer_decode(
         return Err(model_error("FlashInfer decode requires a prepared batch"));
     };
     let (k_cache, v_cache) = cache.cache_tensors()?;
+    // Q is a strided view of packed QKV for multi-request batches. The native
+    // decode kernel uses packed query strides; batch-size one needs no copy.
+    let q = q.contiguous();
     let output = unsafe {
         sglang_flashinfer_decode(
             plan.0,
@@ -365,6 +427,110 @@ fn flashinfer_decode(
     Err(model_error(
         "FlashInfer is unavailable; install its CUDA headers in the build venv and rebuild on Linux CUDA",
     ))
+}
+
+#[cfg(has_flashinfer)]
+fn prepare_flashinfer_prefill(
+    metadata: &AttentionMetadata,
+    spec: AttentionSpec,
+    page_size: i64,
+    existing: *mut std::ffi::c_void,
+) -> Result<*mut std::ffi::c_void> {
+    use std::ffi::{CStr, c_void};
+    unsafe extern "C" {
+        fn sglang_flashinfer_prepare_prefill(
+            existing: *mut c_void,
+            q_indptr: *const c_void,
+            prefixes: *const c_void,
+            table: *const c_void,
+            q_heads: i64,
+            kv_heads: i64,
+            page_size: i64,
+            dtype: i64,
+        ) -> *mut c_void;
+        fn sglang_flashinfer_error() -> *const std::ffi::c_char;
+    }
+    let cumulative = metadata
+        .cu_seqlens_q
+        .as_ref()
+        .ok_or_else(|| model_error("missing cu_seqlens_q"))?;
+    let prefixes = metadata
+        .prefix_lens
+        .as_ref()
+        .ok_or_else(|| model_error("missing prefix_lens"))?;
+    let table = metadata
+        .block_table
+        .as_ref()
+        .ok_or_else(|| model_error("missing block_table"))?;
+    let prepared = unsafe {
+        sglang_flashinfer_prepare_prefill(
+            existing,
+            cumulative.as_ptr().cast(),
+            prefixes.as_ptr().cast(),
+            table.as_ptr().cast(),
+            spec.num_heads,
+            spec.num_kv_heads,
+            page_size,
+            if spec.kind == Kind::BFloat16 { 0 } else { 1 },
+        )
+    };
+    if prepared.is_null() {
+        let error = unsafe { CStr::from_ptr(sglang_flashinfer_error()) };
+        return Err(model_error(&format!(
+            "FlashInfer prefill plan failed: {}",
+            error.to_string_lossy()
+        )));
+    }
+    Ok(prepared)
+}
+
+#[cfg(has_flashinfer)]
+fn flashinfer_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cache: &BaseAttention,
+    plan: &BackendPlan,
+    head_dim: i64,
+) -> Result<Tensor> {
+    use std::ffi::{CStr, c_void};
+    unsafe extern "C" {
+        fn sglang_flashinfer_prefill(
+            plan: *const c_void,
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+        ) -> *mut c_void;
+        fn sglang_flashinfer_error() -> *const std::ffi::c_char;
+    }
+    let BackendPlan::FlashInferPrefill(plan, paged) = plan else {
+        return Err(model_error("missing FlashInfer prefill plan"));
+    };
+    // Prefix mode is selected once at preparation, not separately in each layer.
+    // The native bridge chooses whether these tensors are ragged K/V or paged cache.
+    let cached;
+    let (k, v) = if *paged {
+        cached = cache.cache_tensors()?;
+        (cached.0, cached.1)
+    } else {
+        (k, v)
+    };
+    let out = unsafe {
+        sglang_flashinfer_prefill(
+            plan.0,
+            q.as_ptr().cast(),
+            k.as_ptr().cast(),
+            v.as_ptr().cast(),
+        )
+    };
+    if out.is_null() {
+        let error = unsafe { CStr::from_ptr(sglang_flashinfer_error()) };
+        return Err(model_error(&format!(
+            "FlashInfer prefill failed: {}",
+            error.to_string_lossy()
+        )));
+    }
+    Ok(unsafe { Tensor::from_ptr(out.cast()) }.reshape([q.size()[0], q.size()[1] * head_dim]))
 }
 
 /// Eager libtorch implementation of mini-sglang's Python `PyTorchBackend`.
@@ -959,6 +1125,162 @@ fn model_error(message: &str) -> ModelRunnerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(has_flashinfer)]
+    #[test]
+    fn flashinfer_reuses_workspace_and_updates_decode_plans() {
+        if !tch::Cuda::is_available() {
+            return;
+        }
+        unsafe extern "C" {
+            fn sglang_flashinfer_workspace_allocations(plan: *const std::ffi::c_void) -> u64;
+        }
+        let device = Device::Cuda(0);
+        let spec = AttentionSpec {
+            num_heads: 16,
+            num_kv_heads: 8,
+            head_dim: 128,
+            kind: Kind::BFloat16,
+            device,
+        };
+        let mut attention = Attention::new("flashinfer", spec).unwrap();
+        attention.bind_cache_layout(16);
+        let mut cache = BaseAttention::default();
+        cache
+            .bind_kv_cache(
+                Tensor::randn([32, 16, 8, 128], (Kind::BFloat16, device)),
+                Tensor::randn([32, 16, 8, 128], (Kind::BFloat16, device)),
+            )
+            .unwrap();
+        let table = Tensor::arange(32, (Kind::Int, device)).view([2, 16]);
+        let tokens = Tensor::arange(512, (Kind::Int, device)).view([2, 256]);
+        let packed = Tensor::randn([2, 4096], (Kind::BFloat16, device));
+        let q = packed.narrow(1, 0, 2048).view([2, 16, 128]);
+        assert!(!q.is_contiguous());
+        let mut previous_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut warmed_allocations = 0;
+        for (rows, len) in [
+            (2i64, 256i32),
+            (1, 1),
+            (2, 16),
+            (1, 17),
+            (2, 128),
+            (2, 255),
+            (2, 256),
+        ] {
+            let metadata = AttentionMetadata {
+                forward_mode: BatchPhase::Decode,
+                write_loc: None,
+                cu_seqlens_q: None,
+                prefix_lens: None,
+                block_table: Some(table.narrow(0, 0, rows)),
+                req_to_token: Some(tokens.narrow(0, 0, rows)),
+                cache_seqlens: Some(
+                    Tensor::from_slice(&[len, len - len / 2][..rows as usize]).to_device(device),
+                ),
+                max_seqlen: Some(len as usize),
+            };
+            let batch = attention.prepare(Some(&metadata), rows as usize).unwrap();
+            assert!(attention.prepare(Some(&metadata), rows as usize).is_err());
+            let BackendPlan::FlashInfer(plan) = &batch.plan else {
+                panic!("missing plan");
+            };
+            let allocations = unsafe { sglang_flashinfer_workspace_allocations(plan.0) };
+            if previous_ptr.is_null() {
+                previous_ptr = plan.0;
+                warmed_allocations = allocations;
+            } else {
+                assert_eq!(plan.0, previous_ptr);
+                assert_eq!(allocations, warmed_allocations);
+            }
+            let query = q.narrow(0, 0, rows);
+            let actual = batch.forward(&query, &query, &query, &cache).unwrap();
+            let expected = sdpa_decode_with_cache(&query, &cache, &metadata, 16, 8, 128).unwrap();
+            let error = (actual.to_kind(Kind::Float) - expected.to_kind(Kind::Float))
+                .abs()
+                .max()
+                .double_value(&[]);
+            assert!(error <= 0.03125, "len={len}, error={error}");
+        }
+    }
+
+    #[cfg(has_flashinfer)]
+    #[test]
+    fn flashinfer_prefill_matches_reference_for_ragged_and_cached_batches() {
+        if !tch::Cuda::is_available() {
+            return;
+        }
+        let device = Device::Cuda(0);
+        for kind in [Kind::BFloat16, Kind::Half] {
+            let spec = AttentionSpec {
+                num_heads: 16,
+                num_kv_heads: 8,
+                head_dim: 128,
+                kind,
+                device,
+            };
+            let mut attention = Attention::new("flashinfer", spec).unwrap();
+            attention.bind_cache_layout(16);
+            let mut cache = BaseAttention::default();
+            let keys = Tensor::randn([64, 16, 8, 128], (kind, device));
+            let values = Tensor::randn_like(&keys);
+            cache
+                .bind_kv_cache(keys.shallow_clone(), values.shallow_clone())
+                .unwrap();
+            // Unequal lengths, page boundaries, long contexts and mixed prefixes.
+            for (lengths, prefixes) in [
+                ([17i32, 1], [0i32, 0]),
+                ([129, 33], [0, 0]),
+                ([1, 17], [255, 16]),
+                ([17, 1], [0, 31]),
+                ([257, 65], [240, 0]),
+            ] {
+                let bounds = [0i32, lengths[0], lengths[0] + lengths[1]];
+                let table = Tensor::arange(64, (Kind::Int, device)).view([2, 32]);
+                let tokens = Tensor::arange(1024, (Kind::Int, device)).view([2, 512]);
+                let metadata = AttentionMetadata {
+                    forward_mode: BatchPhase::Prefill,
+                    write_loc: None,
+                    cu_seqlens_q: Some(Tensor::from_slice(&bounds).to_device(device)),
+                    prefix_lens: Some(Tensor::from_slice(&prefixes).to_device(device)),
+                    block_table: Some(table),
+                    req_to_token: Some(tokens),
+                    cache_seqlens: None,
+                    max_seqlen: None,
+                };
+                let packed = Tensor::randn([i64::from(bounds[2]), 4096], (kind, device));
+                let q = packed.narrow(1, 0, 2048).view([-1, 16, 128]);
+                let k = packed.narrow(1, 2048, 1024).view([-1, 8, 128]);
+                let v = packed.narrow(1, 3072, 1024).view([-1, 8, 128]);
+                let batch = attention
+                    .prepare(Some(&metadata), bounds[2] as usize)
+                    .unwrap();
+                assert!(matches!(batch.plan, BackendPlan::FlashInferPrefill(_, _)));
+                let actual = batch.forward(&q, &k, &v, &cache).unwrap();
+                let reference = batched_prefill_sdpa(
+                    &q,
+                    &k,
+                    &v,
+                    &cache,
+                    &bounds.map(i64::from),
+                    &prefixes.map(i64::from),
+                    Some(&metadata),
+                    16,
+                    8,
+                    128,
+                )
+                .unwrap();
+                let error = (actual.to_kind(Kind::Float) - reference.to_kind(Kind::Float))
+                    .abs()
+                    .max()
+                    .double_value(&[]);
+                assert!(
+                    error <= 0.03125,
+                    "kind={kind:?},lengths={lengths:?},prefixes={prefixes:?},error={error}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn padded_decode_matches_eager_for_different_sequence_lengths() {

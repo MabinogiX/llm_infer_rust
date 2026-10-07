@@ -122,13 +122,7 @@ async fn chat_completions_inner(
             .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))
     })?;
     let prompt_tokens = input_ids.len();
-    let params = sampling_params(
-        request.temperature,
-        request.top_p,
-        request.top_k,
-        request.max_tokens,
-        request.ignore_eos,
-    );
+    let params = request.sampling_params();
     let handle = profiler
         .measure_async(RequestStage::Submit, submit(&frontend, input_ids, params))
         .await?;
