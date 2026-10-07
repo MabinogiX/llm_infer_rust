@@ -1,5 +1,6 @@
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <string>
 
 struct GraphBridge {
@@ -59,6 +60,10 @@ extern "C" bool sglang_graph_replay(GraphBridge* bridge) {
 }
 
 extern "C" void sglang_graph_free(GraphBridge* bridge) {
-  c10::cuda::setCurrentCUDAStream(bridge->previous);
+  c10::cuda::CUDAGuard guard(bridge->capture.device_index());
+  // Failed warmup/begin may leave the side stream selected. Destroying an
+  // already completed graph must not change the caller's current stream.
+  if (c10::cuda::getCurrentCUDAStream(bridge->capture.device_index()) == bridge->capture)
+    c10::cuda::setCurrentCUDAStream(bridge->previous);
   delete bridge;
 }

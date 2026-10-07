@@ -18,9 +18,10 @@ Options:\n\
   --memory-ratio R          KV cache memory ratio (default 0.9)\n\
   --max-running-req N       Maximum active requests (default 256)\n\
   --cuda-graph-bs N         Maximum CUDA decode graph batch (0 disables)\n\
+  --prefill-cuda-graph-max-tokens N  Maximum prefill graph tokens (default 2048; 0 disables)\n\
   --max-seq-len N           Maximum sequence length (default 8192; must not exceed model config)\n\
   --page-size N             KV cache page size (default 16)\n\
-  --attention-backend NAME  Attention backend: fa, pt, or flashinfer (CUDA eager decode)\n\
+  --attention-backend NAME  Attention backend: fa, pt, or flashinfer\n\
   --dtype NAME              Model dtype: auto, bfloat16, float16, float32\n\
   --device NAME             Device: auto, cpu, or cuda (default auto)\n\
   --trust-remote-code       Request Hugging Face remote code\n\
@@ -49,6 +50,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--memory-ratio" => engine.memory_ratio = parse_value(&value()?, &flag)?,
             "--max-running-req" => engine.max_running_req = parse_value(&value()?, &flag)?,
             "--cuda-graph-bs" => engine.cuda_graph_bs = Some(parse_value(&value()?, &flag)?),
+            "--prefill-cuda-graph-max-tokens" => {
+                engine.prefill_cuda_graph_max_tokens = parse_value(&value()?, &flag)?
+            }
             "--max-seq-len" => engine.max_seq_len = parse_value(&value()?, &flag)?,
             "--page-size" => engine.page_size = parse_value(&value()?, &flag)?,
             "--attention-backend" => engine.attention_backend = value()?,
@@ -126,6 +130,17 @@ mod tests {
             parse_args(["--model-path", "/tmp/model", "--cuda-graph-bs", "4"].map(str::to_owned))
                 .unwrap();
         assert_eq!(graph_args.engine.cuda_graph_bs, Some(4));
+        let prefill_args = parse_args(
+            [
+                "--model-path",
+                "/tmp/model",
+                "--prefill-cuda-graph-max-tokens",
+                "0",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(prefill_args.engine.prefill_cuda_graph_max_tokens, 0);
         let bf16_args =
             parse_args(["--model-path", "/tmp/model", "--dtype", "bfloat16"].map(str::to_owned))
                 .unwrap();

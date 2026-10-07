@@ -15,6 +15,8 @@ struct FlashInferPlan {
   int64_t total_queries = 0;
   bool prefill = false;
   bool paged = false;
+  bool graph = false;
+  int64_t graph_columns = 0;
   at::Tensor indices;
   at::Tensor indptr;
   at::Tensor last_page_len;
@@ -29,7 +31,7 @@ struct FlashInferPlan {
 
 extern "C" void* sglang_flashinfer_native_plan(
     void* existing, const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,
-    int32_t num_kv_heads, int32_t page_size, int32_t dtype_code,
+    int32_t num_kv_heads, int32_t page_size, int32_t dtype_code, bool graph,
     void* stream, const char** error);
 extern "C" void sglang_flashinfer_native_plan_drop(void* plan);
 extern "C" uint64_t sglang_flashinfer_native_allocations(const void* plan);
@@ -46,7 +48,7 @@ extern "C" const char* sglang_flashinfer_error() { return last_error.c_str(); }
 extern "C" void* sglang_flashinfer_prepare(
     void* existing, const at::Tensor* block_table, const at::Tensor* sequence_lengths,
     int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
-    int64_t page_size, int64_t dtype_code) {
+    int64_t page_size, int64_t dtype_code, bool graph) {
   try {
     if (!block_table->is_cuda() || !sequence_lengths->is_cuda()) {
       throw std::runtime_error("FlashInfer metadata must be CUDA tensors");
@@ -67,16 +69,32 @@ extern "C" void* sglang_flashinfer_prepare(
     if (existing && (plan->device_index != block_table->get_device() ||
         plan->num_q_heads != num_q_heads || plan->num_kv_heads != num_kv_heads ||
         plan->head_dim != head_dim || plan->page_size != page_size ||
-        plan->dtype_code != dtype_code))
+        plan->dtype_code != dtype_code || plan->graph != graph ||
+        (graph && plan->graph_columns != block_table->size(1))))
       throw std::runtime_error("FlashInfer workspace geometry changed");
     auto pages = at::floor_divide(sequence_lengths->to(at::kInt) + page_size - 1,
                                   page_size);
-    plan->indptr = at::cat({at::zeros({1}, pages.options()), pages.cumsum(0, at::kInt)});
+    auto indptr = at::cat({at::zeros({1}, pages.options()), pages.cumsum(0, at::kInt)});
     auto columns = at::arange(block_table->size(1), pages.options());
-    plan->indices = block_table->masked_select(columns.unsqueeze(0) < pages.unsqueeze(1))
-                        .to(at::kInt)
-                        .contiguous();
-    plan->last_page_len = ((sequence_lengths->to(at::kInt) - 1) % page_size + 1).contiguous();
+    auto indices = block_table->masked_select(columns.unsqueeze(0) < pages.unsqueeze(1))
+                        .to(at::kInt).contiguous();
+    auto last_len = ((sequence_lengths->to(at::kInt) - 1) % page_size + 1).contiguous();
+    if (graph) {
+      if (!existing) {
+        plan->indptr = at::empty_like(indptr);
+        plan->indices = at::empty({block_table->numel()}, pages.options());
+        plan->last_page_len = at::empty_like(last_len);
+      }
+      // Graph nodes keep these addresses; only their contents may change.
+      if (indices.numel() > plan->indices.numel() ||
+          indptr.sizes() != plan->indptr.sizes() || last_len.sizes() != plan->last_page_len.sizes())
+        throw std::runtime_error("FlashInfer graph metadata capacity exceeded");
+      plan->indptr.copy_(indptr);
+      plan->indices.narrow(0,0,indices.numel()).copy_(indices);
+      plan->last_page_len.copy_(last_len);
+    } else {
+      plan->indptr = indptr; plan->indices = indices; plan->last_page_len = last_len;
+    }
     auto indptr_host = plan->indptr.to(at::kCPU).contiguous();
     // This blocking read also drains earlier work on the same stream before
     // DecodePlan overwrites its reusable pinned and device workspaces.
@@ -84,7 +102,7 @@ extern "C" void* sglang_flashinfer_prepare(
     auto stream = c10::cuda::getCurrentCUDAStream(block_table->get_device()).stream();
     auto* native_plan = sglang_flashinfer_native_plan(
         plan->native_plan, indptr_host.data_ptr<int32_t>(), block_table->size(0), num_q_heads,
-        num_kv_heads, page_size, dtype_code, stream, &native_error);
+        num_kv_heads, page_size, dtype_code, graph, stream, &native_error);
     if (!native_plan) {
       throw std::runtime_error(native_error ? native_error : "FlashInfer plan failed");
     }
@@ -95,6 +113,7 @@ extern "C" void* sglang_flashinfer_prepare(
     plan->page_size = page_size;
     plan->dtype_code = dtype_code;
     plan->device_index = block_table->get_device();
+    plan->graph = graph; plan->graph_columns = block_table->size(1);
     return existing ? existing : created.release();
   } catch (const std::exception& error) {
     last_error = error.what();

@@ -1,7 +1,7 @@
 //! Dense Qwen3 causal language model implemented with libtorch tensors.
 //!
-//! The dense path supports eager prefill plus paged-KV decode and cached-prefix
-//! prefill. Qwen3-MoE remains outside this implementation.
+//! The dense path supports segmented prefill graphs, eager cached-prefix
+//! prefill, and paged-KV decode graphs. Qwen3-MoE remains outside this implementation.
 
 use std::{cell::RefCell, collections::HashMap};
 
@@ -9,11 +9,15 @@ use tch::{Device, Kind, Tensor};
 
 use super::ops::{RopeCache, add_rms_norm, qk_norm, rms_norm, silu_and_mul};
 use crate::engine::{
-    AttentionMetadata, BatchPhase, ModelArgs, ModelExecutor, ModelFactory, ModelRunnerError,
-    ModelWeights,
+    AttentionMetadata, BatchPhase, DecodeGraphState, ModelArgs, ModelExecutor, ModelFactory,
+    ModelRunnerError, ModelWeights,
 };
 use crate::models::attention::{Attention, AttentionBatch, AttentionSpec, BaseAttention};
 use crate::profiling::{ModelProfiler, ModelStage};
+
+#[path = "prefill_graph.rs"]
+mod prefill_graph;
+use prefill_graph::PrefillGraphCache;
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
@@ -49,6 +53,8 @@ impl ModelFactory for Qwen3Factory {
 
 /// Dense Qwen3 decoder-only model with QK-RMSNorm, RoPE, GQA, and SwiGLU.
 pub struct Qwen3ForCausalLM {
+    // Drop captured segments before any parameters that their kernels reference.
+    prefill_graphs: RefCell<PrefillGraphCache>,
     config: ModelArgs,
     device: Device,
     kind: Kind,
@@ -91,6 +97,7 @@ impl Qwen3ForCausalLM {
         )?;
 
         Ok(Self {
+            prefill_graphs: RefCell::new(PrefillGraphCache::default()),
             config,
             device,
             kind,
@@ -122,6 +129,16 @@ impl Qwen3ForCausalLM {
         attention_metadata: Option<&AttentionMetadata>,
         logits_indices: Option<&Tensor>,
     ) -> Result<Tensor> {
+        if attention_metadata.is_some_and(|meta| meta.forward_mode == BatchPhase::Prefill) {
+            if let Some(logits) = self.forward_prefill_graph(
+                input_ids,
+                positions,
+                attention_metadata,
+                logits_indices,
+            )? {
+                return Ok(logits);
+            }
+        }
         let mut profiler = ModelProfiler::new(self.device);
         let ids = input_ids.view([-1]);
         let positions = positions.view([-1]);
@@ -187,6 +204,7 @@ impl Qwen3ForCausalLM {
     }
 
     fn load_weights_impl(&mut self, weights: ModelWeights) -> Result<usize> {
+        self.prefill_graphs.get_mut().clear();
         let mut weights = weights
             .into_tensors()
             .into_iter()
@@ -232,8 +250,38 @@ impl Qwen3ForCausalLM {
 }
 
 impl ModelExecutor for Qwen3ForCausalLM {
+    fn configure_prefill_graph(&mut self, max_tokens: usize) {
+        let limit = if matches!(self.device, Device::Cuda(_))
+            && matches!(self.kind, Kind::BFloat16 | Kind::Half)
+            && crate::engine::NativeCudaGraph::available()
+            && !crate::logging::step_timing_enabled()
+        {
+            max_tokens
+        } else {
+            0
+        };
+        *self.prefill_graphs.get_mut() = PrefillGraphCache::new(limit);
+        if limit > 0 {
+            tracing::info!(
+                max_tokens = limit,
+                "prefill segmented CUDA Graph configured for startup capture"
+            );
+        }
+    }
+
+    fn capture_prefill_graphs(&self) -> Result<()> {
+        self.capture_prefill_buckets()
+    }
+
     fn supports_cuda_graph(&self) -> bool {
         self.attention.supports_cuda_graph()
+    }
+
+    fn prepare_decode_graph(
+        &self,
+        metadata: &AttentionMetadata,
+    ) -> Result<Option<Box<dyn DecodeGraphState>>> {
+        self.attention.prepare_decode_graph(metadata)
     }
 
     fn forward(
@@ -251,6 +299,7 @@ impl ModelExecutor for Qwen3ForCausalLM {
     }
 
     fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {
+        self.prefill_graphs.get_mut().clear();
         if k_cache.dim() != 5
             || v_cache.size() != k_cache.size()
             || k_cache.size()[0] != self.layers.len() as i64
@@ -327,52 +376,32 @@ impl DecoderLayer {
         profiler: &mut ModelProfiler,
     ) -> Result<(Tensor, Tensor)> {
         let timer = profiler.start(ModelStage::Norm);
-        let (normalized, residual) = if let Some(residual) = residual {
-            add_rms_norm(
-                hidden_states.shallow_clone(),
-                residual,
-                &self.input_layernorm,
-                eps,
-            )
-        } else {
-            (
-                rms_norm(hidden_states, &self.input_layernorm, eps),
-                hidden_states.shallow_clone(),
-            )
-        };
+        let (normalized, residual) = self.input_norm(hidden_states, residual, eps);
         profiler.finish(timer);
-        let attention = self.attention(
-            &normalized,
-            positions,
-            attention_batch,
-            attention_metadata,
-            eps,
-            rope,
-            profiler,
-        )?;
-        let timer = profiler.start(ModelStage::Norm);
-        let (normalized, residual) =
-            add_rms_norm(attention, residual, &self.post_attention_layernorm, eps);
-        profiler.finish(timer);
-
-        let timer = profiler.start(ModelStage::Mlp);
-        let gate_up = linear(&normalized, &self.gate_up_proj);
-        let mlp = silu_and_mul(&gate_up);
-        let output = linear(&mlp, &self.down_proj);
-        profiler.finish(timer);
-        Ok((output, residual))
+        let (q, k, v) = self.project_qkv(&normalized, positions, eps, rope, profiler)?;
+        let attention = self.attend(&q, &k, &v, attention_batch, attention_metadata, profiler)?;
+        Ok(self.output_mlp(&attention, residual, eps, profiler))
     }
 
-    fn attention(
+    fn input_norm(&self, hidden: &Tensor, residual: Option<Tensor>, eps: f64) -> (Tensor, Tensor) {
+        if let Some(residual) = residual {
+            add_rms_norm(hidden.shallow_clone(), residual, &self.input_layernorm, eps)
+        } else {
+            (
+                rms_norm(hidden, &self.input_layernorm, eps),
+                hidden.shallow_clone(),
+            )
+        }
+    }
+
+    fn project_qkv(
         &self,
         hidden_states: &Tensor,
         positions: &Tensor,
-        attention_batch: &AttentionBatch<'_>,
-        attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
         rope: &RopeCache,
         profiler: &mut ModelProfiler,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let timer = profiler.start(ModelStage::QkvLinear);
         let total_tokens = hidden_states.size()[0];
         let qkv = linear(hidden_states, &self.qkv_proj);
@@ -401,10 +430,22 @@ impl DecoderLayer {
         let (q, k) = rope.apply(&q, &k, positions);
         profiler.finish(timer);
 
+        Ok((q, k, v))
+    }
+
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attention_batch: &AttentionBatch<'_>,
+        attention_metadata: Option<&AttentionMetadata>,
+        profiler: &mut ModelProfiler,
+    ) -> Result<Tensor> {
         let timer = profiler.start(ModelStage::KvWrite);
         let write_result = self.base_attention.borrow_mut().write_kv(
-            &k,
-            &v,
+            k,
+            v,
             attention_metadata.and_then(|metadata| metadata.write_loc.as_ref()),
             attention_metadata.map_or(BatchPhase::Prefill, |metadata| metadata.forward_mode),
         );
@@ -412,14 +453,31 @@ impl DecoderLayer {
         write_result?;
 
         let timer = profiler.start(ModelStage::AttentionBackend);
-        let output = attention_batch.forward(&q, &k, &v, &self.base_attention.borrow());
+        let output = attention_batch.forward(q, k, v, &self.base_attention.borrow());
         profiler.finish(timer);
-        let output = output?;
+        output
+    }
 
+    fn output_mlp(
+        &self,
+        attention: &Tensor,
+        residual: Tensor,
+        eps: f64,
+        profiler: &mut ModelProfiler,
+    ) -> (Tensor, Tensor) {
         let timer = profiler.start(ModelStage::AttentionOutput);
-        let output = linear(&output, &self.o_proj);
+        let output = linear(attention, &self.o_proj);
         profiler.finish(timer);
-        Ok(output)
+        let timer = profiler.start(ModelStage::Norm);
+        let (normalized, residual) =
+            add_rms_norm(output, residual, &self.post_attention_layernorm, eps);
+        profiler.finish(timer);
+        let timer = profiler.start(ModelStage::Mlp);
+        let gate_up = linear(&normalized, &self.gate_up_proj);
+        let mlp = silu_and_mul(&gate_up);
+        let output = linear(&mlp, &self.down_proj);
+        profiler.finish(timer);
+        (output, residual)
     }
 
     fn load_weights(
