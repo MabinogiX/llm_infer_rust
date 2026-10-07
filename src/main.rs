@@ -37,6 +37,7 @@ async fn main() -> ExitCode {
         page_size = engine.page_size,
         memory_ratio = engine.memory_ratio,
         cuda_graph_bs_limit = engine.cuda_graph_bs.unwrap_or(engine.max_running_req),
+        prefill_cuda_graph_max_tokens = engine.prefill_cuda_graph_max_tokens,
         requested_dtype = %engine.dtype,
         requested_device = %engine.device,
         log_dir = %args.logging.directory.display(),

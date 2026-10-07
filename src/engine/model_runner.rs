@@ -74,11 +74,35 @@ impl Batch {
     }
 }
 
+/// Owns address-stable backend planning buffers for one captured decode batch.
+/// Planning updates happen before replay, outside stream capture.
+pub trait DecodeGraphState {
+    fn update(&self) -> Result<()>;
+    fn needs_req_to_token(&self) -> bool {
+        true
+    }
+}
+
 /// Boundary implemented by the future Rust model architecture.
 pub trait ModelExecutor {
+    /// Configure model-specific segmented prefill capture; zero clears/disables.
+    fn configure_prefill_graph(&mut self, _max_tokens: usize) {}
+
+    /// Capture configured prefill buckets after weights and KV cache are bound.
+    fn capture_prefill_graphs(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether decode forwards can be safely captured as CUDA Graphs.
     fn supports_cuda_graph(&self) -> bool {
         true
+    }
+
+    fn prepare_decode_graph(
+        &self,
+        _metadata: &AttentionMetadata,
+    ) -> Result<Option<Box<dyn DecodeGraphState>>> {
+        Ok(None)
     }
 
     fn forward(
@@ -146,11 +170,12 @@ impl From<TchError> for ModelRunnerError {
 
 pub type Result<T> = std::result::Result<T, ModelRunnerError>;
 
-/// Owns a model executor and optional captured decode graphs.
+/// Owns model execution, decode graphs, and model-specific prefill graph configuration.
 pub struct ModelRunner {
+    // Graphs must release their backend state before model/cache ownership.
+    graph_runner: Option<GraphRunner>,
     model: Box<dyn ModelExecutor>,
     device: Device,
-    graph_runner: Option<GraphRunner>,
 }
 
 impl ModelRunner {
@@ -172,10 +197,12 @@ impl ModelRunner {
 
     /// Hands loaded Hugging Face tensors to the concrete model architecture.
     pub fn load_weights(&mut self, weights: ModelWeights) -> Result<usize> {
+        self.clear_graphs();
         self.model.load_weights(weights)
     }
 
     pub fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {
+        self.clear_graphs();
         self.model.bind_kv_cache(k_cache, v_cache)
     }
 
@@ -185,8 +212,23 @@ impl ModelRunner {
         pool: Rc<RefCell<KVCachePool>>,
     ) -> Result<()> {
         self.graph_runner = None;
+        let prefill_limit =
+            if matches!(self.device, Device::Cuda(_)) && !crate::logging::step_timing_enabled() {
+                args.prefill_cuda_graph_max_tokens
+            } else {
+                0
+            };
+        self.model.configure_prefill_graph(prefill_limit);
         self.graph_runner = GraphRunner::capture(self, args, pool)?;
+        no_grad(|| self.model.capture_prefill_graphs())?;
         Ok(())
+    }
+
+    pub(crate) fn prepare_decode_graph(
+        &self,
+        metadata: &AttentionMetadata,
+    ) -> Result<Option<Box<dyn DecodeGraphState>>> {
+        self.model.prepare_decode_graph(metadata)
     }
 
     /// The single model-forward entry point used by eager and capture paths.
@@ -232,6 +274,7 @@ impl ModelRunner {
 
     pub fn clear_graphs(&mut self) {
         self.graph_runner = None;
+        self.model.configure_prefill_graph(0);
     }
 
     fn validate_tensors(&self, input_ids: &Tensor, positions: &Tensor) -> Result<()> {

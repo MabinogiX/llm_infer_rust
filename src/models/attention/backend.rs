@@ -1,10 +1,14 @@
 //! Attention backend dispatch matching mini-sglang's `pt` / `fa` seam.
 
 #[cfg(has_flashinfer)]
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::{Rc, Weak},
+};
 use tch::{Device, Kind, Tensor};
 
-use crate::engine::{AttentionMetadata, BatchPhase, ModelRunnerError};
+use crate::engine::{AttentionMetadata, BatchPhase, DecodeGraphState, ModelRunnerError};
 
 use super::BaseAttention;
 
@@ -97,6 +101,18 @@ impl Attention {
         self.backend.supports_cuda_graph()
     }
 
+    pub fn prepare_decode_graph(
+        &self,
+        metadata: &AttentionMetadata,
+    ) -> Result<Option<Box<dyn DecodeGraphState>>> {
+        self.backend.prepare_decode_graph(
+            metadata,
+            self.spec,
+            self.page_size
+                .ok_or_else(|| model_error("graph requires a bound KV cache"))?,
+        )
+    }
+
     pub fn prepare<'a>(
         &'a self,
         metadata: Option<&'a AttentionMetadata>,
@@ -151,6 +167,15 @@ trait AttentionBackend {
         true
     }
 
+    fn prepare_decode_graph(
+        &self,
+        _metadata: &AttentionMetadata,
+        _spec: AttentionSpec,
+        _page_size: i64,
+    ) -> Result<Option<Box<dyn DecodeGraphState>>> {
+        Ok(None)
+    }
+
     fn prepare(
         &self,
         _metadata: Option<&AttentionMetadata>,
@@ -190,11 +215,58 @@ struct FlashInferAttentionBackend {
     plan: RefCell<Option<Rc<FlashInferPlan>>>,
     #[cfg(has_flashinfer)]
     prefill_plan: RefCell<Option<Rc<FlashInferPlan>>>,
+    #[cfg(has_flashinfer)]
+    graph_plans: RefCell<HashMap<usize, Weak<FlashInferPlan>>>,
 }
 
 impl AttentionBackend for FlashInferAttentionBackend {
     fn supports_cuda_graph(&self) -> bool {
-        false
+        cfg!(has_flashinfer)
+    }
+
+    fn prepare_decode_graph(
+        &self,
+        metadata: &AttentionMetadata,
+        spec: AttentionSpec,
+        page_size: i64,
+    ) -> Result<Option<Box<dyn DecodeGraphState>>> {
+        #[cfg(has_flashinfer)]
+        {
+            let table = metadata
+                .block_table
+                .as_ref()
+                .ok_or_else(|| model_error("missing graph block_table"))?;
+            let lengths = metadata
+                .cache_seqlens
+                .as_ref()
+                .ok_or_else(|| model_error("missing graph cache_seqlens"))?;
+            let plan = Rc::new(FlashInferPlan(prepare_flashinfer_decode(
+                metadata,
+                spec,
+                page_size,
+                std::ptr::null_mut(),
+                true,
+            )?));
+            let mut plans = self.graph_plans.borrow_mut();
+            plans.retain(|_, plan| plan.strong_count() > 0);
+            let key = table.data_ptr() as usize;
+            if plans.get(&key).and_then(Weak::upgrade).is_some() {
+                return Err(model_error("decode graph buffers are already registered"));
+            }
+            plans.insert(key, Rc::downgrade(&plan));
+            return Ok(Some(Box::new(FlashInferGraphState {
+                plan,
+                table: table.shallow_clone(),
+                lengths: lengths.shallow_clone(),
+                spec,
+                page_size,
+            })));
+        }
+        #[cfg(not(has_flashinfer))]
+        {
+            let _ = (metadata, spec, page_size);
+            Ok(None)
+        }
     }
 
     fn prepare(
@@ -204,6 +276,16 @@ impl AttentionBackend for FlashInferAttentionBackend {
         page_size: Option<i64>,
     ) -> Result<BackendPlan> {
         if let Some(metadata) = metadata.filter(|meta| meta.forward_mode == BatchPhase::Decode) {
+            #[cfg(has_flashinfer)]
+            if let Some(plan) = metadata.block_table.as_ref().and_then(|table| {
+                self.graph_plans
+                    .borrow()
+                    .get(&(table.data_ptr() as usize))
+                    .and_then(Weak::upgrade)
+            }) {
+                // Already planned outside capture/replay. No GPU read or allocation.
+                return Ok(BackendPlan::FlashInfer(plan));
+            }
             let page_size =
                 page_size.ok_or_else(|| model_error("FlashInfer requires a bound KV cache"))?;
             #[cfg(has_flashinfer)]
@@ -220,6 +302,7 @@ impl AttentionBackend for FlashInferAttentionBackend {
                     spec,
                     page_size,
                     cached.as_ref().map_or(std::ptr::null_mut(), |plan| plan.0),
+                    false,
                 )?;
                 let plan = cached.get_or_insert_with(|| Rc::new(FlashInferPlan(prepared)));
                 return Ok(BackendPlan::FlashInfer(Rc::clone(plan)));
@@ -292,6 +375,40 @@ impl AttentionBackend for FlashInferAttentionBackend {
 struct FlashInferPlan(*mut std::ffi::c_void);
 
 #[cfg(has_flashinfer)]
+struct FlashInferGraphState {
+    plan: Rc<FlashInferPlan>,
+    table: Tensor,
+    lengths: Tensor,
+    spec: AttentionSpec,
+    page_size: i64,
+}
+
+#[cfg(has_flashinfer)]
+impl DecodeGraphState for FlashInferGraphState {
+    fn update(&self) -> Result<()> {
+        let metadata = AttentionMetadata {
+            forward_mode: BatchPhase::Decode,
+            write_loc: None,
+            cu_seqlens_q: None,
+            prefix_lens: None,
+            block_table: Some(self.table.shallow_clone()),
+            cache_seqlens: Some(self.lengths.shallow_clone()),
+            req_to_token: None,
+            max_seqlen: None,
+        };
+        let pointer =
+            prepare_flashinfer_decode(&metadata, self.spec, self.page_size, self.plan.0, true)?;
+        if pointer != self.plan.0 {
+            return Err(model_error("graph plan address changed"));
+        }
+        Ok(())
+    }
+    fn needs_req_to_token(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(has_flashinfer)]
 impl Drop for FlashInferPlan {
     fn drop(&mut self) {
         unsafe extern "C" {
@@ -307,6 +424,7 @@ fn prepare_flashinfer_decode(
     spec: AttentionSpec,
     page_size: i64,
     existing: *mut std::ffi::c_void,
+    graph: bool,
 ) -> Result<*mut std::ffi::c_void> {
     use std::ffi::{CStr, c_void};
 
@@ -320,6 +438,7 @@ fn prepare_flashinfer_decode(
             head_dim: i64,
             page_size: i64,
             dtype_code: i64,
+            graph: bool,
         ) -> *mut c_void;
         fn sglang_flashinfer_error() -> *const std::ffi::c_char;
     }
@@ -346,6 +465,7 @@ fn prepare_flashinfer_decode(
             spec.head_dim,
             page_size,
             dtype_code,
+            graph,
         )
     };
     if prepared.is_null() {

@@ -12,6 +12,9 @@ pub use engine::{
 };
 pub use model_loader::{ModelFactory, ModelLoadError, ModelWeights, load_hf_safetensors};
 pub use model_runner::{
-    AttentionMetadata, Batch, BatchPhase, ModelExecutor, ModelRunner, ModelRunnerError,
+    AttentionMetadata, Batch, BatchPhase, DecodeGraphState, ModelExecutor, ModelRunner,
+    ModelRunnerError,
 };
 pub use sampling::{Sampler, SamplingError, SamplingParams};
+
+pub(crate) use graph::NativeCudaGraph;

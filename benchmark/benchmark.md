@@ -1,6 +1,9 @@
 # Benchmark优化记录
 
 ## 2026.10.07
+添加cuda graph，在max-running-req=1时跟sglang在benchmark上打平，本项目首token延迟少10-30ms不等，但吞吐仍低于sglang
+
+## 2026.10.07
 发现请求中的max_completion_tokens没有被正确处理，导致速度缓慢，修复之后单个请求约0.2s。继续优化算子逻辑，主要消除算子重复调用，内存反复申请/释放的问题。单个请求速度达到约130ms.
 
 ## 2026.10.07

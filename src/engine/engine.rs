@@ -31,6 +31,8 @@ pub struct ServerArgs {
     pub max_running_req: usize,
     /// Maximum captured decode batch size. None uses max_running_req; zero disables capture.
     pub cuda_graph_bs: Option<usize>,
+    /// Maximum aggregate token bucket for segmented prefill graphs; zero disables.
+    pub prefill_cuda_graph_max_tokens: usize,
     pub max_seq_len: usize,
     pub page_size: usize,
     pub dtype: String,
@@ -47,6 +49,7 @@ impl ServerArgs {
             memory_ratio: 0.9,
             max_running_req: 256,
             cuda_graph_bs: None,
+            prefill_cuda_graph_max_tokens: 2048,
             max_seq_len: 8192,
             page_size: 16,
             dtype: "auto".to_owned(),
@@ -431,7 +434,7 @@ impl Engine {
         tracing::info!(
             device = ?self.device,
             max_batch_size = self.server_args.cuda_graph_bs.unwrap_or(self.server_args.max_running_req),
-            "initializing decode graph runner"
+            "initializing CUDA Graph runners"
         );
         let pool = self.shared_kv_cache_pool()?;
         self.model_runner
