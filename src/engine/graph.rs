@@ -8,7 +8,7 @@ use super::{
     AttentionMetadata, Batch, BatchPhase, DecodeGraphState, ModelRunner, ModelRunnerError,
     ServerArgs,
 };
-use crate::engine::kvcache::{BaseCacheHandle, KVCachePool};
+use crate::engine::kvcache::KVCachePool;
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
@@ -21,11 +21,9 @@ struct CapturedGraph {
     output: Tensor,
 }
 
-/// Holds one graph per selected batch size and private KV pages for padding rows.
+/// Holds one graph per batch size; padding reads the permanent reserved page 0.
 pub struct GraphRunner {
     graphs: BTreeMap<usize, CapturedGraph>,
-    pool: Rc<RefCell<KVCachePool>>,
-    pad_handle: BaseCacheHandle,
     pad_pages: Tensor,
     pad_locations: Tensor,
 }
@@ -34,7 +32,7 @@ impl GraphRunner {
     pub fn capture(
         runner: &ModelRunner,
         args: &ServerArgs,
-        pool: Rc<RefCell<KVCachePool>>,
+        _pool: Rc<RefCell<KVCachePool>>,
     ) -> Result<Option<Self>> {
         if crate::logging::step_timing_enabled() {
             tracing::info!("CUDA Graph disabled for synchronized SGLANG_PROFILE_STEPS profiling");
@@ -66,31 +64,10 @@ impl GraphRunner {
             tracing::warn!("CUDA Graph bridge unavailable; using eager decode");
             return Ok(None);
         }
-        if pool.borrow().free_count() <= limit {
-            tracing::warn!("KV cache has no spare padding page; using eager decode");
-            return Ok(None);
-        }
-        let pad_handle = match pool.borrow_mut().alloc(limit) {
-            Ok(handle) => handle,
-            Err(error) => {
-                tracing::warn!(%error, "cannot reserve CUDA Graph padding page; using eager decode");
-                return Ok(None);
-            }
-        };
-        let pad_pages = Tensor::from_slice(
-            &pad_handle
-                .page_ids
-                .iter()
-                .map(|&id| id as i64)
-                .collect::<Vec<_>>(),
-        )
-        .to_kind(Kind::Int)
-        .to_device(runner.device());
-        let pad_locations = &pad_pages * args.page_size as i64;
+        let pad_pages = Tensor::zeros([limit as i64], (Kind::Int, runner.device()));
+        let pad_locations = Tensor::zeros_like(&pad_pages);
         let mut graph_runner = Self {
             graphs: BTreeMap::new(),
-            pool,
-            pad_handle,
             pad_pages,
             pad_locations,
         };
@@ -246,7 +223,6 @@ impl GraphRunner {
 impl Drop for GraphRunner {
     fn drop(&mut self) {
         self.graphs.clear();
-        self.pool.borrow_mut().free(&mut self.pad_handle);
     }
 }
 
@@ -426,6 +402,7 @@ mod tests {
         v.copy_(&Tensor::randn(v.size(), (Kind::BFloat16, device)));
         let mut cache = BaseAttention::default();
         cache.bind_kv_cache(k.get(0), v.get(0)).unwrap();
+        cache.set_reserved_write_slot(0);
         let mut attention = Attention::new(
             "flashinfer",
             AttentionSpec {
@@ -454,7 +431,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(graph.graphs.keys().copied().collect::<Vec<_>>(), [1, 2, 4]);
-        assert_eq!(pool.borrow().free_count(), free - 4);
+        assert_eq!(pool.borrow().free_count(), free);
         let mut retained = None;
         for (iteration, (rows, len)) in [
             (1i64, 1i64),
@@ -475,7 +452,7 @@ mod tests {
                 let length = (len - row * 3).max(1);
                 lengths.push(length as i32);
                 let pages: Vec<i32> = (0..64)
-                    .map(|page| (row * 64 + (page + iteration as i64) % 64) as i32)
+                    .map(|page| (1 + row * 64 + (page + iteration as i64) % 64) as i32)
                     .collect();
                 locations
                     .push(pages[((length - 1) / 16) as usize] * 16 + ((length - 1) % 16) as i32);

@@ -225,17 +225,13 @@ extern "C" void* sglang_flashinfer_native_prefill_plan(
     using namespace flashinfer;
     auto created = existing ? nullptr : std::make_unique<NativePlan>();
     auto* plan = existing ? static_cast<NativePlan*>(existing) : created.get();
-    int device, sms;
-    auto status = cudaGetDevice(&device);
-    if (status == cudaSuccess)
-      status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    size_t float_bytes = 0, int_bytes = 0;
+    // Use the planner's official sizing pass rather than duplicating its layout.
+    // 0.6.18 requires uniform_q_len; -1 denotes heterogeneous query lengths.
+    auto status = PrefillPlanWorkspaceSize<int32_t>(float_bytes, int_bytes,
+        q_host, kv_host, rows, batch, q_heads, kv_heads, 128, 128, page_size,
+        false, 2, -1, -1, false, 0, -1, reinterpret_cast<cudaStream_t>(stream));
     if (status != cudaSuccess) { *error = cudaGetErrorString(status); return nullptr; }
-    auto estimate = PrefillSplitQOKVIndptr(q_host, kv_host, rows, batch,
-        q_heads, kv_heads, 128, page_size, 2 * sms / kv_heads, false, -1, -1, false);
-    const size_t padded = std::get<2>(estimate), tile = std::get<3>(estimate);
-    const size_t int_bytes = padded * 13 + (size_t(batch) + rows + 2) * 4 + 256;
-    const size_t float_bytes = std::get<0>(estimate)
-        ? size_t(q_heads) * padded * tile * 129 * sizeof(float) + 64 : 1;
     if ((status = plan->reserve(plan->float_workspace, plan->float_capacity, float_bytes, false)) != cudaSuccess ||
         (status = plan->reserve(plan->int_workspace, plan->int_capacity, int_bytes, false)) != cudaSuccess ||
         (status = plan->reserve(plan->pinned_int_workspace, plan->pinned_capacity, int_bytes, true)) != cudaSuccess) {
@@ -244,7 +240,7 @@ extern "C" void* sglang_flashinfer_native_prefill_plan(
     status = PrefillPlan<int32_t>(plan->float_workspace, plan->float_capacity,
         plan->int_workspace, plan->pinned_int_workspace, plan->int_capacity,
         plan->prefill_info, q_host, kv_host, rows, batch, q_heads, kv_heads,
-        128, 128, page_size, false, 2, -1, -1, false, 0,
+        128, 128, page_size, false, 2, -1, -1, false, 0, -1,
         reinterpret_cast<cudaStream_t>(stream));
     if (status != cudaSuccess) { *error = cudaGetErrorString(status); return nullptr; }
     return existing ? existing : created.release();

@@ -16,7 +16,7 @@ pub(super) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
 }
 
 /// Consumes layer-owned activations; CUDA updates both buffers in place.
-/// The residual sum is rounded to the activation dtype before normalization.
+/// Normalize the full FP32 sum; store the residual rounded to activation dtype.
 pub(super) fn add_rms_norm(
     x: Tensor,
     residual: Tensor,
@@ -27,8 +27,9 @@ pub(super) fn add_rms_norm(
     if supports_cuda(&x) {
         return cuda::add_rms_norm(x, residual, weight, eps);
     }
-    let residual = x + residual;
-    (rms_norm(&residual, weight, eps), residual)
+    let sum = x.to_kind(Kind::Float) + residual.to_kind(Kind::Float);
+    let normalized = rms_norm(&sum, weight, eps).to_kind(x.kind());
+    (normalized, sum.to_kind(x.kind()))
 }
 
 pub(super) fn qk_norm(
@@ -307,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_add_norm_matches_rounded_residual_for_both_cuda_dtypes() {
+    fn fused_add_norm_matches_fp32_sum_for_both_cuda_dtypes() {
         if !Cuda::is_available() {
             return;
         }
@@ -319,16 +320,119 @@ mod tests {
                     let residual = Tensor::randn_like(&x);
                     let weight = Tensor::randn([width], (kind, Device::Cuda(0)));
                     let expected_residual = &x + &residual;
-                    let expected = rms_norm(&expected_residual, &weight, 1e-6);
+                    let expected = eager_norm(
+                        &(x.to_kind(Kind::Float) + residual.to_kind(Kind::Float)),
+                        &weight,
+                        1e-6,
+                    )
+                    .to_kind(kind);
                     let x_ptr = x.data_ptr();
                     let residual_ptr = residual.data_ptr();
                     let (actual, summed) = add_rms_norm(x, residual, &weight, 1e-6);
                     assert_eq!(actual.data_ptr(), x_ptr);
                     assert_eq!(summed.data_ptr(), residual_ptr);
                     assert_eq!(max_error(&summed, &expected_residual), 0.0);
-                    assert_eq!(max_error(&actual, &expected), 0.0);
+                    assert!(
+                        max_error(&actual, &expected)
+                            <= if kind == Kind::Half {
+                                0.0078125
+                            } else {
+                                0.0625
+                            }
+                    );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cuda_norm_handles_padded_rows_and_partial_head_warps() {
+        if !Cuda::is_available() {
+            return;
+        }
+        tch::manual_seed(41);
+        for kind in [Kind::BFloat16, Kind::Half] {
+            let tolerance = if kind == Kind::Half {
+                0.0078125
+            } else {
+                0.0625
+            };
+            for padding in [1, 16] {
+                let storage = Tensor::randn([5, 1024 + padding], (kind, Device::Cuda(0)));
+                let x = storage.narrow(1, 0, 1024);
+                let residual_storage = Tensor::randn_like(&storage);
+                let residual = residual_storage.narrow(1, 0, 1024);
+                let weight = Tensor::randn([1024], (kind, Device::Cuda(0)));
+                let expected_residual = &x + &residual;
+                let expected = eager_norm(
+                    &(x.to_kind(Kind::Float) + residual.to_kind(Kind::Float)),
+                    &weight,
+                    1e-6,
+                )
+                .to_kind(kind);
+                let padding_before = storage.narrow(1, 1024, padding).copy();
+                let residual_padding = residual_storage.narrow(1, 1024, padding).copy();
+                let (actual, summed) = add_rms_norm(x, residual, &weight, 1e-6);
+                assert!(summed.equal(&expected_residual));
+                assert!(max_error(&actual, &expected) <= tolerance);
+                assert!(storage.narrow(1, 1024, padding).equal(&padding_before));
+                assert!(
+                    residual_storage
+                        .narrow(1, 1024, padding)
+                        .equal(&residual_padding)
+                );
+            }
+            let packed = Tensor::randn([3, 7, 128], (kind, Device::Cuda(0)));
+            let q = packed.narrow(1, 0, 3);
+            let k = packed.narrow(1, 3, 2);
+            let v = packed.narrow(1, 5, 2).copy();
+            let qw = Tensor::randn([128], (kind, Device::Cuda(0)));
+            let kw = Tensor::randn([128], (kind, Device::Cuda(0)));
+            let expected_q = eager_norm(&q, &qw, 1e-6);
+            let expected_k = eager_norm(&k, &kw, 1e-6);
+            let (q, k) = qk_norm(&q, &k, &qw, &kw, 1e-6);
+            assert!(max_error(&q, &expected_q) <= tolerance);
+            assert!(max_error(&k, &expected_k) <= tolerance);
+            assert!(packed.narrow(1, 5, 2).equal(&v));
+        }
+    }
+}
+
+#[cfg(test)]
+mod residual_semantics_tests {
+    use super::*;
+
+    #[test]
+    fn normalization_uses_unrounded_fp32_residual_sum() {
+        let mut devices = vec![Device::Cpu];
+        #[cfg(has_qwen3_cuda)]
+        if tch::Cuda::is_available() {
+            devices.push(Device::Cuda(0));
+        }
+        for device in devices.drain(..) {
+            let x = Tensor::ones([1, 1024], (Kind::BFloat16, device));
+            let residual = Tensor::from_slice(&[0.00390625f32, 0.0078125])
+                .to_kind(Kind::BFloat16)
+                .to_device(device)
+                .view([1, 2])
+                .repeat([1, 512]);
+            let weight = Tensor::ones([1024], (Kind::BFloat16, device));
+            let rounded = rms_norm(&(&x + &residual), &weight, 1e-6);
+            let expected = Tensor::ones_like(&x);
+            assert!(
+                !rounded.equal(&expected),
+                "fixture must distinguish the old semantics"
+            );
+            let (actual, sum) = add_rms_norm(x, residual, &weight, 1e-6);
+            assert!(actual.equal(&expected));
+            assert!(
+                sum.narrow(1, 0, 2).equal(
+                    &Tensor::from_slice(&[1f32, 1.0078125])
+                        .to_kind(Kind::BFloat16)
+                        .to_device(device)
+                        .view([1, 2])
+                )
+            );
         }
     }
 }

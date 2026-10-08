@@ -15,6 +15,7 @@ esac
 
 if [[ ! -x "${venv_dir}/bin/python" ]]; then
     echo "找不到 Python 虚拟环境：${venv_dir}（可通过 VENV_DIR 指定）" >&2
+    echo "请在项目目录执行 uv sync --locked --group dev；Linux CUDA 环境加 --extra cuda。" >&2
     exit 1
 fi
 venv_dir="$(cd "${venv_dir}" && pwd)"
@@ -27,7 +28,7 @@ for candidate in "${venv_dir}"/lib/python*/site-packages/torch/lib; do
     fi
 done
 if [[ -z "${torch_lib}" ]]; then
-    echo "在 ${venv_dir} 中找不到 PyTorch/libtorch，请先安装与 tch 兼容的 PyTorch。" >&2
+    echo "在 ${venv_dir} 中找不到 PyTorch/libtorch，请用 uv sync --locked --group dev 同步环境（Linux CUDA 加 --extra cuda）。" >&2
     exit 1
 fi
 
@@ -94,7 +95,7 @@ if [[ "${attention_backend,,}" == "flashinfer" ]]; then
         fi
     done
     if [[ -z "${flashinfer_header}" ]]; then
-        echo "FlashInfer 头文件不可用：请在 VENV_DIR 指向的环境中安装 flashinfer-python。" >&2
+        echo "FlashInfer 头文件不可用：请执行 uv sync --locked --extra cuda --group dev。" >&2
         exit 1
     fi
 fi
