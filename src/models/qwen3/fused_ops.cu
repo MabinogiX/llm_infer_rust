@@ -4,6 +4,13 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <algorithm>
+#include <qknorm.cuh>
+
+#ifdef SGLANG_USE_FLASHINFER_NORM
+#include <flashinfer/norm.cuh>
+#endif
 
 namespace {
 
@@ -87,15 +94,15 @@ __global__ void add_norm_kernel(T* x, T* residual, const T* weight,
   T* sum_row = residual + blockIdx.x * residual_stride;
   float sum = 0.0f;
   for (int64_t i = threadIdx.x; i < width; i += blockDim.x) {
-    // Match the existing separate BF16/FP16 add before the FP32 RMS reduction.
-    const T rounded = from_float<T>(as_float(input[i]) + as_float(sum_row[i]));
-    sum_row[i] = rounded;
-    const float value = as_float(rounded);
+    const float value = as_float(input[i]) + as_float(sum_row[i]);
     sum += value * value;
   }
   const float scale = rsqrtf(block_sum(sum) / width + eps);
-  for (int64_t i = threadIdx.x; i < width; i += blockDim.x)
-    input[i] = from_float<T>(as_float(sum_row[i]) * scale * as_float(weight[i]));
+  for (int64_t i = threadIdx.x; i < width; i += blockDim.x) {
+    const float value = as_float(input[i]) + as_float(sum_row[i]);
+    sum_row[i] = from_float<T>(value);
+    input[i] = from_float<T>(value * scale * as_float(weight[i]));
+  }
 }
 
 template <typename T>
@@ -163,6 +170,37 @@ __global__ void silu_mul_vector_kernel(const T* gate_up, T* out,
   reinterpret_cast<uint4*>(out)[index] = result;
 }
 
+// Launch the vendored upstream device algorithm on the ATen current stream.
+template <int64_t D, typename T>
+const char* launch_upstream_qk(sglang::QKNormParams params, cudaStream_t stream) {
+  constexpr bool warp = D <= 256;
+  constexpr int threads = [] {
+    if constexpr (warp) return 128;
+    else return int(sglang::host::norm::get_cta_threads<T, D>());
+  }();
+  auto kernel = [] {
+    if constexpr (warp) return sglang::fused_qknorm_warp<D, false, T>;
+    else return sglang::fused_qknorm_cta<D, false, T>;
+  }();
+  int occupancy = 1, device = 0, sms = 1;
+  auto status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, threads, 0);
+  if (status != cudaSuccess) return cudaGetErrorString(status);
+  status = cudaGetDevice(&device);
+  if (status != cudaSuccess) return cudaGetErrorString(status);
+  status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  if (status != cudaSuccess) return cudaGetErrorString(status);
+  const int64_t works = int64_t(params.num_tokens) * (params.num_qo_heads + params.num_kv_heads);
+  const int64_t needed = warp ? (works + 3) / 4 : works;
+  const dim3 blocks(std::min<int64_t>(sms * occupancy, needed));
+  void* args[] = {&params};
+  status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel), blocks, dim3(threads), args, 0, stream);
+  return status == cudaSuccess ? nullptr : cudaGetErrorString(status);
+}
+
+bool aligned(const void* pointer, uintptr_t alignment) {
+  return reinterpret_cast<uintptr_t>(pointer) % alignment == 0;
+}
+
 const char* launch_error() {
   const cudaError_t status = cudaGetLastError();
   return status == cudaSuccess ? nullptr : cudaGetErrorString(status);
@@ -175,6 +213,31 @@ extern "C" const char* sglang_qwen3_native_norm(
     double eps, int dtype, void* stream) {
   const dim3 grid(tokens * heads);
   auto cuda_stream = static_cast<cudaStream_t>(stream);
+  if (tokens == 0) return nullptr;
+#ifdef SGLANG_USE_FLASHINFER_NORM
+  // Official FlashInfer implementation supports a separate input row stride.
+  // Its vector loads require aligned row starts; unusual layouts use fallback.
+  if (heads == 1 && width > 0 && width % 8 == 0 && token_stride % 8 == 0 &&
+      width <= std::numeric_limits<uint32_t>::max() &&
+      tokens <= std::numeric_limits<uint32_t>::max() &&
+      token_stride > 0 && token_stride <= std::numeric_limits<uint32_t>::max() &&
+      aligned(x, 16) && aligned(weight, 16) && aligned(out, 16)) {
+    cudaError_t status;
+    if (dtype == 0)
+      status = flashinfer::norm::RMSNorm(
+          const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(x)),
+          const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(weight)),
+          static_cast<__nv_bfloat16*>(out), tokens, width, token_stride, width,
+          static_cast<float>(eps), false, cuda_stream);
+    else
+      status = flashinfer::norm::RMSNorm(
+          const_cast<__half*>(static_cast<const __half*>(x)),
+          const_cast<__half*>(static_cast<const __half*>(weight)),
+          static_cast<__half*>(out), tokens, width, token_stride, width,
+          static_cast<float>(eps), false, cuda_stream);
+    return status == cudaSuccess ? launch_error() : cudaGetErrorString(status);
+  }
+#endif
   if (dtype == 0)
     norm_kernel<<<grid, 256, 0, cuda_stream>>>(
         static_cast<const __nv_bfloat16*>(x), static_cast<const __nv_bfloat16*>(weight),
@@ -196,6 +259,29 @@ extern "C" const char* sglang_qwen3_native_qk_norm(
     double eps, int dtype, void* stream) {
   const dim3 grid(tokens * (qheads + kheads));
   auto cuda_stream = static_cast<cudaStream_t>(stream);
+  if (tokens == 0) return nullptr;
+  if ((width == 64 || width == 128 || width == 256 || width == 512 || width == 1024) &&
+      q_head_stride == width && k_head_stride == width &&
+      q_token_stride % 8 == 0 && k_token_stride % 8 == 0 &&
+      aligned(q, 16) && aligned(k, 16) && aligned(qw, 16) && aligned(kw, 16)) {
+    sglang::QKNormParams params{q,
+        static_cast<char*>(k) - 2 * qheads * width,
+        q_token_stride, k_token_stride, static_cast<uint32_t>(qheads),
+        static_cast<uint32_t>(kheads), static_cast<float>(eps), qw, kw,
+        static_cast<uint32_t>(tokens)};
+#define LAUNCH_QK(D) \
+    if (dtype == 0) return launch_upstream_qk<D, __nv_bfloat16>(params, cuda_stream); \
+    else return launch_upstream_qk<D, __half>(params, cuda_stream)
+    switch (width) {
+      case 64: LAUNCH_QK(64); break;
+      case 128: LAUNCH_QK(128); break;
+      case 256: LAUNCH_QK(256); break;
+      case 512: LAUNCH_QK(512); break;
+      case 1024: LAUNCH_QK(1024); break;
+    }
+#undef LAUNCH_QK
+    return launch_error();
+  }
   if (dtype == 0)
     qk_norm_kernel<<<grid, 256, 0, cuda_stream>>>(
         static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(k),
@@ -217,6 +303,27 @@ extern "C" const char* sglang_qwen3_native_add_norm(
     double eps, int dtype, void* stream) {
   if (tokens == 0) return nullptr;
   auto cuda_stream = static_cast<cudaStream_t>(stream);
+#ifdef SGLANG_USE_FLASHINFER_NORM
+  if (width > 0 && width <= 16384 && width % 8 == 0 &&
+      x_stride > 0 && residual_stride > 0 && x_stride % 8 == 0 && residual_stride % 8 == 0 &&
+      tokens <= std::numeric_limits<uint32_t>::max() &&
+      x_stride <= std::numeric_limits<uint32_t>::max() &&
+      residual_stride <= std::numeric_limits<uint32_t>::max() &&
+      aligned(x, 16) && aligned(residual, 16) && aligned(weight, 16)) {
+    cudaError_t status;
+    if (dtype == 0)
+      status = flashinfer::norm::FusedAddRMSNorm(
+          static_cast<__nv_bfloat16*>(x), static_cast<__nv_bfloat16*>(residual),
+          const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(weight)),
+          tokens, width, x_stride, residual_stride, static_cast<float>(eps), false, cuda_stream);
+    else
+      status = flashinfer::norm::FusedAddRMSNorm(
+          static_cast<__half*>(x), static_cast<__half*>(residual),
+          const_cast<__half*>(static_cast<const __half*>(weight)),
+          tokens, width, x_stride, residual_stride, static_cast<float>(eps), false, cuda_stream);
+    return status == cudaSuccess ? launch_error() : cudaGetErrorString(status);
+  }
+#endif
   if (dtype == 0)
     add_norm_kernel<<<tokens, 256, 0, cuda_stream>>>(
         static_cast<__nv_bfloat16*>(x), static_cast<__nv_bfloat16*>(residual),

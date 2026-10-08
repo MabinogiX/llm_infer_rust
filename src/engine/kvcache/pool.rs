@@ -82,7 +82,9 @@ impl KVCacheLayout {
         [
             2,
             self.num_layers,
-            self.num_pages,
+            self.num_pages.checked_add(1).ok_or_else(|| {
+                KVCacheError::InvalidArgument("KV page count overflow".to_owned())
+            })?,
             self.page_size,
             self.num_kv_heads,
             self.head_dim,
@@ -114,11 +116,13 @@ impl KVCachePool {
     pub fn new(layout: KVCacheLayout, kind: Kind, device: Device) -> Result<Self> {
         let shape = layout.tensor_shape()?;
         let buffer = Tensor::f_empty(shape, (kind, device))?;
+        // Physical page 0 is a permanent zero-valued CUDA-graph sink.
+        let _ = buffer.narrow(2, 0, 1).zero_();
 
         Ok(Self {
             layout,
             buffer: Some(buffer),
-            free_pages: (0..layout.num_pages).collect(),
+            free_pages: (1..=layout.num_pages).collect(),
         })
     }
 
@@ -128,7 +132,7 @@ impl KVCachePool {
         Self {
             layout,
             buffer: None,
-            free_pages: (0..layout.num_pages).collect(),
+            free_pages: (1..=layout.num_pages).collect(),
         }
     }
 
@@ -160,6 +164,13 @@ impl KVCachePool {
                 .iter()
                 .all(|owner| *owner == PageOwner::Private)
         );
+        assert!(
+            handle
+                .page_ids
+                .iter()
+                .all(|&id| id > 0 && id <= self.layout.num_pages),
+            "invalid or reserved KV page returned to pool"
+        );
         self.free_pages.append(&mut handle.page_ids);
         handle.owners.clear();
         handle.cached_len = 0;
@@ -169,7 +180,13 @@ impl KVCachePool {
 
     /// Return pages owned by a future cache manager, such as a radix tree.
     pub fn free_pages_by_id(&mut self, page_ids: impl IntoIterator<Item = usize>) {
-        self.free_pages.extend(page_ids);
+        for id in page_ids {
+            assert!(
+                id > 0 && id <= self.layout.num_pages,
+                "invalid or reserved KV page returned to pool"
+            );
+            self.free_pages.push(id);
+        }
     }
 
     pub fn free_count(&self) -> usize {
@@ -182,7 +199,7 @@ impl KVCachePool {
     }
 
     /// Return `(k_cache, v_cache)`, each shaped
-    /// `(num_layers, num_pages, page_size, num_kv_heads, head_dim)`.
+    /// `(num_layers, num_pages + 1, page_size, num_kv_heads, head_dim)`.
     pub fn get_all_kv_cache(&self) -> Result<(Tensor, Tensor)> {
         let buffer = self.buffer.as_ref().ok_or(KVCacheError::NotImplemented(
             "无 libtorch buffer 的 KVCachePool 不能提供 K/V tensor",
@@ -213,7 +230,7 @@ mod tests {
         let mut first = pool.alloc(3).unwrap();
         let mut second = pool.alloc(2).unwrap();
 
-        assert_eq!(first.page_ids, vec![9, 8, 7]);
+        assert_eq!(first.page_ids, vec![10, 9, 8]);
         assert_eq!(pool.free_count(), 5);
         pool.free(&mut first);
         assert_eq!(pool.free_count(), 8);
@@ -249,7 +266,25 @@ mod tests {
         let pool = KVCachePool::new(layout, Kind::Float, Device::Cpu).unwrap();
         let (k_cache, v_cache) = pool.get_all_kv_cache().unwrap();
 
-        assert_eq!(k_cache.size(), vec![2, 3, 4, 5, 6]);
-        assert_eq!(v_cache.size(), vec![2, 3, 4, 5, 6]);
+        assert_eq!(k_cache.size(), vec![2, 4, 4, 5, 6]);
+        assert_eq!(v_cache.size(), vec![2, 4, 4, 5, 6]);
+    }
+    #[test]
+    fn reserved_page_zero_is_initialized_and_never_allocated() {
+        let layout = KVCacheLayout::new(1, 3, 4, 1, 2).unwrap();
+        let mut pool = KVCachePool::new(layout, Kind::Float, Device::Cpu).unwrap();
+        let (k, v) = pool.get_all_kv_cache().unwrap();
+        assert_eq!(
+            k.get(0).get(0).abs().sum(Kind::Float).double_value(&[]),
+            0.0
+        );
+        assert_eq!(
+            v.get(0).get(0).abs().sum(Kind::Float).double_value(&[]),
+            0.0
+        );
+        let mut handle = pool.alloc(3).unwrap();
+        assert_eq!(handle.page_ids, vec![3, 2, 1]);
+        pool.free(&mut handle);
+        assert!(!pool.free_page_ids().contains(&0));
     }
 }

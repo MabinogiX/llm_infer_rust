@@ -298,6 +298,15 @@ impl ModelExecutor for Qwen3ForCausalLM {
         self.load_weights_impl(weights)
     }
 
+    fn set_kv_reserved_slot(&mut self, slot: i64) {
+        for layer in &self.layers {
+            layer
+                .base_attention
+                .borrow_mut()
+                .set_reserved_write_slot(slot);
+        }
+    }
+
     fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {
         self.prefill_graphs.get_mut().clear();
         if k_cache.dim() != 5

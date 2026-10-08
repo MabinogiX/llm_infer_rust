@@ -85,6 +85,7 @@ pub trait DecodeGraphState {
 
 /// Boundary implemented by the future Rust model architecture.
 pub trait ModelExecutor {
+    fn set_kv_reserved_slot(&mut self, _slot: i64) {}
     /// Configure model-specific segmented prefill capture; zero clears/disables.
     fn configure_prefill_graph(&mut self, _max_tokens: usize) {}
 
@@ -199,6 +200,10 @@ impl ModelRunner {
     pub fn load_weights(&mut self, weights: ModelWeights) -> Result<usize> {
         self.clear_graphs();
         self.model.load_weights(weights)
+    }
+
+    pub fn set_kv_reserved_slot(&mut self, slot: i64) {
+        self.model.set_kv_reserved_slot(slot);
     }
 
     pub fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {

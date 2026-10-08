@@ -4,6 +4,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_cuda_graph)");
     println!("cargo:rustc-check-cfg=cfg(has_flashinfer)");
     println!("cargo:rustc-check-cfg=cfg(has_qwen3_cuda)");
+    println!("cargo:rustc-check-cfg=cfg(has_cuda_kv_store)");
+    println!("cargo:rerun-if-changed=src/models/attention/kv_store_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/models/attention/kv_store.cu");
     println!("cargo:rerun-if-changed=src/engine/cuda_graph_bridge.cpp");
     println!("cargo:rerun-if-changed=src/engine/sampling_bridge.cpp");
     println!("cargo:rerun-if-changed=src/engine/sampling_flashinfer.cu");
@@ -11,6 +14,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/models/attention/flashinfer_plan_run.cu");
     println!("cargo:rerun-if-changed=src/models/qwen3/fused_ops_bridge.cpp");
     println!("cargo:rerun-if-changed=src/models/qwen3/fused_ops.cu");
+    println!("cargo:rerun-if-changed=third_party/sglang");
     println!("cargo:rerun-if-env-changed=VIRTUAL_ENV");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=FLASHINFER_CUDA_ARCH");
@@ -52,10 +56,21 @@ fn main() {
     println!("cargo:rustc-cfg=has_cuda_graph");
 
     let arch = env::var("FLASHINFER_CUDA_ARCH").unwrap_or_else(|_| "80".to_owned());
+    let flashinfer_include = env::var("VIRTUAL_ENV").ok().and_then(|venv| {
+        fs::read_dir(Path::new(&venv).join("lib"))
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path().join("site-packages/flashinfer/data/include"))
+                    .find(|path| path.join("flashinfer/attention/decode.cuh").exists())
+            })
+    });
     let mut fused_bridge = cc::Build::new();
     fused_bridge
         .cpp(true)
         .file("src/models/qwen3/fused_ops_bridge.cpp")
+        .file("src/models/attention/kv_store_bridge.cpp")
         .flag_if_supported("-std=c++20")
         .warnings(false)
         .define("_GLIBCXX_USE_CXX11_ABI", abi);
@@ -69,26 +84,35 @@ fn main() {
         .debug(false)
         .opt_level(3)
         .file("src/models/qwen3/fused_ops.cu")
-        .flag("-std=c++17")
+        .file("src/models/attention/kv_store.cu")
+        .include("third_party/sglang")
+        .include("third_party/sglang/include")
+        .flag(&format!("-DSGL_CUDA_ARCH={arch}0"))
+        .flag("-std=c++20")
+        .flag("--expt-relaxed-constexpr")
+        .flag("-UNDEBUG")
         .flag(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
         .warnings(false);
+    if let Some(include) = &flashinfer_include {
+        let data = include.parent().unwrap();
+        println!("cargo:rerun-if-changed={}", include.display());
+        fused_kernels
+            .define("SGLANG_USE_FLASHINFER_NORM", None)
+            .include(include)
+            .include(data.join("cccl/libcudacxx/include"))
+            .include(data.join("cccl/cub"))
+            .include(data.join("cccl/thrust"));
+    }
     fused_kernels.compile("sglang_qwen3_fused_kernels");
     println!("cargo:rustc-cfg=has_qwen3_cuda");
+    println!("cargo:rustc-cfg=has_cuda_kv_store");
 
     // Compile the thin native adapter against the wheel's official CUDA headers.
-    let Ok(venv) = env::var("VIRTUAL_ENV") else {
-        return;
-    };
-    let Ok(python_libs) = fs::read_dir(Path::new(&venv).join("lib")) else {
-        return;
-    };
-    let flashinfer_include = python_libs
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("site-packages/flashinfer/data/include"))
-        .find(|path| path.join("flashinfer/attention/decode.cuh").exists());
     let Some(flashinfer_include) = flashinfer_include else {
         return;
     };
+    // Wheel upgrades must rebuild the adapter even when Rust sources are unchanged.
+    println!("cargo:rerun-if-changed={}", flashinfer_include.display());
     let flashinfer_data = flashinfer_include.parent().unwrap();
     let mut flashinfer_build = cc::Build::new();
     flashinfer_build

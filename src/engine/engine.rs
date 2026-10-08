@@ -390,6 +390,7 @@ impl Engine {
         let (k_cache, v_cache) = self.kv_cache_pool()?.get_all_kv_cache()?;
         let mut model_runner = model_runner;
         model_runner.bind_kv_cache(k_cache, v_cache)?;
+        model_runner.set_kv_reserved_slot(0);
         self.model_runner = Some(model_runner);
         Ok(())
     }

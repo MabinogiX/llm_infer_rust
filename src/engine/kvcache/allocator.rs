@@ -99,7 +99,8 @@ impl KVCacheAllocator {
             .and_then(|bytes| bytes.checked_mul(model.head_dim))
             .and_then(|bytes| bytes.checked_mul(dtype_itemsize))
             .ok_or_else(|| KVCacheError::InvalidArgument("bytes per page overflow".to_owned()))?;
-        let pages_that_fit = usize::max(1, available / bytes_per_page);
+        // Account for the permanent reserved physical page as well as real pages.
+        let pages_that_fit = (available / bytes_per_page).saturating_sub(1).max(1);
         let pages_per_request = server.max_seq_len / server.page_size + 1;
         let max_pages_needed = server.max_running_req.saturating_mul(pages_per_request);
 
