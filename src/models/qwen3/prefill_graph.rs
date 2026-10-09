@@ -300,7 +300,7 @@ mod cuda_tests {
         Tensor,
         Tensor,
     ) {
-        let config = ModelArgs {
+        let config = Qwen3Config {
             hidden_size: 64,
             num_layers: 3,
             num_attention_heads: 2,

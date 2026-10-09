@@ -12,7 +12,7 @@ use std::{
 
 use tch::{Device, Kind, TchError, Tensor};
 
-use super::{ModelArgs, ModelExecutor, ModelRunnerError};
+use super::{ModelExecutor, ModelRunnerError, RuntimeModelConfig};
 
 #[derive(Debug)]
 pub enum ModelLoadError {
@@ -59,24 +59,23 @@ pub type Result<T> = std::result::Result<T, ModelLoadError>;
 /// trait here lets Engine own the same construction lifecycle as mini-sglang
 /// without hard-coding an architecture that has not been migrated.
 pub trait ModelFactory {
+    /// Check that runtime geometry matches the model configuration and that the
+    /// execution combination is supported, before model or weight allocation.
+    fn validate_runtime(
+        &self,
+        runtime_config: RuntimeModelConfig,
+        kind: Kind,
+        device: Device,
+        attention_backend: &str,
+    ) -> std::result::Result<(), ModelRunnerError>;
+
+    /// Construct the model using its already parsed, model-specific configuration.
     fn create(
         &self,
-        model_args: ModelArgs,
         kind: Kind,
         device: Device,
+        attention_backend: &str,
     ) -> std::result::Result<Box<dyn ModelExecutor>, ModelRunnerError>;
-
-    /// Creates a model with the engine-selected attention implementation.
-    /// Factories without native attention can use the compatibility default.
-    fn create_with_attention_backend(
-        &self,
-        model_args: ModelArgs,
-        kind: Kind,
-        device: Device,
-        _attention_backend: &str,
-    ) -> std::result::Result<Box<dyn ModelExecutor>, ModelRunnerError> {
-        self.create(model_args, kind, device)
-    }
 }
 
 /// Named tensors read from a Hugging Face safetensors checkpoint.

@@ -96,7 +96,7 @@ pub trait ModelExecutor {
 
     /// Whether decode forwards can be safely captured as CUDA Graphs.
     fn supports_cuda_graph(&self) -> bool {
-        true
+        false
     }
 
     fn prepare_decode_graph(

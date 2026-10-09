@@ -352,6 +352,10 @@ mod tests {
     }
 
     impl ModelExecutor for DecodeModel {
+        fn supports_cuda_graph(&self) -> bool {
+            self.attention.supports_cuda_graph()
+        }
+
         fn prepare_decode_graph(
             &self,
             metadata: &AttentionMetadata,

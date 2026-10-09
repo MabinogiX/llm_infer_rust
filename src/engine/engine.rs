@@ -60,117 +60,28 @@ impl ServerArgs {
     }
 }
 
-/// Model architecture values required to size the KV cache.
+/// Architecture-independent information consumed by the current paged-KV runtime.
+/// Model computation fields belong to the concrete model's configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelArgs {
-    pub hidden_size: usize,
+pub struct RuntimeModelConfig {
     pub num_layers: usize,
-    pub num_attention_heads: usize,
     pub num_kv_heads: usize,
-    pub intermediate_size: usize,
-    pub vocab_size: usize,
     pub head_dim: usize,
+    pub vocab_size: usize,
     pub max_position_embeddings: usize,
-    pub rope_theta: f64,
-    pub rms_norm_eps: f64,
-    pub tie_word_embeddings: bool,
-    pub qk_norm: bool,
+    pub checkpoint_kind: Kind,
 }
 
-impl Default for ModelArgs {
+impl Default for RuntimeModelConfig {
     fn default() -> Self {
         Self {
-            hidden_size: 0,
             num_layers: 0,
-            num_attention_heads: 0,
             num_kv_heads: 0,
-            intermediate_size: 0,
-            vocab_size: 0,
             head_dim: 0,
+            vocab_size: 0,
             max_position_embeddings: 8192,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            tie_word_embeddings: false,
-            qk_norm: false,
+            checkpoint_kind: Kind::Float,
         }
-    }
-}
-
-impl ModelArgs {
-    /// Reads Qwen-compatible architecture fields from Hugging Face `config.json`.
-    pub fn from_pretrained(model_path: impl AsRef<Path>) -> Result<Self> {
-        let config_path = model_path.as_ref().join("config.json");
-        let contents = std::fs::read_to_string(&config_path).map_err(|error| {
-            EngineError::InvalidModelConfig {
-                path: config_path.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        let config: serde_json::Value =
-            serde_json::from_str(&contents).map_err(|error| EngineError::InvalidModelConfig {
-                path: config_path.clone(),
-                message: error.to_string(),
-            })?;
-        let required_usize = |name: &str| -> Result<usize> {
-            config
-                .get(name)
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| EngineError::InvalidModelConfig {
-                    path: config_path.clone(),
-                    message: format!("missing or invalid integer field {name}"),
-                })
-        };
-        let optional_usize = |name: &str, default: usize| -> Result<usize> {
-            match config.get(name) {
-                None | Some(serde_json::Value::Null) => Ok(default),
-                Some(value) => value
-                    .as_u64()
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| EngineError::InvalidModelConfig {
-                        path: config_path.clone(),
-                        message: format!("invalid integer field {name}"),
-                    }),
-            }
-        };
-        let hidden_size = required_usize("hidden_size")?;
-        let num_attention_heads = required_usize("num_attention_heads")?;
-        let head_dim = optional_usize(
-            "head_dim",
-            hidden_size
-                .checked_div(num_attention_heads)
-                .ok_or_else(|| EngineError::InvalidModelConfig {
-                    path: config_path.clone(),
-                    message: "num_attention_heads must be greater than zero".to_owned(),
-                })?,
-        )?;
-
-        Ok(Self {
-            hidden_size,
-            num_layers: optional_usize("num_hidden_layers", 0)?,
-            num_attention_heads,
-            num_kv_heads: optional_usize("num_key_value_heads", num_attention_heads)?,
-            intermediate_size: optional_usize("intermediate_size", 0)?,
-            vocab_size: optional_usize("vocab_size", 0)?,
-            head_dim,
-            max_position_embeddings: optional_usize("max_position_embeddings", 8192)?,
-            rope_theta: config
-                .get("rope_theta")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(10_000.0),
-            rms_norm_eps: config
-                .get("rms_norm_eps")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(1e-6),
-            tie_word_embeddings: config
-                .get("tie_word_embeddings")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            qk_norm: config
-                .get("qk_norm")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-        })
     }
 }
 
@@ -245,7 +156,7 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 /// Owns Rust-side engine state during the gradual migration.
 pub struct Engine {
     server_args: ServerArgs,
-    model_args: ModelArgs,
+    runtime_config: RuntimeModelConfig,
     tp_rank: usize,
     device: Device,
     kind: Kind,
@@ -257,48 +168,67 @@ pub struct Engine {
 impl Engine {
     /// Builds a CPU, float32 engine. Use [`Self::with_runtime`] to select a
     /// different libtorch device or element type.
-    pub fn new(server_args: ServerArgs, model_args: ModelArgs, tp_rank: usize) -> Result<Self> {
-        Self::with_runtime(server_args, model_args, tp_rank, Kind::Float, Device::Cpu)
+    pub fn new(
+        server_args: ServerArgs,
+        runtime_config: RuntimeModelConfig,
+        tp_rank: usize,
+    ) -> Result<Self> {
+        Self::with_runtime(
+            server_args,
+            runtime_config,
+            tp_rank,
+            Kind::Float,
+            Device::Cpu,
+        )
     }
 
     /// Loads model weights before sizing the KV cache against remaining GPU memory.
     pub fn load_for_serving(
         server_args: ServerArgs,
-        model_args: ModelArgs,
+        runtime_config: RuntimeModelConfig,
         tp_rank: usize,
         factory: &dyn ModelFactory,
     ) -> Result<Self> {
-        validate_model_path(&server_args.model_path)?;
-        validate_parallelism(server_args.tp_size, tp_rank)?;
-        if server_args.tp_size > 1 {
-            return Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"));
-        }
-        validate_max_seq_len(&server_args, model_args)?;
-        let device = resolve_device(&server_args.device, Cuda::is_available())?;
-        let kind = resolve_kind(&server_args.dtype, &server_args.model_path, device)?;
-        let model = factory.create_with_attention_backend(
-            model_args,
-            kind,
-            device,
-            &server_args.attention_backend,
-        )?;
+        let (kind, device) =
+            Self::validate_for_serving(&server_args, runtime_config, tp_rank, factory)?;
+        let model = factory.create(kind, device, &server_args.attention_backend)?;
         let mut runner = ModelRunner::new(model, device);
         let weights = load_hf_safetensors(&server_args.model_path).map_err(|error| {
             EngineError::InvalidArgument(format!("Hugging Face 权重加载失败: {error}"))
         })?;
         runner.load_weights(weights)?;
 
-        let mut engine = Self::with_runtime(server_args, model_args, tp_rank, kind, device)?;
+        let mut engine = Self::with_runtime(server_args, runtime_config, tp_rank, kind, device)?;
         engine.attach_model_runner(runner)?;
         engine.capture_graphs()?;
         tracing::info!(?device, ?kind, "model loaded for inference");
         Ok(engine)
     }
 
+    /// Resolve and validate the execution combination before startup allocates tensors.
+    pub fn validate_for_serving(
+        server_args: &ServerArgs,
+        runtime_config: RuntimeModelConfig,
+        tp_rank: usize,
+        factory: &dyn ModelFactory,
+    ) -> Result<(Kind, Device)> {
+        validate_model_path(&server_args.model_path)?;
+        validate_parallelism(server_args.tp_size, tp_rank)?;
+        if server_args.tp_size > 1 {
+            return Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"));
+        }
+        validate_max_seq_len(&server_args, runtime_config)?;
+        let device = resolve_device(&server_args.device, Cuda::is_available())?;
+        let kind = resolve_kind(&server_args.dtype, runtime_config.checkpoint_kind, device)?;
+        KVCacheAllocator::new(allocation_config(server_args, runtime_config))?;
+        factory.validate_runtime(runtime_config, kind, device, &server_args.attention_backend)?;
+        Ok((kind, device))
+    }
+
     /// Validates configuration and allocates the libtorch-backed KV cache.
     pub fn with_runtime(
         server_args: ServerArgs,
-        model_args: ModelArgs,
+        runtime_config: RuntimeModelConfig,
         tp_rank: usize,
         kind: Kind,
         device: Device,
@@ -308,25 +238,13 @@ impl Engine {
         if server_args.tp_size > 1 {
             return Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"));
         }
-        validate_max_seq_len(&server_args, model_args)?;
-        let allocator = KVCacheAllocator::new(KVCacheAllocationConfig {
-            server: KVCacheServerConfig {
-                page_size: server_args.page_size,
-                max_running_req: server_args.max_running_req,
-                max_seq_len: server_args.max_seq_len,
-                memory_ratio: server_args.memory_ratio,
-            },
-            model: KVCacheModelConfig {
-                num_layers: model_args.num_layers,
-                num_kv_heads: model_args.num_kv_heads,
-                head_dim: model_args.head_dim,
-            },
-        })?;
+        validate_max_seq_len(&server_args, runtime_config)?;
+        let allocator = KVCacheAllocator::new(allocation_config(&server_args, runtime_config))?;
         let kv_cache_pool = allocator.allocate(kind, device, server_args.tp_size)?;
 
         Ok(Self {
             server_args,
-            model_args,
+            runtime_config,
             tp_rank,
             device,
             kind,
@@ -340,8 +258,8 @@ impl Engine {
         &self.server_args
     }
 
-    pub fn model_args(&self) -> ModelArgs {
-        self.model_args
+    pub fn runtime_config(&self) -> RuntimeModelConfig {
+        self.runtime_config
     }
 
     pub fn tp_rank(&self) -> usize {
@@ -405,12 +323,13 @@ impl Engine {
     /// Creates the selected Rust model and binds it to this Engine.
     pub fn build_model(&mut self, factory: &dyn ModelFactory) -> Result<()> {
         self.ensure_live()?;
-        let model = factory.create_with_attention_backend(
-            self.model_args,
+        factory.validate_runtime(
+            self.runtime_config,
             self.kind,
             self.device,
             &self.server_args.attention_backend,
         )?;
+        let model = factory.create(self.kind, self.device, &self.server_args.attention_backend)?;
         self.attach_model_runner(ModelRunner::new(model, self.device))
     }
 
@@ -484,17 +403,39 @@ impl Drop for Engine {
     }
 }
 
+fn allocation_config(
+    server_args: &ServerArgs,
+    runtime_config: RuntimeModelConfig,
+) -> KVCacheAllocationConfig {
+    KVCacheAllocationConfig {
+        server: KVCacheServerConfig {
+            page_size: server_args.page_size,
+            max_running_req: server_args.max_running_req,
+            max_seq_len: server_args.max_seq_len,
+            memory_ratio: server_args.memory_ratio,
+        },
+        model: KVCacheModelConfig {
+            num_layers: runtime_config.num_layers,
+            num_kv_heads: runtime_config.num_kv_heads,
+            head_dim: runtime_config.head_dim,
+        },
+    }
+}
+
 /// Rejects a context window larger than the model configuration before allocating memory.
-pub fn validate_max_seq_len(server_args: &ServerArgs, model_args: ModelArgs) -> Result<()> {
-    if model_args.max_position_embeddings == 0 {
+pub fn validate_max_seq_len(
+    server_args: &ServerArgs,
+    runtime_config: RuntimeModelConfig,
+) -> Result<()> {
+    if runtime_config.max_position_embeddings == 0 {
         return Err(EngineError::InvalidArgument(
             "模型配置 max_position_embeddings 必须大于 0".to_owned(),
         ));
     }
-    if server_args.max_seq_len > model_args.max_position_embeddings {
+    if server_args.max_seq_len > runtime_config.max_position_embeddings {
         return Err(EngineError::InvalidArgument(format!(
             "--max-seq-len {} 超过模型配置的 max_position_embeddings={}；请降低 --max-seq-len",
-            server_args.max_seq_len, model_args.max_position_embeddings
+            server_args.max_seq_len, runtime_config.max_position_embeddings
         )));
     }
     Ok(())
@@ -516,31 +457,19 @@ pub fn validate_model_path(model_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_kind(requested: &str, model_path: &Path, device: Device) -> Result<Kind> {
-    let name = if requested == "auto" {
-        let config = std::fs::read_to_string(model_path.join("config.json")).map_err(|error| {
-            EngineError::InvalidArgument(format!("读取模型 dtype 失败: {error}"))
-        })?;
-        let config: serde_json::Value = serde_json::from_str(&config).map_err(|error| {
-            EngineError::InvalidArgument(format!("解析模型 dtype 失败: {error}"))
-        })?;
-        config
-            .get("torch_dtype")
-            .or_else(|| config.get("dtype"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("float32")
-            .to_owned()
+fn resolve_kind(requested: &str, checkpoint_kind: Kind, device: Device) -> Result<Kind> {
+    let kind = if requested == "auto" {
+        checkpoint_kind
     } else {
-        requested.to_owned()
-    };
-    let kind = match name.as_str() {
-        "bfloat16" => Kind::BFloat16,
-        "float16" => Kind::Half,
-        "float32" => Kind::Float,
-        _ => {
-            return Err(EngineError::InvalidArgument(format!(
-                "不支持的模型 dtype: {name}"
-            )));
+        match requested {
+            "bfloat16" => Kind::BFloat16,
+            "float16" => Kind::Half,
+            "float32" => Kind::Float,
+            _ => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "不支持的模型 dtype: {requested}"
+                )));
+            }
         }
     };
     if matches!(device, Device::Cpu) && kind != Kind::Float {
@@ -603,14 +532,84 @@ mod tests {
         path
     }
 
-    fn model_args() -> ModelArgs {
-        ModelArgs {
+    fn runtime_config() -> RuntimeModelConfig {
+        RuntimeModelConfig {
             num_layers: 1,
             num_kv_heads: 1,
             head_dim: 1,
             max_position_embeddings: 4,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rejects_factory_runtime_mismatches_before_loading_or_binding() {
+        use crate::models::{Qwen3Factory, qwen3::Qwen3Config};
+
+        let path = model_dir();
+        let factory = Qwen3Factory {
+            config: Qwen3Config {
+                hidden_size: 4,
+                num_layers: 1,
+                num_attention_heads: 2,
+                num_kv_heads: 1,
+                intermediate_size: 8,
+                vocab_size: 8,
+                head_dim: 2,
+                max_position_embeddings: 4,
+                ..Default::default()
+            },
+        };
+        let expected = factory.config.runtime(Kind::Float);
+        for field in [
+            "num_layers",
+            "num_kv_heads",
+            "head_dim",
+            "vocab_size",
+            "context",
+        ] {
+            let mut runtime = expected;
+            match field {
+                "num_layers" => runtime.num_layers = 2,
+                "num_kv_heads" => runtime.num_kv_heads = 2,
+                "head_dim" => runtime.head_dim = 4,
+                "vocab_size" => runtime.vocab_size = 16,
+                "context" => runtime.max_position_embeddings = 8,
+                _ => unreachable!(),
+            }
+            let mut args = ServerArgs::new(&path);
+            args.device = "cpu".into();
+            args.max_seq_len = runtime.max_position_embeddings;
+            args.max_running_req = 1;
+            args.page_size = 2;
+            let error = Engine::load_for_serving(args.clone(), runtime, 0, &factory)
+                .err()
+                .expect("mismatch must fail before checkpoint loading");
+            assert!(
+                error.to_string().contains("does not match"),
+                "{field}: {error}"
+            );
+            let mut engine = Engine::new(args, runtime, 0).unwrap();
+            let error = engine
+                .build_model(&factory)
+                .expect_err("mismatch must fail before model binding");
+            assert!(
+                error.to_string().contains("does not match"),
+                "{field}: {error}"
+            );
+            assert!(matches!(
+                engine.model_runner(),
+                Err(EngineError::ModelRunnerNotAttached)
+            ));
+        }
+        let mut args = ServerArgs::new(&path);
+        args.max_seq_len = 4;
+        args.max_running_req = 1;
+        args.page_size = 2;
+        let mut engine = Engine::new(args, expected, 0).unwrap();
+        engine.build_model(&factory).unwrap();
+        assert!(engine.model_runner().is_ok());
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -623,22 +622,19 @@ mod tests {
     }
 
     #[test]
-    fn auto_dtype_uses_checkpoint_config_and_cpu_fallback() {
-        let path = model_dir();
-        fs::write(path.join("config.json"), r#"{"torch_dtype":"bfloat16"}"#).unwrap();
+    fn auto_dtype_uses_resolved_checkpoint_kind_and_cpu_fallback() {
         assert_eq!(
-            resolve_kind("auto", &path, Device::Cuda(0)).unwrap(),
+            resolve_kind("auto", Kind::BFloat16, Device::Cuda(0)).unwrap(),
             Kind::BFloat16
         );
         assert_eq!(
-            resolve_kind("auto", &path, Device::Cpu).unwrap(),
+            resolve_kind("auto", Kind::BFloat16, Device::Cpu).unwrap(),
             Kind::Float
         );
         assert_eq!(
-            resolve_kind("float32", &path, Device::Cuda(0)).unwrap(),
+            resolve_kind("float32", Kind::BFloat16, Device::Cuda(0)).unwrap(),
             Kind::Float
         );
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -649,12 +645,12 @@ mod tests {
         args.max_seq_len = 8;
         args.page_size = 2;
 
-        let error = Engine::new(args, model_args(), 0).err().unwrap();
+        let error = Engine::new(args, runtime_config(), 0).err().unwrap();
         assert!(error.to_string().contains("--max-seq-len 8"));
         assert!(error.to_string().contains("max_position_embeddings=4"));
         let mut at_limit = ServerArgs::new(&model_dir);
         at_limit.max_seq_len = 4;
-        assert!(validate_max_seq_len(&at_limit, model_args()).is_ok());
+        assert!(validate_max_seq_len(&at_limit, runtime_config()).is_ok());
         fs::remove_dir_all(model_dir).unwrap();
     }
 
@@ -665,7 +661,7 @@ mod tests {
         args.max_running_req = 1;
         args.max_seq_len = 2;
         args.page_size = 2;
-        let mut engine = Engine::new(args, model_args(), 0).unwrap();
+        let mut engine = Engine::new(args, runtime_config(), 0).unwrap();
 
         engine.cleanup();
         engine.cleanup();
@@ -686,41 +682,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_qwen_architecture_from_hugging_face_config() {
-        let path = model_dir();
-        fs::write(
-            path.join("config.json"),
-            r#"{
-                "hidden_size": 16,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "intermediate_size": 32,
-                "vocab_size": 64,
-                "max_position_embeddings": 128,
-                "rope_theta": 1000000.0,
-                "rms_norm_eps": 0.00001,
-                "tie_word_embeddings": true,
-                "qk_norm": true
-            }"#,
-        )
-        .unwrap();
-
-        let args = ModelArgs::from_pretrained(&path).unwrap();
-        assert_eq!(args.head_dim, 4);
-        assert_eq!(args.num_kv_heads, 2);
-        assert!(args.tie_word_embeddings);
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
     fn tensor_parallelism_is_explicitly_deferred() {
         let model_dir = model_dir();
         let mut args = ServerArgs::new(&model_dir);
         args.tp_size = 2;
 
         assert!(matches!(
-            Engine::new(args, model_args(), 0),
+            Engine::new(args, runtime_config(), 0),
             Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"))
         ));
         fs::remove_dir_all(model_dir).unwrap();
@@ -733,7 +701,7 @@ mod tests {
         args.max_running_req = 1;
         args.max_seq_len = 2;
         args.page_size = 2;
-        let engine = Engine::new(args, model_args(), 0).unwrap();
+        let engine = Engine::new(args, runtime_config(), 0).unwrap();
         let logits = Tensor::from_slice(&[0.1f32, 2.0, 0.2]).view([1, 3]);
 
         assert_eq!(
@@ -783,11 +751,22 @@ mod tests {
     struct LoadingFactory;
 
     impl ModelFactory for LoadingFactory {
-        fn create(
+        fn validate_runtime(
             &self,
-            _model_args: ModelArgs,
+            _runtime_config: RuntimeModelConfig,
             _kind: Kind,
             _device: Device,
+            _attention_backend: &str,
+        ) -> std::result::Result<(), ModelRunnerError> {
+            // This test executor has no model geometry or attention backend.
+            Ok(())
+        }
+
+        fn create(
+            &self,
+            _kind: Kind,
+            _device: Device,
+            _attention_backend: &str,
         ) -> std::result::Result<Box<dyn ModelExecutor>, ModelRunnerError> {
             Ok(Box::new(LoadingModel))
         }
@@ -800,7 +779,7 @@ mod tests {
         args.max_running_req = 1;
         args.max_seq_len = 2;
         args.page_size = 2;
-        let mut engine = Engine::new(args, model_args(), 0).unwrap();
+        let mut engine = Engine::new(args, runtime_config(), 0).unwrap();
         engine
             .attach_model_runner(ModelRunner::new(Box::new(EchoModel), Device::Cpu))
             .unwrap();
@@ -831,7 +810,7 @@ mod tests {
         args.max_running_req = 1;
         args.max_seq_len = 2;
         args.page_size = 2;
-        let mut engine = Engine::new(args, model_args(), 0).unwrap();
+        let mut engine = Engine::new(args, runtime_config(), 0).unwrap();
 
         engine.build_model(&LoadingFactory).unwrap();
         assert_eq!(engine.load_model_weights().unwrap(), 1);
@@ -853,7 +832,7 @@ mod tests {
         args.max_seq_len = 2;
         args.page_size = 2;
 
-        let engine = Engine::load_for_serving(args, model_args(), 0, &LoadingFactory).unwrap();
+        let engine = Engine::load_for_serving(args, runtime_config(), 0, &LoadingFactory).unwrap();
         assert_eq!(engine.device(), Device::Cpu);
         assert!(engine.model_runner().is_ok());
         let (k_cache, _) = engine.kv_cache_pool().unwrap().get_all_kv_cache().unwrap();

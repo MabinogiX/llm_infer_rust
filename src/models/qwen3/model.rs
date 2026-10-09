@@ -7,10 +7,11 @@ use std::{cell::RefCell, collections::HashMap};
 
 use tch::{Device, Kind, Tensor};
 
+use super::config::Qwen3Config;
 use super::ops::{RopeCache, add_rms_norm, qk_norm, rms_norm, silu_and_mul};
 use crate::engine::{
-    AttentionMetadata, BatchPhase, DecodeGraphState, ModelArgs, ModelExecutor, ModelFactory,
-    ModelRunnerError, ModelWeights,
+    AttentionMetadata, BatchPhase, DecodeGraphState, ModelExecutor, ModelFactory, ModelRunnerError,
+    ModelWeights, RuntimeModelConfig,
 };
 use crate::models::attention::{Attention, AttentionBatch, AttentionSpec, BaseAttention};
 use crate::profiling::{ModelProfiler, ModelStage};
@@ -22,28 +23,46 @@ use prefill_graph::PrefillGraphCache;
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
 /// Factory for the dense `Qwen3ForCausalLM` architecture.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Qwen3Factory;
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen3Factory {
+    pub config: Qwen3Config,
+}
 
 impl ModelFactory for Qwen3Factory {
-    fn create(
+    fn validate_runtime(
         &self,
-        model_args: ModelArgs,
+        runtime_config: RuntimeModelConfig,
         kind: Kind,
         device: Device,
-    ) -> Result<Box<dyn ModelExecutor>> {
-        Ok(Box::new(Qwen3ForCausalLM::new(model_args, kind, device)?))
+        attention_backend: &str,
+    ) -> Result<()> {
+        validate_config(self.config)?;
+        let expected = self.config.runtime(runtime_config.checkpoint_kind);
+        if runtime_config != expected {
+            return Err(model_error(&format!(
+                "runtime model configuration does not match Qwen3 config: expected {expected:?}, received {runtime_config:?}"
+            )));
+        }
+        Attention::validate(
+            attention_backend,
+            AttentionSpec {
+                num_heads: self.config.num_attention_heads as i64,
+                num_kv_heads: self.config.num_kv_heads as i64,
+                head_dim: self.config.head_dim as i64,
+                kind,
+                device,
+            },
+        )
     }
 
-    fn create_with_attention_backend(
+    fn create(
         &self,
-        model_args: ModelArgs,
         kind: Kind,
         device: Device,
         attention_backend: &str,
     ) -> Result<Box<dyn ModelExecutor>> {
         Ok(Box::new(Qwen3ForCausalLM::new_with_attention_backend(
-            model_args,
+            self.config,
             kind,
             device,
             attention_backend,
@@ -55,7 +74,7 @@ impl ModelFactory for Qwen3Factory {
 pub struct Qwen3ForCausalLM {
     // Drop captured segments before any parameters that their kernels reference.
     prefill_graphs: RefCell<PrefillGraphCache>,
-    config: ModelArgs,
+    config: Qwen3Config,
     device: Device,
     kind: Kind,
     attention: Attention,
@@ -67,12 +86,12 @@ pub struct Qwen3ForCausalLM {
 }
 
 impl Qwen3ForCausalLM {
-    pub fn new(config: ModelArgs, kind: Kind, device: Device) -> Result<Self> {
+    pub fn new(config: Qwen3Config, kind: Kind, device: Device) -> Result<Self> {
         Self::new_with_attention_backend(config, kind, device, "pt")
     }
 
     pub fn new_with_attention_backend(
-        config: ModelArgs,
+        config: Qwen3Config,
         kind: Kind,
         device: Device,
         attention_backend: &str,
@@ -547,34 +566,8 @@ impl DecoderLayer {
     }
 }
 
-fn validate_config(config: ModelArgs) -> Result<()> {
-    if config.hidden_size == 0
-        || config.num_layers == 0
-        || config.num_attention_heads == 0
-        || config.num_kv_heads == 0
-        || config.intermediate_size == 0
-        || config.vocab_size == 0
-        || config.head_dim == 0
-        || config.max_position_embeddings == 0
-    {
-        return Err(model_error(
-            "Qwen3 configuration dimensions must be greater than zero",
-        ));
-    }
-    if config.num_attention_heads % config.num_kv_heads != 0 {
-        return Err(model_error(
-            "num_attention_heads must be divisible by num_kv_heads",
-        ));
-    }
-    if config.head_dim % 2 != 0 {
-        return Err(model_error("Qwen3 RoPE requires an even head_dim"));
-    }
-    if !config.rope_theta.is_finite() || config.rope_theta <= 0.0 {
-        return Err(model_error(
-            "Qwen3 RoPE requires a positive finite rope_theta",
-        ));
-    }
-    Ok(())
+fn validate_config(config: Qwen3Config) -> Result<()> {
+    config.validate().map_err(|message| model_error(&message))
 }
 
 fn linear(x: &Tensor, weight: &Tensor) -> Tensor {
@@ -656,8 +649,8 @@ mod tests {
 
     static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
-    fn config() -> ModelArgs {
-        ModelArgs {
+    fn config() -> Qwen3Config {
+        Qwen3Config {
             hidden_size: 4,
             num_layers: 1,
             num_attention_heads: 2,

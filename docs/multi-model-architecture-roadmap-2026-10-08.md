@@ -166,7 +166,7 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 | 阶段 | 状态 | 主要产物 | 验收条件 |
 |---|---|---|---|
 | 0：目标模型确认 | 待实施 | 完整模型名／目录、配置和权重结构；功能与资源矩阵 | 明确 attention、状态、dense／MoE、量化、上下文、文本路径和硬件需求；列出支持／缺失／待验证项 |
-| 1：注册与配置 | 待实施 | 模型定义注册、每模型配置、公共能力与运行时描述；统一启动流程 | Qwen3 保持可运行；未知 architecture 和不支持配置在加载前报错；模型模块不再组装 Scheduler 和服务对象 |
+| 1：注册与配置 | 已实现；本地 CPU 与远端 Qwen3／CUDA 验证通过 | 模型定义注册、每模型配置、公共能力与运行时描述；统一启动流程 | Qwen3 保持可运行；未知 architecture 和不支持配置在加载前报错；模型模块不再组装 Scheduler 和服务对象 |
 | 2：共享算子与加载 | 待实施 | 共享 layers、逐步加载与权重映射接口 | Qwen3 数值与 API 回归通过；测试覆盖 packed／tied 权重和加载错误；记录启动时间与 CPU/GPU 内存峰值 |
 | 3：执行与状态缓存 | 待实施 | ForwardBatch／ForwardOutput、分层状态需求与生命周期 | 现有分页 KV 路径通过；按目标模型验证所需状态的取消、前缀复用和中间 chunk 行为；无资源泄漏或共享状态污染 |
 | 4：graph 接口整理 | 待实施 | 通用 graph 管理、模型计算段和 backend 元数据契约 | Qwen3 eager／decode graph／prefill graph 对照通过；不同桶、padding、前缀命中、失效与回退正常；未验证组合不启用 |
@@ -178,6 +178,35 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 
 纯接口迁移先保持既有数值和服务行为。需要更改参数校验、模板、数值语义、槽位或布局时，分别记录原因和兼容性影响。优先复用 FlashInfer 或原版已验证内核；接口、布局不兼容的选择先告知用户。性能检查在有实际执行变化或退化疑点时进行，不把架构重构本身当作提速证据。
 
+### 5.1 阶段 1 实施记录（2026-10-09）
+
+本次确认注册与配置分离的设计合理，并完成以下调整：
+
+- `models/registry.rs` 注册配置解析器、模型 factory 和现有模板／输出 parser 的默认选择；不再接收 `ServeArgs` 或返回 `ServeComponents`。Qwen3 的定义移到 `models/qwen3/definition.rs`，模型模块不再创建 Engine、Scheduler 或 tokenizer。
+- `Qwen3Config` 保存计算字段并在启动时强类型解析、校验。通用 `ModelArgs` 移除，`RuntimeModelConfig` 只保存当前分页 KV 几何、词表、上下文上限及已解析的 checkpoint dtype。`ModelFactory` 持有模型专属配置，通过 `validate_runtime` 校验实际执行组合，再通过 `create` 构造模型。
+- `server/components/builder.rs` 统一选择定义、解析配置、校验执行组合和 EOS、初始化 tokenizer、加载 Engine 并创建 Scheduler。权重加载、剩余显存缓存分配和 graph capture 的原有顺序仍由 Engine 执行。模型配置不再由 Engine 或 Scheduler 重读。
+- 未知 architecture、非法维度／dtype／backend／并行配置，以及未支持的 RoPE scaling、量化、projection bias、滑窗、非 SiLU 激活和逐层 attention 类型，在 tokenizer／权重加载之前失败。停用滑窗时保留其窗口元数据，普通 HF 元数据允许存在；这不是对任意未知计算扩展的兼容承诺。
+- EOS 策略已由用户确认：优先取 `generation_config.json` 的 `eos_token_id`，该字段缺失时使用 `config.json`；显式 `null`／`[]` 表示无 EOS。缺失、非整数、负数或超出词表的 ID 启动报错。移除 tokenizer 配置中的 ID 回退和 token 0 的通用 EOS 回退。Scheduler 接收已解析的 EOS 集合，无 EOS 模型仍按长度结束并支持取消／错误清理。
+- 未显式声明 graph 支持的 `ModelExecutor` 默认禁用 decode graph；Qwen3 保留现有 backend 声明和 prefill capture 路径。
+
+本阶段采用两个范围收敛：当前公共状态描述只表达已实现的统一分页 KV，不提前设计分层状态类型；能力通过实际的模型／dtype／device／backend 组合校验表达，完整 graph 模式／形状能力描述留在阶段 4。ChatProfile 的独立 override 和通用模板迁移仍属于阶段 6，当前保留 Qwen3 renderer 和 parser。模型／生成配置以外的请求默认采样参数保持现状。
+
+兼容性变化：不完整的模型维度配置、此前被静默忽略的不支持特性、无效 EOS 不再被接受。缺省的上下文、RoPE theta、norm epsilon 和 tied embedding 继续保留本项目原有默认值；显式非法类型不再静默取默认值。Rust 构造接口相应迁移到 `Qwen3Config`、已配置的 factory、`RuntimeModelConfig` 及显式 EOS 参数。
+
+本地 macOS／CPU 验证：`cargo test --all-targets --no-fail-fast`，109 项测试通过。覆盖配置拒绝、EOS 来源优先级与严格校验、统一启动加载微型 dense Qwen3 safetensors checkpoint、prefill／decode 生成、无 EOS 时 token 0 不误停及 abort；原有 Qwen3 前向、权重绑定、模板／parser、调度和缓存测试通过。
+
+按用户指定的工作方式，在本地开发并同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust`，以该远端代码和测试结果为验收依据。两端基于同一提交 `da6c5c1`，同步文件通过 SHA-256 校验，远端 `tmp.sh`／benchmark 脚本保留。
+
+远端 A100 GPU 1 验证：`cargo test --release --all-targets -- --test-threads=1`，119 项通过、1 项已有采样微基准默认忽略；release 服务二进制已更新。首次 CUDA 回归暴露测试执行器未声明 graph 支持，已在本地补齐其 backend 能力转发并同步，完整回归通过。真实 `/sjtu/yaosikai/Qwen3-0.6B`、BF16、FlashInfer、max-running-req=4、max-seq-len=40960，eager（decode/prefill graph 均关闭）和 graph（decode 上限 4、prefill token 上限 2048）各 12 项 HTTP 回归通过；8 组含不同长度和重复前缀的贪心请求，文本、usage 和 finish_reason 完全一致。已有 CUDA kernel／graph 数值回归随 Rust 测试通过，服务日志确认 decode 与 segmented prefill graph 捕获。临时服务均已退出。
+
+远端记录保存在项目 `logs/registration-config-tests-20261009.log`、`logs/registration-config-build-20261009.log`、`logs/registration-config-http-summary-20261009.log` 和 `logs/registration-config-eager-graph-comparison-20261009.json`，两种模式各自的服务／API 日志也位于 `logs/`。本次未做性能测量，重构不作为推理提速证据。
+
+### 5.2 阶段 1 审查修复（2026-10-09）
+
+经多 agent 独立审查及交叉验证，用户授权修复 R1–R4，详情见 [审查报告及修复记录](model-registration-config-review-2026-10-09.md)。factory 的运行时校验现在对照公共描述与模型强配置，Engine 的加载／构造入口提前拒绝不一致组合；缓存配置映射共用一个私有函数；Qwen3 固定默认值由 serde 与程序构造共用；README 的装配职责、EOS 说明和公开构造示例已更新。未增加新的配置层或已校验加载入口，缓存仍在权重加载后分配。
+
+修复在本地开发并同步远端。本地 111 项 Rust 测试通过，README Rust 示例编译检查通过；远端 GPU 1 release 全目标测试 121 项通过、1 项已有微基准忽略，release 二进制更新。真实 Qwen3 eager／CUDA graph 各 12 项 HTTP 回归通过，8 组贪心 text／usage／finish_reason 对照一致，临时服务退出。远端修复验收日志使用 `logs/registration-r1-r4-*-20261009.*`，与此前阶段 1 的日志分开保留。
+
 ## 6. 本阶段范围之外
 
 当前未决定实现同进程多模型驻留、多模态请求、跨进程 worker、Tensor／Expert Parallel、speculative decoding 或所有量化格式。若目标模型的体积或结构要求其中某项，应在阶段 0 明确列为必要前置条件，再安排对应阶段，不能因本文未展开就视为已支持。
@@ -187,8 +216,8 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 Rust：
 
 - [模型注册](../src/models/registry.rs)与[启动组装](../src/server/components/builder.rs)。
-- [Qwen3 组装](../src/models/qwen3/components.rs)、[模型与权重绑定](../src/models/qwen3/model.rs)、[算子](../src/models/qwen3/ops.rs)、[prefill graph](../src/models/qwen3/prefill_graph.rs)。
-- [Engine／ModelArgs](../src/engine/engine.rs)、[ModelExecutor／ModelRunner](../src/engine/model_runner.rs)、[checkpoint reader](../src/engine/model_loader.rs)、[KVCachePool](../src/engine/kvcache/pool.rs)。
+- [Qwen3 定义](../src/models/qwen3/definition.rs)、[强类型配置](../src/models/qwen3/config.rs)、[模型与权重绑定](../src/models/qwen3/model.rs)、[算子](../src/models/qwen3/ops.rs)、[prefill graph](../src/models/qwen3/prefill_graph.rs)。
+- [Engine／RuntimeModelConfig](../src/engine/engine.rs)、[ModelExecutor／ModelRunner](../src/engine/model_runner.rs)、[checkpoint reader](../src/engine/model_loader.rs)、[KVCachePool](../src/engine/kvcache/pool.rs)。
 - [AttentionSpec／backend](../src/models/attention/backend.rs)、[HTTP](../src/server/api.rs)、[请求 schema](../src/server/schemas.rs)、[FrontendManager／detokenizer](../src/server/manager.rs)、[输出 parser](../src/server/output/parser.rs)。
 - [Scheduler／EOS](../src/scheduler/scheduler.rs)、[prefill 调度](../src/scheduler/prefill.rs)、[tokenizer／模板](../src/tokenizer.rs)。
 

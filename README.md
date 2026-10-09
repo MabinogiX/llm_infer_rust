@@ -78,7 +78,7 @@ CUDA 非贪心采样在构建包含 FlashInfer 时，使用与原版 SGLang 相�
 
 Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-server.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
 
-模型专有代码集中在 `src/models/<模型名>/`：`model.rs` 实现模型结构，`template.rs` 处理输入模板，`output.rs` 解析输出，`components.rs` 组装 tokenizer、engine、scheduler 和输出解析器。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择一次模型；不支持的模型会在加载权重前报错。新增模型时只需在 `src/models/` 下增加目录并登记，无须修改服务端和 tokenizer 的模型分支；请求处理过程不切换模型。
+模型专有代码集中在 `src/models/<模型名>/`：`config.rs` 解析和校验模型强类型配置，`model.rs` 实现模型结构及持有配置的 factory，`template.rs` 处理输入模板，`output.rs` 解析输出，`definition.rs` 提供配置解析器、factory 和默认模板／parser 的注册定义。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择模型，并统一初始化 tokenizer、Engine、Scheduler 和输出解析器。不支持的模型或执行组合会在加载权重前报错。新增模型时实现配置、运行时描述及能力校验并登记，无须在模型目录中复制运行时装配；请求处理过程不切换模型。
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -167,26 +167,26 @@ cargo test --lib
 
 ## Scheduler 接口
 
-`scheduler::Scheduler` 提供请求提交、取消、空闲判断和 `step` 接口，以及请求状态、输出 token 和终止原因类型。它从模型配置按 generation、tokenizer、model 的顺序加载 EOS ID。`step` 先运行 `PrefillManager`，再由 `DecodeManager` 对所有仍在运行的请求执行一次 decode（包括本轮新进入运行状态的请求）。Decode 使用可复用的 libtorch 输入和页表缓冲区；超长或无法容纳的请求返回 `Abort`，前向/采样失败返回 `Error`，具体错误可由 `last_step_error()` 查看。Prefill 失败回滚 radix 插入，decode 失败按已写入的 KV 前缀清理请求。
+`scheduler::Scheduler` 提供请求提交、取消、空闲判断和 `step` 接口，以及请求状态、输出 token 和终止原因类型。启动模块优先读取 `generation_config.json` 的 `eos_token_id`，字段缺失时读取 `config.json`，将解析后的 EOS 集合显式传给 Scheduler；Scheduler 不再自行读取配置。显式 `null`／`[]` 表示无 EOS，缺失、非整数、负数或越界 ID 会启动失败，不从 tokenizer 配置或 token 0 回退。`step` 先运行 `PrefillManager`，再由 `DecodeManager` 对所有仍在运行的请求执行一次 decode（包括本轮新进入运行状态的请求）。Decode 使用可复用的 libtorch 输入和页表缓冲区；超长或无法容纳的请求返回 `Abort`，前向/采样失败返回 `Error`，具体错误可由 `last_step_error()` 查看。Prefill 失败回滚 radix 插入，decode 失败按已写入的 KV 前缀清理请求。
 
 `load_hf_safetensors` 支持读取 `model.safetensors` 或 `model.safetensors.index.json` 所列的 shards。`Engine::build_model(&factory)` 通过模型层提供的 `ModelFactory` 创建 Rust 模型，随后 `Engine::load_model_weights()` 把实际读取到的具名 Tensor 交给 `ModelExecutor::load_weights` 绑定；未实现绑定的模型会明确报错。
 
 ## Qwen3（dense）
 
-`models::Qwen3Factory` 已实现 dense Qwen3 的 RMSNorm、SwiGLU、QK-RMSNorm、RoPE、GQA 与因果注意力，并按 Hugging Face 标准权重键加载：
+`models::Qwen3ForCausalLM` 已实现 dense Qwen3 的 RMSNorm、SwiGLU、QK-RMSNorm、RoPE、GQA 与因果注意力，并按 Hugging Face 标准权重键加载。`Qwen3Factory` 持有 `Qwen3Config`；Engine 在构造模型前检查其层数、KV 几何、词表和上下文与 `RuntimeModelConfig` 一致。通常通过公开的统一启动入口加载模型与服务所需对象：
 
 ```rust
 use sglang_rust::{
-    engine::{Engine, ModelArgs, ServerArgs},
-    models::Qwen3Factory,
+    engine::ServerArgs,
+    server::{ServeArgs, build_components},
 };
 
-let model_path = "/path/to/qwen3";
-let model_args = ModelArgs::from_pretrained(model_path)?;
-let mut engine = Engine::new(ServerArgs::new(model_path), model_args, 0)?;
-engine.build_model(&Qwen3Factory)?;
-engine.load_model_weights()?;
-# Ok::<(), Box<dyn std::error::Error>>(())
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = ServeArgs::new(ServerArgs::new("/path/to/qwen3"));
+    let components = build_components(&args)?;
+    let _engine = components.scheduler.engine();
+    Ok(())
+}
 ```
 
 当前 dense Qwen3 支持 eager/分段图 prefill、带缓存前缀的 prefill 和 paged-KV decode；模型接入 `Engine` 时会自动绑定 `KVCachePool` 的逐层 K/V 切片。Qwen3-MoE 与张量并行尚未迁移，调用时会返回明确错误。

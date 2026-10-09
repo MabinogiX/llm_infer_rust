@@ -66,6 +66,17 @@ pub struct AttentionBatch<'a> {
 
 impl Attention {
     pub fn new(name: &str, spec: AttentionSpec) -> Result<Self> {
+        Self::validate(name, spec)?;
+        let kind = AttentionBackendKind::parse(name)?;
+        Ok(Self {
+            backend: create_attention_backend(kind),
+            spec,
+            page_size: None,
+        })
+    }
+
+    /// Validate a backend combination without allocating model tensors.
+    pub fn validate(name: &str, spec: AttentionSpec) -> Result<()> {
         let kind = AttentionBackendKind::parse(name)?;
         if kind == AttentionBackendKind::FlashInfer {
             if !cfg!(has_flashinfer) {
@@ -86,11 +97,7 @@ impl Attention {
                 ));
             }
         }
-        Ok(Self {
-            backend: create_attention_backend(kind),
-            spec,
-            page_size: None,
-        })
+        Ok(())
     }
 
     pub fn bind_cache_layout(&mut self, page_size: i64) {
