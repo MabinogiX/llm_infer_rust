@@ -179,12 +179,9 @@ impl Qwen3ForCausalLM {
                 .copy_(&outputs[3]);
             next.native.replay()?;
         }
-        let mut hidden = graph.segments.last().unwrap().outputs[0].narrow(0, 0, count);
+        let hidden = graph.segments.last().unwrap().outputs[0].narrow(0, 0, count);
         // Output row count depends on the live requests, not the token bucket.
-        if let Some(indices) = logits_indices {
-            hidden = hidden.index_select(0, indices);
-        }
-        Ok(Some(linear(&hidden, &self.lm_head)))
+        Ok(Some(logits(&hidden, &self.lm_head, logits_indices)))
     }
 
     fn capture_prefill_segments(&self, tokens: usize) -> Result<PrefillGraph> {
@@ -197,7 +194,7 @@ impl Qwen3ForCausalLM {
         let eps = self.config.rms_norm_eps;
         let layer = &self.layers[0];
         let (native, outputs) = NativeCudaGraph::capture(device, || {
-            let hidden = self.embed_tokens.index_select(0, &ids);
+            let hidden = embedding(&ids, &self.embed_tokens);
             let (normalized, residual) = layer.input_norm(&hidden, None, eps);
             let (q, k, v) = layer.project_qkv(
                 &normalized,
@@ -215,10 +212,8 @@ impl Qwen3ForCausalLM {
             residual_input: None,
         }];
         for (index, layer) in self.layers.iter().enumerate() {
-            let attention_input = Tensor::zeros(
-                [rows, layer.num_heads * layer.head_dim],
-                (self.kind, self.device),
-            );
+            let attention_input =
+                Tensor::zeros([rows, layer.qkv_proj.widths()[0]], (self.kind, self.device));
             let residual_input = Tensor::zeros(
                 [rows, self.config.hidden_size as i64],
                 (self.kind, self.device),
@@ -330,7 +325,7 @@ mod cuda_tests {
         for (a, b) in eager.layers.iter_mut().zip(graph.layers.iter_mut()) {
             for (x, y, norm) in [
                 (&mut a.input_layernorm, &mut b.input_layernorm, true),
-                (&mut a.qkv_proj, &mut b.qkv_proj, false),
+                (&mut a.qkv_proj.weight, &mut b.qkv_proj.weight, false),
                 (&mut a.o_proj, &mut b.o_proj, false),
                 (&mut a.q_norm, &mut b.q_norm, true),
                 (&mut a.k_norm, &mut b.k_norm, true),
@@ -339,8 +334,8 @@ mod cuda_tests {
                     &mut b.post_attention_layernorm,
                     true,
                 ),
-                (&mut a.gate_up_proj, &mut b.gate_up_proj, false),
-                (&mut a.down_proj, &mut b.down_proj, false),
+                (&mut a.mlp.gate_up_proj, &mut b.mlp.gate_up_proj, false),
+                (&mut a.mlp.down_proj, &mut b.mlp.down_proj, false),
             ] {
                 if norm {
                     let _ = x.fill_(1.0);

@@ -36,7 +36,7 @@ HTTP / OpenAI 协议
 |---|---|---|---|
 | 模型注册 | 注册项构造 Scheduler、Tokenizer 和 OutputParser | Registry 选择模型实现，运行时负责加载和执行 | 注册提供模型定义，启动流程集中组装 |
 | 模型配置 | 通用 ModelArgs 包含 Qwen 风格计算字段与缓存尺寸 | 保留 HF 配置并提取运行时信息 | 每模型强类型配置 + 公共运行时描述 |
-| 基础算子 | 通用 norm、RoPE、MLP 等位于 Qwen3 目录 | layers 共享算子，模型组合这些算子 | 提取共享 layers，保留模型数值差异 |
+| 基础算子 | Qwen3 已使用共享 layers；第二模型验证待完成 | layers 共享算子，模型组合这些算子 | 提取共享 layers，保留模型数值差异 |
 | 状态缓存 | 统一逐层、同尺寸的分页 K/V 张量 | 不同 attention 与状态缓存实现 | 模型声明分层缓存需求，运行时管理资源 |
 | 模型执行 | 多个独立输入参数，返回 logits Tensor | ForwardBatch 与结构化执行输出 | 统一批次输入和输出语义 |
 | CUDA graph | decode 在通用 runner，prefill 直接访问 Qwen3 层 | runner 与 backend 分工，明确图内／图外操作 | graph 生命周期通用化，模型提供计算段 |
@@ -74,7 +74,7 @@ EOS、特殊 token 和生成默认设置由统一模型／tokenizer 初始化流
 
 Dense FFN 与 MoE FFN 可以在 decoder 组合处替换。MoE 的 routing、专家权重布局和计算策略应由专门模块承载，避免把 MoE 逻辑散落到通用 Scheduler。
 
-先用第二个真实模型验证共享接口。避免通过几十个开关构造覆盖所有架构的通用 Transformer，也避免给每个标量算子增加热路径动态分发。
+第二个真实模型的完整名称与 checkpoint 尚未确认。经用户确认，先完成 Qwen3 共享层提取与回归，第二模型验证保留为待办；在其接入前不把现有接口视为覆盖所有模型的稳定公共 API。避免通过几十个开关构造覆盖所有架构的通用 Transformer，也避免给每个标量算子增加热路径动态分发。
 
 ### 3.3 分层状态缓存
 
@@ -167,7 +167,7 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 |---|---|---|---|
 | 0：目标模型确认 | 待实施 | 完整模型名／目录、配置和权重结构；功能与资源矩阵 | 明确 attention、状态、dense／MoE、量化、上下文、文本路径和硬件需求；列出支持／缺失／待验证项 |
 | 1：注册与配置 | 已实现；本地 CPU 与远端 Qwen3／CUDA 验证通过 | 模型定义注册、每模型配置、公共能力与运行时描述；统一启动流程 | Qwen3 保持可运行；未知 architecture 和不支持配置在加载前报错；模型模块不再组装 Scheduler 和服务对象 |
-| 2：共享算子与加载 | 待实施 | 共享 layers、逐步加载与权重映射接口 | Qwen3 数值与 API 回归通过；测试覆盖 packed／tied 权重和加载错误；记录启动时间与 CPU/GPU 内存峰值 |
+| 2：共享算子与加载 | 部分实施：Qwen3 共享层提取完成；第二模型与逐步加载待办 | 共享 layers、逐步加载与权重映射接口 | Qwen3 数值与 API 回归通过；测试覆盖 packed／tied 权重和加载错误；记录启动时间与 CPU/GPU 内存峰值 |
 | 3：执行与状态缓存 | 待实施 | ForwardBatch／ForwardOutput、分层状态需求与生命周期 | 现有分页 KV 路径通过；按目标模型验证所需状态的取消、前缀复用和中间 chunk 行为；无资源泄漏或共享状态污染 |
 | 4：graph 接口整理 | 待实施 | 通用 graph 管理、模型计算段和 backend 元数据契约 | Qwen3 eager／decode graph／prefill graph 对照通过；不同桶、padding、前缀命中、失效与回退正常；未验证组合不启用 |
 | 5：目标模型接入 | 待实施 | 实际 dense／MoE／其他所需模块的模型实现与注册 | 对齐可信参考的模板、logits／数值容差、生成和用量语义；多批次与不同长度测试通过；记录支持限制与性能 |
@@ -207,6 +207,16 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 
 修复在本地开发并同步远端。本地 111 项 Rust 测试通过，README Rust 示例编译检查通过；远端 GPU 1 release 全目标测试 121 项通过、1 项已有微基准忽略，release 二进制更新。真实 Qwen3 eager／CUDA graph 各 12 项 HTTP 回归通过，8 组贪心 text／usage／finish_reason 对照一致，临时服务退出。远端修复验收日志使用 `logs/registration-r1-r4-*-20261009.*`，与此前阶段 1 的日志分开保留。
 
+### 5.3 共享 layers 与 Qwen3 结构实施记录（2026-10-09）
+
+共享层提取的设计合理，但接口应按已知计算语义命名。此次将 bias-free linear、embedding／logits 行选择、packed QKV、dense SwiGLU、RMSNorm／residual RMSNorm／QK norm 与全维未缩放 half-split RoPE 移至 `src/layers/`，CUDA 桥接与内核也移入该目录。接口限定 crate 内可见，保留原算法、dtype 舍入及 CUDA 原地更新约定，不引入逐算子动态分发、MoE 占位或通用 Transformer 的特性开关。
+
+`PackedQkv` 统一持有 projection 几何和权重，返回原 packed allocation 的 Q/K/V 视图，支持 query width 与 hidden size 不同。`DenseSwiGlu` 封装 gate-up packing、激活和 down projection。Qwen3 decoder 不再重复保存这些参数和几何字段；模型仍负责 checkpoint 命名与绑定、tied embedding、QK norm 选用、残差顺序、attention 与 graph 分段。prefill 和 decode 共用 logits 行选择／投影逻辑。权重 reader 的逐 shard 加载留在后续工作。
+
+新增 packed QKV 对照独立 projection、packed SwiGLU 对照 gate/up/down、embedding／tied weight 与 live logits 行重排测试；原有 norm、RoPE、CUDA 和 graph 数值测试随提取保留。用户已确认先完成 Qwen3 提取和回归，第二模型验证待办；尚未完成阶段 2 的全部加载与内存验收，本次不作为推理提速证据。
+
+本地 macOS／CPU 全目标 Rust 测试 114 项通过。最终源码同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust` 并以 SHA-256 校验；远端 A100 GPU 1 release 全目标测试 124 项通过、1 项已有采样微基准忽略，release 二进制更新。真实 Qwen3-0.6B／BF16／FlashInfer 下，eager 和 decode＋segmented prefill graph 各 12 项 HTTP 测试通过；每种模式的 8 组不同长度与重复前缀请求，其 text／usage／finish_reason 均与提取前基线完全一致，两种模式也互相一致。临时服务退出后 GPU 显存恢复。远端验收记录为 `logs/shared-layers-tests-20261009.log`、`logs/shared-layers-build-20261009.log`、`logs/shared-layers-http-summary-20261009.log`、`logs/shared-layers-eager-graph-comparison-20261009.json` 及各模式服务／API 日志。
+
 ## 6. 本阶段范围之外
 
 当前未决定实现同进程多模型驻留、多模态请求、跨进程 worker、Tensor／Expert Parallel、speculative decoding 或所有量化格式。若目标模型的体积或结构要求其中某项，应在阶段 0 明确列为必要前置条件，再安排对应阶段，不能因本文未展开就视为已支持。
@@ -216,7 +226,7 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 Rust：
 
 - [模型注册](../src/models/registry.rs)与[启动组装](../src/server/components/builder.rs)。
-- [Qwen3 定义](../src/models/qwen3/definition.rs)、[强类型配置](../src/models/qwen3/config.rs)、[模型与权重绑定](../src/models/qwen3/model.rs)、[算子](../src/models/qwen3/ops.rs)、[prefill graph](../src/models/qwen3/prefill_graph.rs)。
+- [Qwen3 定义](../src/models/qwen3/definition.rs)、[强类型配置](../src/models/qwen3/config.rs)、[模型与权重绑定](../src/models/qwen3/model.rs)、[共享 layers](../src/layers/mod.rs)、[prefill graph](../src/models/qwen3/prefill_graph.rs)。
 - [Engine／RuntimeModelConfig](../src/engine/engine.rs)、[ModelExecutor／ModelRunner](../src/engine/model_runner.rs)、[checkpoint reader](../src/engine/model_loader.rs)、[KVCachePool](../src/engine/kvcache/pool.rs)。
 - [AttentionSpec／backend](../src/models/attention/backend.rs)、[HTTP](../src/server/api.rs)、[请求 schema](../src/server/schemas.rs)、[FrontendManager／detokenizer](../src/server/manager.rs)、[输出 parser](../src/server/output/parser.rs)。
 - [Scheduler／EOS](../src/scheduler/scheduler.rs)、[prefill 调度](../src/scheduler/prefill.rs)、[tokenizer／模板](../src/tokenizer.rs)。

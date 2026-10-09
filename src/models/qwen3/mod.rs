@@ -1,7 +1,6 @@
 mod config;
 mod definition;
 mod model;
-mod ops;
 mod output;
 mod template;
 

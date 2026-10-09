@@ -8,10 +8,13 @@ use std::{cell::RefCell, collections::HashMap};
 use tch::{Device, Kind, Tensor};
 
 use super::config::Qwen3Config;
-use super::ops::{RopeCache, add_rms_norm, qk_norm, rms_norm, silu_and_mul};
 use crate::engine::{
     AttentionMetadata, BatchPhase, DecodeGraphState, ModelExecutor, ModelFactory, ModelRunnerError,
     ModelWeights, RuntimeModelConfig,
+};
+use crate::layers::{
+    DenseSwiGlu, HalfSplitRope, PackedQkv, add_rms_norm, embedding, linear, logits, qk_norm,
+    rms_norm,
 };
 use crate::models::attention::{Attention, AttentionBatch, AttentionSpec, BaseAttention};
 use crate::profiling::{ModelProfiler, ModelStage};
@@ -78,7 +81,7 @@ pub struct Qwen3ForCausalLM {
     device: Device,
     kind: Kind,
     attention: Attention,
-    rope: RopeCache,
+    rope: HalfSplitRope,
     embed_tokens: Tensor,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
@@ -121,7 +124,7 @@ impl Qwen3ForCausalLM {
             device,
             kind,
             attention,
-            rope: RopeCache::new(max_positions, head_dim, config.rope_theta, kind, device),
+            rope: HalfSplitRope::new(max_positions, head_dim, config.rope_theta, kind, device),
             embed_tokens: parameter([vocab, hidden], kind, device),
             layers: (0..config.num_layers)
                 .map(|_| {
@@ -172,7 +175,7 @@ impl Qwen3ForCausalLM {
         let attention = attention?;
 
         let timer = profiler.start(ModelStage::Embed);
-        let mut hidden_states = self.embed_tokens.index_select(0, &ids);
+        let mut hidden_states = embedding(&ids, &self.embed_tokens);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::Layers);
@@ -205,10 +208,7 @@ impl Qwen3ForCausalLM {
         } else {
             rms_norm(&hidden_states, &self.norm, self.config.rms_norm_eps)
         };
-        if let Some(indices) = logits_indices {
-            hidden_states = hidden_states.index_select(0, indices);
-        }
-        let logits = linear(&hidden_states, &self.lm_head);
+        let logits = logits(&hidden_states, &self.lm_head, logits_indices);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::PlanDrop);
@@ -350,16 +350,12 @@ impl ModelExecutor for Qwen3ForCausalLM {
 struct DecoderLayer {
     base_attention: RefCell<BaseAttention>,
     input_layernorm: Tensor,
-    qkv_proj: Tensor,
+    qkv_proj: PackedQkv,
     o_proj: Tensor,
     q_norm: Tensor,
     k_norm: Tensor,
     post_attention_layernorm: Tensor,
-    gate_up_proj: Tensor,
-    down_proj: Tensor,
-    num_heads: i64,
-    num_kv_heads: i64,
-    head_dim: i64,
+    mlp: DenseSwiGlu,
 }
 
 impl DecoderLayer {
@@ -375,20 +371,12 @@ impl DecoderLayer {
         Self {
             base_attention: RefCell::new(BaseAttention::default()),
             input_layernorm: parameter([hidden], kind, device),
-            qkv_proj: parameter(
-                [(num_heads + 2 * num_kv_heads) * head_dim, hidden],
-                kind,
-                device,
-            ),
+            qkv_proj: PackedQkv::new(hidden, num_heads, num_kv_heads, head_dim, kind, device),
             o_proj: parameter([hidden, num_heads * head_dim], kind, device),
             q_norm: parameter([head_dim], kind, device),
             k_norm: parameter([head_dim], kind, device),
             post_attention_layernorm: parameter([hidden], kind, device),
-            gate_up_proj: parameter([2 * intermediate, hidden], kind, device),
-            down_proj: parameter([hidden, intermediate], kind, device),
-            num_heads,
-            num_kv_heads,
-            head_dim,
+            mlp: DenseSwiGlu::new(hidden, intermediate, kind, device),
         }
     }
 
@@ -400,7 +388,7 @@ impl DecoderLayer {
         attention_batch: &AttentionBatch<'_>,
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
-        rope: &RopeCache,
+        rope: &HalfSplitRope,
         profiler: &mut ModelProfiler,
     ) -> Result<(Tensor, Tensor)> {
         let timer = profiler.start(ModelStage::Norm);
@@ -427,27 +415,11 @@ impl DecoderLayer {
         hidden_states: &Tensor,
         positions: &Tensor,
         eps: f64,
-        rope: &RopeCache,
+        rope: &HalfSplitRope,
         profiler: &mut ModelProfiler,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let timer = profiler.start(ModelStage::QkvLinear);
-        let total_tokens = hidden_states.size()[0];
-        let qkv = linear(hidden_states, &self.qkv_proj);
-        let q_width = self.num_heads * self.head_dim;
-        let kv_width = self.num_kv_heads * self.head_dim;
-        let q = qkv
-            .narrow(-1, 0, q_width)
-            .view([total_tokens, self.num_heads, self.head_dim]);
-        let k = qkv.narrow(-1, q_width, kv_width).view([
-            total_tokens,
-            self.num_kv_heads,
-            self.head_dim,
-        ]);
-        let v = qkv.narrow(-1, q_width + kv_width, kv_width).view([
-            total_tokens,
-            self.num_kv_heads,
-            self.head_dim,
-        ]);
+        let (q, k, v) = self.qkv_proj.forward(hidden_states);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::QkNorm);
@@ -501,9 +473,7 @@ impl DecoderLayer {
             add_rms_norm(output, residual, &self.post_attention_layernorm, eps);
         profiler.finish(timer);
         let timer = profiler.start(ModelStage::Mlp);
-        let gate_up = linear(&normalized, &self.gate_up_proj);
-        let mlp = silu_and_mul(&gate_up);
-        let output = linear(&mlp, &self.down_proj);
+        let output = self.mlp.forward(&normalized);
         profiler.finish(timer);
         (output, residual)
     }
@@ -525,7 +495,7 @@ impl DecoderLayer {
                 &mut self.post_attention_layernorm,
                 "post_attention_layernorm.weight",
             ),
-            (&mut self.down_proj, "mlp.down_proj.weight"),
+            (&mut self.mlp.down_proj, "mlp.down_proj.weight"),
         ] {
             load_parameter(
                 parameter,
@@ -535,26 +505,23 @@ impl DecoderLayer {
                 device,
             )?;
         }
+        let qkv_rows = self.qkv_proj.widths();
         load_packed_parameter(
-            &mut self.qkv_proj,
+            &mut self.qkv_proj.weight,
             &prefix,
             &[
                 "self_attn.q_proj.weight",
                 "self_attn.k_proj.weight",
                 "self_attn.v_proj.weight",
             ],
-            &[
-                self.num_heads * self.head_dim,
-                self.num_kv_heads * self.head_dim,
-                self.num_kv_heads * self.head_dim,
-            ],
+            &qkv_rows,
             weights,
             kind,
             device,
         )?;
-        let intermediate = self.gate_up_proj.size()[0] / 2;
+        let intermediate = self.mlp.gate_up_proj.size()[0] / 2;
         load_packed_parameter(
-            &mut self.gate_up_proj,
+            &mut self.mlp.gate_up_proj,
             &prefix,
             &["mlp.gate_proj.weight", "mlp.up_proj.weight"],
             &[intermediate, intermediate],
@@ -568,10 +535,6 @@ impl DecoderLayer {
 
 fn validate_config(config: Qwen3Config) -> Result<()> {
     config.validate().map_err(|message| model_error(&message))
-}
-
-fn linear(x: &Tensor, weight: &Tensor) -> Tensor {
-    x.matmul(&weight.transpose(0, 1))
 }
 
 fn parameter(shape: impl AsRef<[i64]>, kind: Kind, device: Device) -> Tensor {
@@ -643,9 +606,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::super::ops::rotate_half;
     use super::*;
     use crate::engine::load_hf_safetensors;
+    use crate::layers::{rotate_half, silu_and_mul};
 
     static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -714,7 +677,7 @@ mod tests {
         let q = Tensor::ones([2, 2, 4], (Kind::BFloat16, Device::Cpu));
         let k = Tensor::ones([2, 1, 4], (Kind::BFloat16, Device::Cpu));
         let positions = Tensor::from_slice(&[0i64, 1]);
-        let rope = RopeCache::new(16, 4, 10_000.0, Kind::BFloat16, Device::Cpu);
+        let rope = HalfSplitRope::new(16, 4, 10_000.0, Kind::BFloat16, Device::Cpu);
         let (q, k) = rope.apply(&q, &k, &positions);
         assert_eq!(q.kind(), Kind::BFloat16);
         assert_eq!(k.kind(), Kind::BFloat16);
@@ -730,7 +693,7 @@ mod tests {
                 .view([4, 1, 4])
                 .to_kind(kind);
             let positions = Tensor::from_slice(&[0i64, 15, 3, 15]);
-            let rope = RopeCache::new(16, 4, 10_000.0, kind, Device::Cpu);
+            let rope = HalfSplitRope::new(16, 4, 10_000.0, kind, Device::Cpu);
             let (cached_q, cached_k) = rope.apply(&q, &k, &positions);
 
             let inv_freq = (Tensor::arange_start_step(0, 4, 2, (Kind::Float, Device::Cpu))

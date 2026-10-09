@@ -1,10 +1,12 @@
-//! Qwen3 elementwise operators. CUDA dispatch stays behind this module so the
-//! decoder only expresses model operations, irrespective of the kernel backend.
+//! Shared operators with fixed numerical semantics and native CUDA dispatch.
+//! RMSNorm uses direct scales and FP32 accumulation; RoPE is unscaled, full-head
+//! half-split rotation. Other semantics require a separate implementation.
 
 use tch::{Device, Kind, Tensor};
 
-pub(super) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
-    #[cfg(has_qwen3_cuda)]
+/// Direct scale RMSNorm: FP32 variance and multiplication, cast to activation dtype.
+pub(crate) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
+    #[cfg(has_layer_cuda)]
     if supports_cuda(x) {
         return cuda::rms_norm(x, weight, eps);
     }
@@ -17,13 +19,13 @@ pub(super) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
 
 /// Consumes layer-owned activations; CUDA updates both buffers in place.
 /// Normalize the full FP32 sum; store the residual rounded to activation dtype.
-pub(super) fn add_rms_norm(
+pub(crate) fn add_rms_norm(
     x: Tensor,
     residual: Tensor,
     weight: &Tensor,
     eps: f64,
 ) -> (Tensor, Tensor) {
-    #[cfg(has_qwen3_cuda)]
+    #[cfg(has_layer_cuda)]
     if supports_cuda(&x) {
         return cuda::add_rms_norm(x, residual, weight, eps);
     }
@@ -32,22 +34,25 @@ pub(super) fn add_rms_norm(
     (normalized, sum.to_kind(x.kind()))
 }
 
-pub(super) fn qk_norm(
+/// Normalize owned Q/K projection views; CUDA mutates those views in place.
+/// Callers must not reuse their pre-normalization contents. V is left untouched.
+pub(crate) fn qk_norm(
     q: &Tensor,
     k: &Tensor,
     q_weight: &Tensor,
     k_weight: &Tensor,
     eps: f64,
 ) -> (Tensor, Tensor) {
-    #[cfg(has_qwen3_cuda)]
+    #[cfg(has_layer_cuda)]
     if supports_cuda(q) {
         return cuda::qk_norm(q, k, q_weight, k_weight, eps);
     }
     (rms_norm(q, q_weight, eps), rms_norm(k, k_weight, eps))
 }
 
-pub(super) fn silu_and_mul(gate_up: &Tensor) -> Tensor {
-    #[cfg(has_qwen3_cuda)]
+/// Packed [gate, up] SwiGLU activation; input is a 2-D tensor of even width.
+pub(crate) fn silu_and_mul(gate_up: &Tensor) -> Tensor {
+    #[cfg(has_layer_cuda)]
     if supports_cuda(gate_up) {
         return cuda::silu_and_mul(gate_up);
     }
@@ -55,21 +60,21 @@ pub(super) fn silu_and_mul(gate_up: &Tensor) -> Tensor {
     gate_up.narrow(-1, 0, width).silu() * gate_up.narrow(-1, width, width)
 }
 
-#[cfg(has_qwen3_cuda)]
+#[cfg(has_layer_cuda)]
 fn supports_cuda(tensor: &Tensor) -> bool {
     matches!(tensor.device(), Device::Cuda(_))
         && matches!(tensor.kind(), Kind::BFloat16 | Kind::Half)
 }
 
 /// Shared by all decoder layers. Frequencies are materialized once at model creation.
-pub(super) struct RopeCache {
+pub(crate) struct HalfSplitRope {
     cos: Tensor,
     sin: Tensor,
     half_dim: i64,
 }
 
-impl RopeCache {
-    pub(super) fn new(
+impl HalfSplitRope {
+    pub(crate) fn new(
         max_positions: i64,
         head_dim: i64,
         rope_theta: f64,
@@ -97,8 +102,9 @@ impl RopeCache {
         }
     }
 
-    pub(super) fn apply(&self, q: &Tensor, k: &Tensor, positions: &Tensor) -> (Tensor, Tensor) {
-        #[cfg(has_qwen3_cuda)]
+    /// CUDA mutates owned Q/K views in place; positions must index the cache.
+    pub(crate) fn apply(&self, q: &Tensor, k: &Tensor, positions: &Tensor) -> (Tensor, Tensor) {
+        #[cfg(has_layer_cuda)]
         if supports_cuda(q) {
             return cuda::rope(q, k, positions, &self.cos, &self.sin);
         }
@@ -111,7 +117,7 @@ impl RopeCache {
     }
 }
 
-pub(super) fn rotate_half(x: &Tensor, cos: &Tensor, sin: &Tensor, half_dim: i64) -> Tensor {
+pub(crate) fn rotate_half(x: &Tensor, cos: &Tensor, sin: &Tensor, half_dim: i64) -> Tensor {
     let first = x.narrow(-1, 0, half_dim);
     let second = x.narrow(-1, half_dim, half_dim);
     Tensor::cat(
@@ -120,54 +126,61 @@ pub(super) fn rotate_half(x: &Tensor, cos: &Tensor, sin: &Tensor, half_dim: i64)
     )
 }
 
-#[cfg(has_qwen3_cuda)]
+#[cfg(has_layer_cuda)]
 mod cuda {
     use std::ffi::{CStr, c_char, c_void};
     use tch::Tensor;
 
     unsafe extern "C" {
-        fn sglang_qwen3_rms_norm(x: *const c_void, weight: *const c_void, eps: f64) -> *mut c_void;
-        fn sglang_qwen3_add_rms_norm_inplace(
+        fn sglang_layers_rms_norm(x: *const c_void, weight: *const c_void, eps: f64)
+        -> *mut c_void;
+        fn sglang_layers_add_rms_norm_inplace(
             x: *const c_void,
             residual: *const c_void,
             weight: *const c_void,
             eps: f64,
         ) -> bool;
-        fn sglang_qwen3_qk_norm_inplace(
+        fn sglang_layers_qk_norm_inplace(
             q: *const c_void,
             k: *const c_void,
             qw: *const c_void,
             kw: *const c_void,
             eps: f64,
         ) -> bool;
-        fn sglang_qwen3_rope_inplace(
+        fn sglang_layers_rope_inplace(
             q: *const c_void,
             k: *const c_void,
             positions: *const c_void,
             cos: *const c_void,
             sin: *const c_void,
         ) -> bool;
-        fn sglang_qwen3_silu_and_mul(gate_up: *const c_void) -> *mut c_void;
-        fn sglang_qwen3_error() -> *const c_char;
+        fn sglang_layers_silu_and_mul(gate_up: *const c_void) -> *mut c_void;
+        fn sglang_layers_error() -> *const c_char;
     }
 
     fn check(output: *mut c_void) -> Tensor {
         if output.is_null() {
-            let error = unsafe { CStr::from_ptr(sglang_qwen3_error()) };
-            panic!("Qwen3 CUDA kernel failed: {}", error.to_string_lossy());
+            let error = unsafe { CStr::from_ptr(sglang_layers_error()) };
+            panic!(
+                "shared layer CUDA kernel failed: {}",
+                error.to_string_lossy()
+            );
         }
         unsafe { Tensor::from_ptr(output.cast()) }
     }
 
     fn check_inplace(ok: bool) {
         if !ok {
-            let error = unsafe { CStr::from_ptr(sglang_qwen3_error()) };
-            panic!("Qwen3 CUDA kernel failed: {}", error.to_string_lossy());
+            let error = unsafe { CStr::from_ptr(sglang_layers_error()) };
+            panic!(
+                "shared layer CUDA kernel failed: {}",
+                error.to_string_lossy()
+            );
         }
     }
 
     pub(super) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
-        check(unsafe { sglang_qwen3_rms_norm(x.as_ptr().cast(), weight.as_ptr().cast(), eps) })
+        check(unsafe { sglang_layers_rms_norm(x.as_ptr().cast(), weight.as_ptr().cast(), eps) })
     }
 
     pub(super) fn add_rms_norm(
@@ -177,7 +190,7 @@ mod cuda {
         eps: f64,
     ) -> (Tensor, Tensor) {
         check_inplace(unsafe {
-            sglang_qwen3_add_rms_norm_inplace(
+            sglang_layers_add_rms_norm_inplace(
                 x.as_ptr().cast(),
                 residual.as_ptr().cast(),
                 weight.as_ptr().cast(),
@@ -195,7 +208,7 @@ mod cuda {
         eps: f64,
     ) -> (Tensor, Tensor) {
         let ok = unsafe {
-            sglang_qwen3_qk_norm_inplace(
+            sglang_layers_qk_norm_inplace(
                 q.as_ptr().cast(),
                 k.as_ptr().cast(),
                 qw.as_ptr().cast(),
@@ -215,7 +228,7 @@ mod cuda {
         sin: &Tensor,
     ) -> (Tensor, Tensor) {
         let ok = unsafe {
-            sglang_qwen3_rope_inplace(
+            sglang_layers_rope_inplace(
                 q.as_ptr().cast(),
                 k.as_ptr().cast(),
                 positions.as_ptr().cast(),
@@ -228,11 +241,11 @@ mod cuda {
     }
 
     pub(super) fn silu_and_mul(gate_up: &Tensor) -> Tensor {
-        check(unsafe { sglang_qwen3_silu_and_mul(gate_up.as_ptr().cast()) })
+        check(unsafe { sglang_layers_silu_and_mul(gate_up.as_ptr().cast()) })
     }
 }
 
-#[cfg(all(test, has_qwen3_cuda))]
+#[cfg(all(test, has_layer_cuda))]
 mod tests {
     use super::*;
     use tch::Cuda;
@@ -284,7 +297,7 @@ mod tests {
         assert!(max_error(&qn, &expected_q) <= 0.03125);
         assert!(max_error(&kn, &expected_k) <= 0.03125);
 
-        let rope = RopeCache::new(32, 128, 1_000_000.0, Kind::BFloat16, device);
+        let rope = HalfSplitRope::new(32, 128, 1_000_000.0, Kind::BFloat16, device);
         assert_eq!(rope.cos.kind(), Kind::Float);
         assert_eq!(rope.sin.kind(), Kind::Float);
         let positions = Tensor::from_slice(&[0i64, 31, 7]).to_device(device);
@@ -405,7 +418,7 @@ mod residual_semantics_tests {
     #[test]
     fn normalization_uses_unrounded_fp32_residual_sum() {
         let mut devices = vec![Device::Cpu];
-        #[cfg(has_qwen3_cuda)]
+        #[cfg(has_layer_cuda)]
         if tch::Cuda::is_available() {
             devices.push(Device::Cuda(0));
         }

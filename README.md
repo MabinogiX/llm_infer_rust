@@ -80,6 +80,8 @@ Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 
 
 模型专有代码集中在 `src/models/<模型名>/`：`config.rs` 解析和校验模型强类型配置，`model.rs` 实现模型结构及持有配置的 factory，`template.rs` 处理输入模板，`output.rs` 解析输出，`definition.rs` 提供配置解析器、factory 和默认模板／parser 的注册定义。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择模型，并统一初始化 tokenizer、Engine、Scheduler 和输出解析器。不支持的模型或执行组合会在加载权重前报错。新增模型时实现配置、运行时描述及能力校验并登记，无须在模型目录中复制运行时装配；请求处理过程不切换模型。
 
+共享计算位于 `src/layers/`：bias-free linear、embedding／logits 行选择、`PackedQkv`、`DenseSwiGlu`、RMSNorm／residual RMSNorm／QK norm 和 `HalfSplitRope`，包括对应 CUDA 内核。接口目前只表达 Qwen3 已验证的直接 norm scale、FP32 累积和全维 half-split RoPE 语义，CUDA Q/K 变换会原地更新 projection 视图。模型保留权重命名和绑定、QK norm 的选用、残差组合、attention 调用及 graph 分段。第二个真实模型的接口验证仍待完成。
+
 ```bash
 curl http://127.0.0.1:8000/health
 
