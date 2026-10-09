@@ -2,6 +2,8 @@
 
 Rust 版本的 mini-sglang 推理服务。目前支持本地 dense Qwen3 模型、CPU/CUDA float32 eager 执行，以及 OpenAI 风格的文本与聊天生成接口。
 
+后续 dense、MoE 及不同状态缓存模型的接入计划见 [多模型架构优化与分阶段实施方案](docs/multi-model-architecture-roadmap-2026-10-08.md)。
+
 ## 运行
 
 Python 构建与测试环境统一由根目录的 `pyproject.toml` 和 `uv.lock` 管理，默认环境为 `.venv`。先同步依赖：
