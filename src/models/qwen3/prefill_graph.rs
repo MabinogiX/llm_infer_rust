@@ -206,10 +206,12 @@ mod cuda_tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn segmented_prefill_matches_eager_logits_and_kv_for_live_request_boundaries() {
-        if !tch::Cuda::is_available() {
-            return;
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
         no_grad(|| {
             for (kind, backend) in [
                 (Kind::BFloat16, "flashinfer"),

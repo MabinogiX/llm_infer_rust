@@ -98,6 +98,10 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 `server/manager.rs` 在专用线程中运行 Scheduler，通过通道收发请求和 token；`server/api.rs` 提供普通 JSON 和 SSE 响应。流式连接中断时会取消对应请求。
 
+## 测试
+
+测试分层、CUDA 前置条件及单独运行命令见 [tests/README.md](tests/README.md)。默认 Rust 测试显式忽略 CUDA 用例；GPU 回归必须另外运行 `./scripts/run-rust-tests.sh cuda`。
+
 ## 端到端接口测试
 
 完整的 PR smoke 与 release 性能测试入口见 [benchmark/README.md](benchmark/README.md)。
@@ -112,7 +116,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 # Linux CUDA 环境；macOS / CPU 环境去掉 --extra cuda
 uv sync --locked --extra cuda --group dev
 SGLANG_E2E_BASE_URL=http://127.0.0.1:8000/v1 \
-  uv run --locked --extra cuda --group dev python -m unittest discover -s tests -p test_api_e2e.py -v
+  uv run --locked --extra cuda --group dev python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 聊天接口支持 `max_completion_tokens` 和 `max_tokens`；两者同时提供时优先使用非空的 `max_completion_tokens`。新字段缺省或为 `null` 时使用 `max_tokens`，两者均未指定时默认生成上限为 1024。输出长度包含思考内容对应的 tokens，流式与非流式请求使用相同上限。
@@ -148,11 +152,7 @@ SGLANG_E2E_BASE_URL=http://127.0.0.1:8000/v1 \
 本机使用 `tch-rs` 构建时，需将 `LIBTORCH_USE_PYTORCH=1` 指向含 libtorch 的 Python 环境。`tch 0.26` 的官方目标版本是 PyTorch/libtorch 2.13，本项目当前环境为 2.13.0。macOS 运行时还需设置 `DYLD_LIBRARY_PATH`，让动态链接器找到 libtorch：
 
 ```bash
-VIRTUAL_ENV=/Users/dp/code/sglang-rust/.venv \
-PATH=/Users/dp/code/sglang-rust/.venv/bin:$PATH \
-LIBTORCH_USE_PYTORCH=1 \
-DYLD_LIBRARY_PATH=/Users/dp/code/sglang-rust/.venv/lib/python3.12/site-packages/torch/lib \
-cargo test --lib
+./scripts/run-rust-tests.sh cpu
 ```
 
 ## Engine

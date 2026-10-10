@@ -277,8 +277,11 @@ fn heterogeneous_factory_serving_prefill_decode_and_cached_extend_match_full_for
 }
 
 #[test]
+#[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
 fn cuda_heterogeneous_factory_serving_prefill_decode_and_cached_extend_match_full_forward() {
-    if tch::Cuda::is_available() {
-        compare_cached_and_full_forward(Device::Cuda(0));
-    }
+    assert!(
+        tch::Cuda::is_available(),
+        "CUDA test requires an available GPU"
+    );
+    compare_cached_and_full_forward(Device::Cuda(0));
 }

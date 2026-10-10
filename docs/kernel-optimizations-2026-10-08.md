@@ -147,7 +147,7 @@ Engine 给 model 配置 reserved_write_slot=0；decode graph 的 block table、r
 ```bash
 # Linux CUDA，构建与测试均使用项目 .venv
 uv sync --locked --extra cuda --group dev
-uv run --locked --extra cuda --group dev python -m unittest discover -s tests -p test_api_e2e.py -v
+uv run --locked --extra cuda --group dev python -m unittest discover -s tests -p 'test_*.py' -v
 
 # macOS / CPU
 uv sync --locked --group dev

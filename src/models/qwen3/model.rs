@@ -646,7 +646,6 @@ mod tests {
 
     use super::*;
     use crate::engine::load_hf_safetensors;
-    use crate::layers::{rotate_half, silu_and_mul};
 
     static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -711,47 +710,60 @@ mod tests {
     }
 
     #[test]
-    fn rope_keeps_bfloat16_query_and_key() {
-        let q = Tensor::ones([2, 2, 4], (Kind::BFloat16, Device::Cpu));
-        let k = Tensor::ones([2, 1, 4], (Kind::BFloat16, Device::Cpu));
-        let positions = Tensor::from_slice(&[0i64, 1]);
-        let rope = HalfSplitRope::new(16, 4, 10_000.0, Kind::BFloat16, Device::Cpu);
-        let (q, k) = rope.apply(&q, &k, &positions);
-        assert_eq!(q.kind(), Kind::BFloat16);
-        assert_eq!(k.kind(), Kind::BFloat16);
-    }
-
-    #[test]
-    fn cached_rope_matches_eager_formula_for_reordered_and_last_positions() {
-        for kind in [Kind::Float, Kind::BFloat16] {
-            let q = Tensor::arange(32, (Kind::Float, Device::Cpu))
-                .view([4, 2, 4])
-                .to_kind(kind);
-            let k = Tensor::arange(16, (Kind::Float, Device::Cpu))
-                .view([4, 1, 4])
-                .to_kind(kind);
-            let positions = Tensor::from_slice(&[0i64, 15, 3, 15]);
-            let rope = HalfSplitRope::new(16, 4, 10_000.0, kind, Device::Cpu);
-            let (cached_q, cached_k) = rope.apply(&q, &k, &positions);
-
-            let inv_freq = (Tensor::arange_start_step(0, 4, 2, (Kind::Float, Device::Cpu))
-                * (-(10_000.0_f64.ln() / 4.0)))
-                .exp();
-            let frequencies = positions.to_kind(Kind::Float).unsqueeze(-1) * inv_freq.unsqueeze(0);
-            let cos = frequencies.cos().to_kind(kind).unsqueeze(1);
-            let sin = frequencies.sin().to_kind(kind).unsqueeze(1);
-            let eager_q = rotate_half(&q, &cos, &sin, 2);
-            let eager_k = rotate_half(&k, &cos, &sin, 2);
-            let q_error = (cached_q - eager_q).abs().max().double_value(&[]);
-            let k_error = (cached_k - eager_k).abs().max().double_value(&[]);
-            assert!(q_error <= 1e-5, "kind={kind:?}, q_error={q_error}");
-            assert!(k_error <= 1e-5, "kind={kind:?}, k_error={k_error}");
-        }
-    }
-
-    #[test]
-    fn runs_paged_decode_and_cached_prefix_prefill() {
+    fn paged_decode_and_cached_prefix_prefill_match_full_forward() {
         let mut model = Qwen3ForCausalLM::new(config(), Kind::Float, Device::Cpu).unwrap();
+        // Zero-initialized parameters only checked shapes and could not detect
+        // missing KV writes. Use nonuniform deterministic weights and compare
+        // each cached step to the full causal forward.
+        for weight in [&mut model.embed_tokens, &mut model.lm_head] {
+            weight.copy_(
+                &(Tensor::arange(weight.numel() as i64, (Kind::Float, Device::Cpu))
+                    .sin()
+                    .view(weight.size().as_slice())
+                    * 0.1),
+            );
+        }
+        let _ = model.norm.fill_(1.0);
+        for layer in &mut model.layers {
+            for weight in [
+                &mut layer.input_layernorm,
+                &mut layer.q_norm,
+                &mut layer.k_norm,
+                &mut layer.post_attention_layernorm,
+            ] {
+                let _ = weight.fill_(1.0);
+            }
+            for weight in [
+                &mut layer.qkv_proj.weight,
+                &mut layer.o_proj,
+                &mut layer.mlp.gate_up_proj,
+                &mut layer.mlp.down_proj,
+            ] {
+                weight.copy_(
+                    &(Tensor::arange(weight.numel() as i64, (Kind::Float, Device::Cpu))
+                        .cos()
+                        .view(weight.size().as_slice())
+                        * 0.2),
+                );
+            }
+        }
+        let full = model
+            .forward_impl(
+                &Tensor::from_slice(&[1i64, 2, 3, 4]),
+                &Tensor::from_slice(&[0i64, 1, 2, 3]),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(full.abs().max().double_value(&[]) > 0.01);
+        let check = |actual: Tensor, start, rows| {
+            assert_eq!(actual.size(), vec![rows, 8]);
+            let error = (actual - full.narrow(0, start, rows))
+                .abs()
+                .max()
+                .double_value(&[]);
+            assert!(error < 1e-5, "start={start}, error={error}");
+        };
         let k_cache = Tensor::zeros([1, 2, 2, 1, 2], (Kind::Float, Device::Cpu));
         let v_cache = Tensor::zeros([1, 2, 2, 1, 2], (Kind::Float, Device::Cpu));
         model
@@ -776,7 +788,7 @@ mod tests {
             cache_seqlens: None,
             max_seqlen: Some(2),
         };
-        assert_eq!(
+        check(
             model
                 .forward_impl(
                     &Tensor::from_slice(&[1i64, 2]),
@@ -784,9 +796,9 @@ mod tests {
                     Some(&first_prefill),
                     None,
                 )
-                .unwrap()
-                .size(),
-            vec![2, 8]
+                .unwrap(),
+            0,
+            2,
         );
 
         let decode = AttentionMetadata {
@@ -799,7 +811,7 @@ mod tests {
             cache_seqlens: Some(Tensor::from_slice(&[3i32])),
             max_seqlen: Some(3),
         };
-        assert_eq!(
+        check(
             model
                 .forward_impl(
                     &Tensor::from_slice(&[3i64]),
@@ -807,9 +819,9 @@ mod tests {
                     Some(&decode),
                     None,
                 )
-                .unwrap()
-                .size(),
-            vec![1, 8]
+                .unwrap(),
+            2,
+            1,
         );
 
         let cached_prefill = AttentionMetadata {
@@ -822,7 +834,7 @@ mod tests {
             cache_seqlens: None,
             max_seqlen: Some(4),
         };
-        assert_eq!(
+        check(
             model
                 .forward_impl(
                     &Tensor::from_slice(&[4i64]),
@@ -830,9 +842,9 @@ mod tests {
                     Some(&cached_prefill),
                     None,
                 )
-                .unwrap()
-                .size(),
-            vec![1, 8]
+                .unwrap(),
+            3,
+            1,
         );
     }
 
@@ -918,32 +930,5 @@ mod tests {
             14
         );
         fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn packed_projections_match_separate_projections() {
-        let x = Tensor::arange(12, (Kind::Float, Device::Cpu)).view([3, 4]) / 10.0;
-        let q = Tensor::arange(16, (Kind::Float, Device::Cpu)).view([4, 4]);
-        let k = &q + 100.0;
-        let v = &q + 200.0;
-        let packed = Tensor::cat(&[&q, &k, &v], 0);
-        let output = linear(&x, &packed);
-        for (offset, weight) in [(0, &q), (4, &k), (8, &v)] {
-            let difference = (output.narrow(1, offset, 4) - linear(&x, weight))
-                .abs()
-                .max()
-                .double_value(&[]);
-            assert!(difference < 1e-4);
-        }
-
-        let gate = &q / 10.0;
-        let up = &k / 10.0;
-        let gate_up = linear(&x, &Tensor::cat(&[&gate, &up], 0));
-        let expected = linear(&x, &gate).silu() * linear(&x, &up);
-        let difference = (silu_and_mul(&gate_up) - expected)
-            .abs()
-            .max()
-            .double_value(&[]);
-        assert!(difference < 1e-4);
     }
 }

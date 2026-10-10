@@ -228,10 +228,12 @@ mod tests {
 
     #[cfg(has_cuda_kv_store)]
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn cuda_kv_store_preserves_packed_strides_padding_and_unwritten_slots() {
-        if !tch::Cuda::is_available() {
-            return;
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
         for kind in [Kind::BFloat16, Kind::Half] {
             for width in [7, 128] {
                 for index_kind in [Kind::Int, Kind::Int64] {
@@ -284,10 +286,12 @@ mod tests {
 
     #[cfg(has_cuda_kv_store)]
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn cuda_invalid_kv_indices_fail_in_isolated_process() {
-        if !tch::Cuda::is_available() {
-            return;
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
         if let Ok(index) = std::env::var("SGLANG_TEST_INVALID_KV_INDEX") {
             let device = Device::Cuda(0);
             let mut attention = BaseAttention::default();
@@ -312,7 +316,7 @@ mod tests {
         }
         for index in ["-1", "12"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "models::attention::base::tests::cuda_invalid_kv_indices_fail_in_isolated_process", "--nocapture"])
+                .args(["--exact", "models::attention::base::tests::cuda_invalid_kv_indices_fail_in_isolated_process", "--ignored", "--nocapture"])
                 .env("SGLANG_TEST_INVALID_KV_INDEX", index).output().unwrap();
             let message = format!(
                 "{}{}",
