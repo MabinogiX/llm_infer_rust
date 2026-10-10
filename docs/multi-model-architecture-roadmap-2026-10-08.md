@@ -110,6 +110,8 @@ ForwardOutput 初期以生成所需 logits 为核心，后续按真实需求增�
 
 已将 prefill 的桶目录、固定缓冲区、捕获、回放与失效释放移到通用 `SegmentedGraphRunner`。Qwen3 通过 `PrefillGraphProgram` 提供计算段和图外 attention；通用管理器不访问 decoder layers。另一个三段算术测试程序验证接口不依赖 Transformer 层结构，第二个实际模型的验证仍待后续接入。
 
+已优化分段 prefill 的图外执行：attention 元数据、缓存索引与 mask 在每批次准备一次，各层复用；相邻 graph 直接沿用 residual 固定地址；attention 写入固定输出，FlashInfer 直接输出到该地址，SDPA／`pt` 按接口能力保留必要写回。分段仍以 attention 为断点；共享 graph 内存池留待后续评估，性能收益需单独测量。
+
 graph 已使用按模式划分的 `GraphCapabilities` 显式声明，默认不启用；声明根据实际模型、backend、dtype 和 KV 绑定状态产生，并携带请求数／token／上下文与 padding 约束。未验证的组合回退 eager，启动日志说明能力拒绝原因，动态形状回退记录 debug 原因。
 
 原版 attention backend 将元数据处理区分为图外准备与图内静态形状操作，可以参考这一契约。保留已实现的启动时捕获策略和 graph 生命周期约定。
@@ -247,6 +249,18 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 远端 A100 GPU 1 release 全目标测试 136 项通过、1 项已有采样微基准忽略。BF16／FP16 × `pt`／`fa`／FlashInfer 六种分段 prefill 对照通过；真实 Qwen3-0.6B／BF16／FlashInfer 的 eager 与 decode＋segmented prefill graph 各 12 项 HTTP 回归通过。8 组不同长度和重复前缀请求的 text／usage／finish_reason 在两种模式间、与已有重构前基线均完全一致。服务日志确认两种 graph 捕获，release 二进制已更新，临时服务退出后 GPU 1 显存恢复至 7 MiB。
 
 远端验收记录为 `logs/execution-graph-tests-20261010.log`、`logs/execution-graph-build-20261010.log`、`logs/execution-graph-http-summary-20261010.log`、`logs/execution-graph-eager-graph-comparison-20261010.json` 及各模式服务／API 日志。本次没有性能测量；第二个实际模型的执行与 graph 接入验证仍待后续完成。
+
+### 5.6 分段 prefill 图外开销优化（2026-10-10）
+
+attention 元数据改为每个批次准备一次：`pt` 复用 query boundaries、prefix lengths、因果 mask 与缓存 gather 索引，`fa` 复用 padding／输出索引、缓存索引和 mask；各层只 gather 自己的 K/V 内容。FlashInfer planning 复用已读取的 host boundaries／prefixes，不再额外从 GPU 读取同一份元数据。
+
+分段接口允许后续 graph 直接消费上一段固定输出。Qwen3 移除每层独立 residual bridge 及其复制，attention 输出成为唯一的段间固定输入。图外 attention 通过 `forward_into` 写入固定输出：FlashInfer 直接传入已有 kernel 的输出指针，多请求 SDPA 用 `index_select_out` 写入解包结果；单请求 SDPA 与 `pt` 保留必要写回。只清零 attention 输出的 padding 行，真实 token 之外不发布 KV。没有改变 native kernel 算法，也没有引入共享 graph pool。
+
+本地 CPU 测试 124 项通过；远端 A100 GPU 1 的 15 项 CUDA 模块／集成测试通过，覆盖 BF16／FP16 × `pt`／`fa`／FlashInfer、缓存前缀、动态长度、padding、clear／recapture、跨段地址与权重／缓存重绑定。新增固定输出测试验证 native 返回值沿用调用方地址，且不覆盖真实 token 范围之外的存储。格式与 diff 检查通过。
+
+真实 Qwen3-0.6B／BF16／FlashInfer 下，优化版 eager／graph 各 12 项 HTTP 回归通过。另以改动前 `8e493744c995db99244038254e03a27384630b2b` 的原始实现构建基线，两种模式各 8 组贪心请求的 text／usage／finish_reason 在优化前后完全一致。额外发现其中一组共享前缀请求的 eager／graph 文本不一致：两请求最小复现及原始基线均出现相同差异，因此不是本次优化引入；本次不宣称两种模式任意输入都逐 token 一致，也不扩大为该既有差异的修复。
+
+五个源码文件同步并通过 SHA-256 核对；基线验证后远端源码与优化版 release 二进制均已恢复，临时服务退出后 GPU 1 显存恢复为 4 MiB。验收日志使用 `logs/prefill-output-opt-*-20261010.*`；旧版基线和最小复现分别使用 `logs/prefill-output-baseline*-20261010.*` 与 `logs/prefill-output-repro-*-20261010.*`。本次未做耗时／吞吐基准，不给出提速比例。
 
 ## 6. 本阶段范围之外
 

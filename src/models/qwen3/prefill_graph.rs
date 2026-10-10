@@ -9,13 +9,10 @@ impl PrefillGraphProgram for Qwen3ForCausalLM {
         let rows = tokens as i64;
         let mut segments = vec![vec![]];
         for layer in &self.layers {
-            segments.push(vec![
-                Tensor::zeros([rows, layer.qkv_proj.widths()[0]], (self.kind, self.device)),
-                Tensor::zeros(
-                    [rows, self.config.hidden_size as i64],
-                    (self.kind, self.device),
-                ),
-            ]);
+            segments.push(vec![Tensor::zeros(
+                [rows, layer.qkv_proj.widths()[0]],
+                (self.kind, self.device),
+            )]);
         }
         Ok(PrefillGraphInputs {
             ids: Tensor::ones([rows], (Kind::Int64, self.device)),
@@ -23,7 +20,12 @@ impl PrefillGraphProgram for Qwen3ForCausalLM {
             segments,
         })
     }
-    fn run_segment(&self, index: usize, inputs: &PrefillGraphInputs) -> Result<Vec<Tensor>> {
+    fn run_segment(
+        &self,
+        index: usize,
+        inputs: &PrefillGraphInputs,
+        previous: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
         let eps = self.config.rms_norm_eps;
         let mut profiler = ModelProfiler::new(self.device);
         if index == 0 {
@@ -41,7 +43,7 @@ impl PrefillGraphProgram for Qwen3ForCausalLM {
         let layer = &self.layers[index - 1];
         let segment = &inputs.segments[index];
         let (hidden, residual) =
-            layer.output_mlp(&segment[0], segment[1].shallow_clone(), eps, &mut profiler);
+            layer.output_mlp(&segment[0], previous[3].shallow_clone(), eps, &mut profiler);
         if let Some(next) = self.layers.get(index) {
             let (normalized, residual) = next.input_norm(&hidden, Some(residual), eps);
             let (q, k, v) = next.project_qkv(
@@ -75,17 +77,23 @@ struct QwenPrefillReplay<'a> {
     batch: ForwardBatch<'a>,
 }
 impl PrefillGraphReplay for QwenPrefillReplay<'_> {
-    fn run_eager(&self, index: usize, outputs: &[Tensor]) -> Result<Vec<Tensor>> {
+    fn run_eager(&self, index: usize, outputs: &[Tensor], inputs: &[Tensor]) -> Result<()> {
         let count = self.batch.tokens() as i64;
-        let raw = self.model.layers[index].attend(
+        let output = &inputs[0];
+        let _ = self.model.layers[index].attend(
             &outputs[0].narrow(0, 0, count),
             &outputs[1].narrow(0, 0, count),
             &outputs[2].narrow(0, 0, count),
             &self.attention,
             self.batch.attention,
             &mut ModelProfiler::new(self.model.device),
+            Some(&output.narrow(0, 0, count)),
         )?;
-        Ok(vec![raw, outputs[3].shallow_clone()])
+        // Only the attention output is padded; residual remains at its captured address.
+        if count < output.size()[0] {
+            let _ = output.narrow(0, count, output.size()[0] - count).zero_();
+        }
+        Ok(())
     }
     fn finish(&self, outputs: &[Tensor]) -> Result<ForwardOutput> {
         let hidden = outputs[0].narrow(0, 0, self.batch.tokens() as i64);
@@ -201,6 +209,15 @@ mod cuda_tests {
                 .unwrap()
                 .captured_sizes(),
             capture_sizes(64)
+        );
+        assert_eq!(
+            graph
+                .prefill_graph_runner
+                .as_ref()
+                .unwrap()
+                .bridge_input_counts(64),
+            vec![0, 1, 1, 1],
+            "only attention outputs need bridge buffers; residuals are graph outputs",
         );
         (eager, graph, ek, ev, gk, gv)
     }

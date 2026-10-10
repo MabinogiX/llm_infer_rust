@@ -60,8 +60,43 @@ pub struct AttentionBatch<'a> {
     backend: &'a dyn AttentionBackend,
     spec: AttentionSpec,
     metadata: Option<&'a AttentionMetadata>,
-    sequence_boundaries: Vec<i64>,
+    prefill: PrefillMetadata,
     plan: BackendPlan,
+}
+
+/// Host values are read once per invocation, never in layer forward.
+struct PrefillMetadata {
+    boundaries: Vec<i64>,
+    prefixes: Vec<i64>,
+}
+impl PrefillMetadata {
+    fn prepare(metadata: Option<&AttentionMetadata>, total_tokens: usize) -> Result<Self> {
+        let boundaries = batch_boundaries(metadata, total_tokens)?;
+        let prefixes =
+            if let Some(meta) = metadata.filter(|meta| meta.forward_mode == BatchPhase::Prefill) {
+                tensor_i32(meta.prefix_lens.as_ref(), "prefix_lens")?
+                    .into_iter()
+                    .map(i64::from)
+                    .collect()
+            } else {
+                vec![0; boundaries.len() - 1]
+            };
+        if prefixes.len() + 1 != boundaries.len() || prefixes.iter().any(|&prefix| prefix < 0) {
+            return Err(model_error("invalid prefill prefix lengths"));
+        }
+        Ok(Self {
+            boundaries,
+            prefixes,
+        })
+    }
+    fn has_prefix(&self) -> bool {
+        self.prefixes.iter().any(|&prefix| prefix > 0)
+    }
+}
+struct CacheRow {
+    indices: Tensor,
+    max_location: i64,
+    blocked: Tensor,
 }
 
 impl Attention {
@@ -125,13 +160,15 @@ impl Attention {
         metadata: Option<&'a AttentionMetadata>,
         total_tokens: usize,
     ) -> Result<AttentionBatch<'a>> {
-        let sequence_boundaries = batch_boundaries(metadata, total_tokens)?;
-        let plan = self.backend.prepare(metadata, self.spec, self.page_size)?;
+        let prefill = PrefillMetadata::prepare(metadata, total_tokens)?;
+        let plan = self
+            .backend
+            .prepare(metadata, &prefill, self.spec, self.page_size)?;
         Ok(AttentionBatch {
             backend: self.backend.as_ref(),
             spec: self.spec,
             metadata,
-            sequence_boundaries,
+            prefill,
             plan,
         })
     }
@@ -150,7 +187,7 @@ impl AttentionBatch<'_> {
             k,
             v,
             cache,
-            &self.sequence_boundaries,
+            &self.prefill,
             self.metadata,
             self.spec.num_heads,
             self.spec.num_kv_heads,
@@ -158,10 +195,57 @@ impl AttentionBatch<'_> {
             &self.plan,
         )
     }
+
+    /// Write live tokens into a caller-owned static output, preserving its address.
+    pub fn forward_into(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        cache: &BaseAttention,
+        output: &Tensor,
+    ) -> Result<()> {
+        if q.dim() != 3
+            || output.size() != [q.size()[0], self.spec.num_heads * self.spec.head_dim]
+            || output.kind() != self.spec.kind
+            || output.device() != self.spec.device
+            || !output.is_contiguous()
+        {
+            return Err(model_error("invalid static attention output"));
+        }
+        #[cfg(has_flashinfer)]
+        if matches!(self.plan, BackendPlan::FlashInferPrefill(_, _)) {
+            let _ =
+                flashinfer_prefill(q, k, v, cache, &self.plan, self.spec.head_dim, Some(output))?;
+            return Ok(());
+        }
+        if let BackendPlan::SdpaPrefill(prepared) = &self.plan {
+            let result = prepared.forward(
+                q,
+                k,
+                v,
+                cache,
+                self.spec.num_heads,
+                self.spec.num_kv_heads,
+                self.spec.head_dim,
+                Some(output),
+            )?;
+            if result.data_ptr() != output.data_ptr() {
+                output.shallow_clone().copy_(&result);
+            }
+            return Ok(());
+        }
+        // Backends without an out kernel still honor the fixed-address contract.
+        output.shallow_clone().copy_(&self.forward(q, k, v, cache)?);
+        Ok(())
+    }
 }
 
 enum BackendPlan {
     None,
+    CachedPrefill(Vec<CacheRow>),
+    PtPrefill(Vec<Tensor>),
+    SdpaPrefill(SdpaPrefillPlan),
     #[cfg(has_flashinfer)]
     FlashInfer(Rc<FlashInferPlan>),
     #[cfg(has_flashinfer)]
@@ -186,6 +270,7 @@ trait AttentionBackend {
     fn prepare(
         &self,
         _metadata: Option<&AttentionMetadata>,
+        _prefill: &PrefillMetadata,
         _spec: AttentionSpec,
         _page_size: Option<i64>,
     ) -> Result<BackendPlan> {
@@ -199,7 +284,7 @@ trait AttentionBackend {
         k: &Tensor,
         v: &Tensor,
         cache: &BaseAttention,
-        sequence_boundaries: &[i64],
+        prefill: &PrefillMetadata,
         metadata: Option<&AttentionMetadata>,
         num_heads: i64,
         num_kv_heads: i64,
@@ -279,6 +364,7 @@ impl AttentionBackend for FlashInferAttentionBackend {
     fn prepare(
         &self,
         metadata: Option<&AttentionMetadata>,
+        prefill: &PrefillMetadata,
         spec: AttentionSpec,
         page_size: Option<i64>,
     ) -> Result<BackendPlan> {
@@ -330,6 +416,7 @@ impl AttentionBackend for FlashInferAttentionBackend {
             }
             let prepared = prepare_flashinfer_prefill(
                 metadata,
+                prefill,
                 spec,
                 page_size.ok_or_else(|| model_error("FlashInfer requires a bound KV cache"))?,
                 cached.as_ref().map_or(std::ptr::null_mut(), |plan| plan.0),
@@ -337,10 +424,10 @@ impl AttentionBackend for FlashInferAttentionBackend {
             let plan = cached.get_or_insert_with(|| Rc::new(FlashInferPlan(prepared)));
             return Ok(BackendPlan::FlashInferPrefill(
                 Rc::clone(plan),
-                has_cached_prefix(metadata)?,
+                prefill.has_prefix(),
             ));
         }
-        Ok(BackendPlan::None)
+        FlashAttentionBackend.prepare(metadata, prefill, spec, page_size)
     }
 
     fn forward(
@@ -349,7 +436,7 @@ impl AttentionBackend for FlashInferAttentionBackend {
         k: &Tensor,
         v: &Tensor,
         cache: &BaseAttention,
-        sequence_boundaries: &[i64],
+        prefill: &PrefillMetadata,
         metadata: Option<&AttentionMetadata>,
         num_heads: i64,
         num_kv_heads: i64,
@@ -361,14 +448,14 @@ impl AttentionBackend for FlashInferAttentionBackend {
         }
         #[cfg(has_flashinfer)]
         if metadata.is_some() {
-            return flashinfer_prefill(q, k, v, cache, plan, head_dim);
+            return flashinfer_prefill(q, k, v, cache, plan, head_dim, None);
         }
         FlashAttentionBackend.forward(
             q,
             k,
             v,
             cache,
-            sequence_boundaries,
+            prefill,
             metadata,
             num_heads,
             num_kv_heads,
@@ -559,6 +646,7 @@ fn flashinfer_decode(
 #[cfg(has_flashinfer)]
 fn prepare_flashinfer_prefill(
     metadata: &AttentionMetadata,
+    prefill: &PrefillMetadata,
     spec: AttentionSpec,
     page_size: i64,
     existing: *mut std::ffi::c_void,
@@ -570,6 +658,8 @@ fn prepare_flashinfer_prefill(
             q_indptr: *const c_void,
             prefixes: *const c_void,
             table: *const c_void,
+            boundaries_host: *mut i32,
+            prefixes_host: *mut i32,
             q_heads: i64,
             kv_heads: i64,
             page_size: i64,
@@ -589,12 +679,22 @@ fn prepare_flashinfer_prefill(
         .block_table
         .as_ref()
         .ok_or_else(|| model_error("missing block_table"))?;
+    // Reuse the host snapshot already read at Attention::prepare, including its
+    // synchronization of previous work before the native plan reuses workspaces.
+    let mut boundaries_host: Vec<i32> = prefill
+        .boundaries
+        .iter()
+        .map(|&value| value as i32)
+        .collect();
+    let mut prefixes_host: Vec<i32> = prefill.prefixes.iter().map(|&value| value as i32).collect();
     let prepared = unsafe {
         sglang_flashinfer_prepare_prefill(
             existing,
             cumulative.as_ptr().cast(),
             prefixes.as_ptr().cast(),
             table.as_ptr().cast(),
+            boundaries_host.as_mut_ptr(),
+            prefixes_host.as_mut_ptr(),
             spec.num_heads,
             spec.num_kv_heads,
             page_size,
@@ -619,6 +719,7 @@ fn flashinfer_prefill(
     cache: &BaseAttention,
     plan: &BackendPlan,
     head_dim: i64,
+    output: Option<&Tensor>,
 ) -> Result<Tensor> {
     use std::ffi::{CStr, c_void};
     unsafe extern "C" {
@@ -627,6 +728,7 @@ fn flashinfer_prefill(
             q: *const c_void,
             k: *const c_void,
             v: *const c_void,
+            output: *const c_void,
         ) -> *mut c_void;
         fn sglang_flashinfer_error() -> *const std::ffi::c_char;
     }
@@ -642,12 +744,16 @@ fn flashinfer_prefill(
     } else {
         (k, v)
     };
+    let output = output.map(|out| out.view(q.size().as_slice()));
     let out = unsafe {
         sglang_flashinfer_prefill(
             plan.0,
             q.as_ptr().cast(),
             k.as_ptr().cast(),
             v.as_ptr().cast(),
+            output
+                .as_ref()
+                .map_or(std::ptr::null(), |out| out.as_ptr().cast()),
         )
     };
     if out.is_null() {
@@ -664,13 +770,78 @@ fn flashinfer_prefill(
 struct PyTorchAttentionBackend;
 
 impl AttentionBackend for PyTorchAttentionBackend {
+    fn prepare(
+        &self,
+        metadata: Option<&AttentionMetadata>,
+        prefill: &PrefillMetadata,
+        spec: AttentionSpec,
+        _page_size: Option<i64>,
+    ) -> Result<BackendPlan> {
+        if metadata.is_some_and(|meta| meta.forward_mode == BatchPhase::Decode) {
+            return Ok(BackendPlan::None);
+        }
+        if !prefill.has_prefix() {
+            return Ok(BackendPlan::PtPrefill(
+                prefill
+                    .boundaries
+                    .windows(2)
+                    .map(|bounds| {
+                        blocked_attention_mask(
+                            bounds[1] - bounds[0],
+                            bounds[1] - bounds[0],
+                            0,
+                            spec.device,
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+        let table = metadata
+            .and_then(|meta| meta.req_to_token.as_ref())
+            .ok_or_else(|| model_error("cached prefill requires req_to_token"))?;
+        if table.dim() != 2 || table.size()[0] != prefill.prefixes.len() as i64 {
+            return Err(model_error("invalid cached prefill table shape"));
+        }
+        let mut rows = Vec::with_capacity(prefill.prefixes.len());
+        for (index, (bounds, &prefix)) in prefill
+            .boundaries
+            .windows(2)
+            .zip(&prefill.prefixes)
+            .enumerate()
+        {
+            let length = prefix + bounds[1] - bounds[0];
+            if length > table.size()[1] {
+                return Err(model_error("invalid cache sequence length"));
+            }
+            let locations = tensor_i32(
+                Some(&table.get(index as i64).narrow(0, 0, length)),
+                "req_to_token",
+            )?;
+            if locations.iter().any(|&loc| loc < 0) {
+                return Err(model_error(
+                    "req_to_token contains an invalid cache location",
+                ));
+            }
+            let max_location = i64::from(*locations.iter().max().unwrap());
+            let indices = Tensor::from_slice(&locations)
+                .to_device(spec.device)
+                .to_kind(Kind::Int64);
+            rows.push(CacheRow {
+                indices,
+                max_location,
+                blocked: blocked_attention_mask(bounds[1] - bounds[0], length, prefix, spec.device),
+            });
+        }
+        Ok(BackendPlan::CachedPrefill(rows))
+    }
+
     fn forward(
         &self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
         cache: &BaseAttention,
-        sequence_boundaries: &[i64],
+        prefill: &PrefillMetadata,
         metadata: Option<&AttentionMetadata>,
         num_heads: i64,
         num_kv_heads: i64,
@@ -681,22 +852,35 @@ impl AttentionBackend for PyTorchAttentionBackend {
             if metadata.forward_mode == BatchPhase::Decode {
                 return decode_with_cache(q, cache, metadata, num_heads, num_kv_heads, head_dim);
             }
-            if has_cached_prefix(metadata)? {
-                return prefill_with_cache(q, cache, metadata, num_heads, num_kv_heads, head_dim);
+            if prefill.has_prefix() {
+                return prefill_with_cache(
+                    q,
+                    cache,
+                    prefill,
+                    _plan,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                );
             }
         }
 
-        let mut outputs = Vec::with_capacity(sequence_boundaries.len().saturating_sub(1));
-        for boundaries in sequence_boundaries.windows(2) {
+        let BackendPlan::PtPrefill(masks) = _plan else {
+            return Err(model_error("missing PyTorch prefill plan"));
+        };
+        let mut outputs = Vec::with_capacity(prefill.boundaries.len().saturating_sub(1));
+        for (boundaries, blocked) in prefill.boundaries.windows(2).zip(masks) {
             let start = boundaries[0];
             let length = boundaries[1] - start;
-            outputs.push(causal_attention(
+            outputs.push(attention_against_cache(
                 &q.narrow(0, start, length),
                 &k.narrow(0, start, length),
                 &v.narrow(0, start, length),
+                0,
                 num_heads,
                 num_kv_heads,
                 head_dim,
+                Some(blocked),
             ));
         }
         Ok(Tensor::cat(&outputs, 0))
@@ -707,13 +891,30 @@ impl AttentionBackend for PyTorchAttentionBackend {
 struct FlashAttentionBackend;
 
 impl AttentionBackend for FlashAttentionBackend {
+    fn prepare(
+        &self,
+        metadata: Option<&AttentionMetadata>,
+        prefill: &PrefillMetadata,
+        spec: AttentionSpec,
+        _page_size: Option<i64>,
+    ) -> Result<BackendPlan> {
+        if metadata.is_some_and(|meta| meta.forward_mode == BatchPhase::Decode) {
+            return Ok(BackendPlan::None);
+        }
+        Ok(BackendPlan::SdpaPrefill(SdpaPrefillPlan::prepare(
+            prefill,
+            metadata,
+            spec.device,
+        )?))
+    }
+
     fn forward(
         &self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
         cache: &BaseAttention,
-        sequence_boundaries: &[i64],
+        _prefill: &PrefillMetadata,
         metadata: Option<&AttentionMetadata>,
         num_heads: i64,
         num_kv_heads: i64,
@@ -732,30 +933,178 @@ impl AttentionBackend for FlashAttentionBackend {
                 );
             }
         }
-        let prefixes = if let Some(metadata) = metadata {
-            tensor_i32(metadata.prefix_lens.as_ref(), "prefix_lens")?
-                .into_iter()
-                .map(i64::from)
-                .collect::<Vec<_>>()
-        } else {
-            vec![0; sequence_boundaries.len().saturating_sub(1)]
+        let BackendPlan::SdpaPrefill(prepared) = _plan else {
+            return Err(model_error("missing SDPA prefill plan"));
         };
-        batched_prefill_sdpa(
-            q,
-            k,
-            v,
-            cache,
-            sequence_boundaries,
-            &prefixes,
-            metadata,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-        )
+        prepared.forward(q, k, v, cache, num_heads, num_kv_heads, head_dim, None)
     }
 }
 
-/// Packs variable-length requests into one padded SDPA invocation per model layer.
+/// Padded SDPA layout and masks are independent of layer K/V values.
+struct SdpaPrefillPlan {
+    batch_size: i64,
+    max_query: i64,
+    indices: Option<Tensor>,
+    output_indices: Option<Tensor>,
+    cache_indices: Option<Tensor>,
+    mask: Option<Tensor>,
+}
+impl SdpaPrefillPlan {
+    fn prepare(
+        prefill: &PrefillMetadata,
+        metadata: Option<&AttentionMetadata>,
+        device: Device,
+    ) -> Result<Self> {
+        let boundaries = &prefill.boundaries;
+        let prefixes = &prefill.prefixes;
+        let batch_size = prefixes.len();
+        if batch_size == 0 {
+            return Err(model_error("empty prefill batch"));
+        }
+        let lengths: Vec<_> = boundaries
+            .windows(2)
+            .map(|bounds| bounds[1] - bounds[0])
+            .collect();
+        if lengths.iter().any(|&length| length <= 0) {
+            return Err(model_error("prefill requests must contain uncached tokens"));
+        }
+        if batch_size == 1 && prefixes[0] == 0 {
+            return Ok(Self {
+                batch_size: 1,
+                max_query: lengths[0],
+                indices: None,
+                output_indices: None,
+                cache_indices: None,
+                mask: None,
+            });
+        }
+        let max_query = *lengths.iter().max().unwrap();
+        let max_key = lengths
+            .iter()
+            .zip(prefixes)
+            .map(|(&len, &prefix)| len + prefix)
+            .max()
+            .unwrap();
+        let mut padded_indices = Vec::with_capacity(batch_size * max_query as usize);
+        let mut output_indices = Vec::with_capacity(*boundaries.last().unwrap() as usize);
+        for (row, bounds) in boundaries.windows(2).enumerate() {
+            for position in 0..max_query {
+                padded_indices.push(bounds[0] + position.min(lengths[row] - 1));
+            }
+            for position in 0..lengths[row] {
+                output_indices.push(row as i64 * max_query + position);
+            }
+        }
+        let indices = Some(Tensor::from_slice(&padded_indices).to_device(device));
+        let output_indices = Some(Tensor::from_slice(&output_indices).to_device(device));
+        let (cache_indices, mask) = if prefill.has_prefix() {
+            let table = metadata
+                .and_then(|meta| meta.req_to_token.as_ref())
+                .ok_or_else(|| model_error("cached prefill requires req_to_token"))?;
+            if table.dim() != 2 || table.size()[0] != batch_size as i64 || table.size()[1] < max_key
+            {
+                return Err(model_error("cached prefill page table is too small"));
+            }
+            let cache_indices = table
+                .narrow(1, 0, max_key)
+                .clamp_min(0)
+                .to_kind(Kind::Int64);
+            let query_positions = Tensor::arange(max_query, (Kind::Int64, device)).unsqueeze(0)
+                + Tensor::from_slice(prefixes).to_device(device).unsqueeze(1);
+            let key_positions = Tensor::arange(max_key, (Kind::Int64, device));
+            let key_lengths: Vec<_> = lengths
+                .iter()
+                .zip(prefixes)
+                .map(|(&len, &prefix)| len + prefix)
+                .collect();
+            let mask = key_positions
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .le_tensor(&query_positions.unsqueeze(2))
+                .logical_and(
+                    &key_positions
+                        .unsqueeze(0)
+                        .lt_tensor(
+                            &Tensor::from_slice(&key_lengths)
+                                .to_device(device)
+                                .unsqueeze(1),
+                        )
+                        .unsqueeze(1),
+                )
+                .unsqueeze(1);
+            (Some(cache_indices), Some(mask))
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            batch_size: batch_size as i64,
+            max_query,
+            indices,
+            output_indices,
+            cache_indices,
+            mask,
+        })
+    }
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        cache: &BaseAttention,
+        num_heads: i64,
+        num_kv_heads: i64,
+        head_dim: i64,
+        target: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let Some(indices) = &self.indices else {
+            return sdpa_attention(q, k, v, 0, num_heads, num_kv_heads, head_dim);
+        };
+        let batch_size = self.batch_size;
+        let max_query = self.max_query;
+        let query = q
+            .index_select(0, indices)
+            .view([batch_size, max_query, num_heads, head_dim])
+            .permute([0, 2, 1, 3]);
+        let (keys, values) = if let Some(locations) = &self.cache_indices {
+            cache.read_kv_padded(locations)?
+        } else {
+            (
+                k.index_select(0, indices)
+                    .view([batch_size, max_query, num_kv_heads, head_dim]),
+                v.index_select(0, indices)
+                    .view([batch_size, max_query, num_kv_heads, head_dim]),
+            )
+        };
+        let repeats = num_heads / num_kv_heads;
+        let keys = keys
+            .repeat_interleave_self_int(repeats, 2, Some(num_heads))
+            .permute([0, 2, 1, 3]);
+        let values = values
+            .repeat_interleave_self_int(repeats, 2, Some(num_heads))
+            .permute([0, 2, 1, 3]);
+        let output = Tensor::f_scaled_dot_product_attention(
+            &query,
+            &keys,
+            &values,
+            self.mask.as_ref(),
+            0.0,
+            self.mask.is_none(),
+            None,
+            false,
+        )?;
+        let output = output
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size * max_query, num_heads * head_dim]);
+        match target {
+            Some(target) => {
+                Ok(output.f_index_select_out(target, 0, self.output_indices.as_ref().unwrap())?)
+            }
+            None => Ok(output.index_select(0, self.output_indices.as_ref().unwrap())),
+        }
+    }
+}
+
+#[cfg(test)]
 fn batched_prefill_sdpa(
     q: &Tensor,
     k: &Tensor,
@@ -768,138 +1117,30 @@ fn batched_prefill_sdpa(
     num_kv_heads: i64,
     head_dim: i64,
 ) -> Result<Tensor> {
-    let batch_size = prefixes.len();
-    if batch_size == 0
-        || boundaries.len() != batch_size + 1
+    if prefixes.is_empty()
+        || boundaries.len() != prefixes.len() + 1
         || boundaries[0] != 0
-        || boundaries[batch_size] != q.size()[0]
+        || *boundaries.last().unwrap() != q.size()[0]
         || prefixes.iter().any(|&prefix| prefix < 0)
     {
         return Err(model_error(
             "invalid prefill batch boundaries or prefix lengths",
         ));
     }
-    let lengths = boundaries
-        .windows(2)
-        .map(|bounds| bounds[1] - bounds[0])
-        .collect::<Vec<_>>();
-    if lengths.iter().any(|&length| length <= 0) {
-        return Err(model_error("prefill requests must contain uncached tokens"));
-    }
-    if batch_size == 1 && prefixes[0] == 0 {
-        return sdpa_attention(q, k, v, 0, num_heads, num_kv_heads, head_dim);
-    }
-    let max_query = *lengths.iter().max().unwrap();
-    let max_key = lengths
-        .iter()
-        .zip(prefixes)
-        .map(|(&length, &prefix)| length + prefix)
-        .max()
-        .unwrap();
-    let mut padded_indices = Vec::with_capacity(batch_size * max_query as usize);
-    let mut output_indices = Vec::with_capacity(q.size()[0] as usize);
-    for (row, bounds) in boundaries.windows(2).enumerate() {
-        for position in 0..max_query {
-            padded_indices.push(bounds[0] + position.min(lengths[row] - 1));
-        }
-        for position in 0..lengths[row] {
-            output_indices.push(row as i64 * max_query + position);
-        }
-    }
-    let indices = Tensor::from_slice(&padded_indices).to_device(q.device());
-    let query = q
-        .index_select(0, &indices)
-        .view([batch_size as i64, max_query, num_heads, head_dim])
-        .permute([0, 2, 1, 3]);
-    let has_prefix = prefixes.iter().any(|&prefix| prefix > 0);
-    let (keys, values) = if has_prefix {
-        let table = metadata
-            .and_then(|meta| meta.req_to_token.as_ref())
-            .ok_or_else(|| model_error("cached prefill requires req_to_token"))?;
-        if table.size()[0] != batch_size as i64 || table.size()[1] < max_key {
-            return Err(model_error("cached prefill page table is too small"));
-        }
-        let locations = table.narrow(1, 0, max_key);
-        cache.read_kv_padded(&locations.clamp_min(0).to_kind(Kind::Int64))?
-    } else {
-        let keys = k.index_select(0, &indices).view([
-            batch_size as i64,
-            max_query,
-            num_kv_heads,
-            head_dim,
-        ]);
-        let values = v.index_select(0, &indices).view([
-            batch_size as i64,
-            max_query,
-            num_kv_heads,
-            head_dim,
-        ]);
-        (keys, values)
+    let prefill = PrefillMetadata {
+        boundaries: boundaries.to_vec(),
+        prefixes: prefixes.to_vec(),
     };
-    let repeats = num_heads / num_kv_heads;
-    let keys = keys
-        .repeat_interleave_self_int(repeats, 2, Some(num_heads))
-        .permute([0, 2, 1, 3]);
-    let values = values
-        .repeat_interleave_self_int(repeats, 2, Some(num_heads))
-        .permute([0, 2, 1, 3]);
-    let output = if has_prefix {
-        let query_positions = Tensor::arange(max_query, (Kind::Int64, q.device())).unsqueeze(0)
-            + Tensor::from_slice(prefixes)
-                .to_device(q.device())
-                .unsqueeze(1);
-        let key_positions = Tensor::arange(max_key, (Kind::Int64, q.device()));
-        let key_lengths = lengths
-            .iter()
-            .zip(prefixes)
-            .map(|(&length, &prefix)| length + prefix)
-            .collect::<Vec<_>>();
-        let mask = key_positions
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .le_tensor(&query_positions.unsqueeze(2))
-            .logical_and(
-                &key_positions
-                    .unsqueeze(0)
-                    .lt_tensor(
-                        &Tensor::from_slice(&key_lengths)
-                            .to_device(q.device())
-                            .unsqueeze(1),
-                    )
-                    .unsqueeze(1),
-            )
-            .unsqueeze(1);
-        Tensor::f_scaled_dot_product_attention(
-            &query,
-            &keys,
-            &values,
-            Some(&mask),
-            0.0,
-            false,
-            None,
-            false,
-        )?
-    } else {
-        // Right padding is already hidden from every real query by causal masking.
-        // Keeping attn_mask=None lets LibTorch select its fused Flash kernel.
-        Tensor::f_scaled_dot_product_attention(
-            &query,
-            &keys,
-            &values,
-            None::<&Tensor>,
-            0.0,
-            true,
-            None,
-            false,
-        )?
-    };
-    let output = output
-        .permute([0, 2, 1, 3])
-        .reshape([batch_size as i64 * max_query, num_heads * head_dim]);
-    Ok(output.index_select(
-        0,
-        &Tensor::from_slice(&output_indices).to_device(q.device()),
-    ))
+    SdpaPrefillPlan::prepare(&prefill, metadata, q.device())?.forward(
+        q,
+        k,
+        v,
+        cache,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        None,
+    )
 }
 
 fn sdpa_attention(
@@ -1006,44 +1247,45 @@ fn sdpa_decode_with_cache(
 fn prefill_with_cache(
     q: &Tensor,
     cache: &BaseAttention,
-    metadata: &AttentionMetadata,
+    prefill: &PrefillMetadata,
+    plan: &BackendPlan,
     num_heads: i64,
     num_kv_heads: i64,
     head_dim: i64,
 ) -> Result<Tensor> {
-    let boundaries = prefill_boundaries(metadata, q.size()[0] as usize)?;
-    let prefix_lens = tensor_i32(metadata.prefix_lens.as_ref(), "prefix_lens")?;
-    if prefix_lens.len() + 1 != boundaries.len() {
-        return Err(model_error(
-            "prefix_lens must contain one value per prefill request",
-        ));
-    }
-    let table = metadata
-        .req_to_token
-        .as_ref()
-        .ok_or_else(|| model_error("cached prefill requires req_to_token"))?;
-    let mut outputs = Vec::with_capacity(prefix_lens.len());
-    for (request_index, (&prefix_len, boundaries)) in
-        prefix_lens.iter().zip(boundaries.windows(2)).enumerate()
+    let BackendPlan::CachedPrefill(rows) = plan else {
+        return Err(model_error("missing cached prefill plan"));
+    };
+    let (k_cache, v_cache) = cache.cache_tensors()?;
+    let shape = k_cache.size();
+    let capacity = shape[0] * shape[1];
+    let mut outputs = Vec::with_capacity(rows.len());
+    for ((bounds, &prefix), row) in prefill
+        .boundaries
+        .windows(2)
+        .zip(&prefill.prefixes)
+        .zip(rows)
     {
-        if prefix_len < 0 {
-            return Err(model_error("prefix_lens cannot be negative"));
+        if row.max_location >= capacity {
+            return Err(model_error(
+                "req_to_token points outside the bound KV cache",
+            ));
         }
-        let start = boundaries[0];
-        let query_len = boundaries[1] - start;
-        let (cached_k, cached_v) = cache.read_kv(
-            table,
-            request_index as i64,
-            i64::from(prefix_len) + query_len,
-        )?;
+        let cached_k = k_cache
+            .view([-1, shape[2], shape[3]])
+            .index_select(0, &row.indices);
+        let cached_v = v_cache
+            .view([-1, shape[2], shape[3]])
+            .index_select(0, &row.indices);
         outputs.push(attention_against_cache(
-            &q.narrow(0, start, query_len),
+            &q.narrow(0, bounds[0], bounds[1] - bounds[0]),
             &cached_k,
             &cached_v,
-            i64::from(prefix_len),
+            prefix,
             num_heads,
             num_kv_heads,
             head_dim,
+            Some(&row.blocked),
         ));
     }
     Ok(Tensor::cat(&outputs, 0))
@@ -1085,6 +1327,7 @@ fn decode_with_cache(
             num_heads,
             num_kv_heads,
             head_dim,
+            None,
         ));
     }
     Ok(Tensor::cat(&outputs, 0))
@@ -1139,6 +1382,7 @@ fn decode_with_cache_padded(
         .reshape([batch_size, num_heads * head_dim]))
 }
 
+#[cfg(test)]
 fn causal_attention(
     q: &Tensor,
     k: &Tensor,
@@ -1171,6 +1415,14 @@ fn causal_attention(
         .reshape([sequence_length, num_heads * head_dim])
 }
 
+fn blocked_attention_mask(query_len: i64, key_len: i64, prefix: i64, device: Device) -> Tensor {
+    let query_positions = Tensor::arange(query_len, (Kind::Int64, device)) + prefix;
+    let key_positions = Tensor::arange(key_len, (Kind::Int64, device));
+    key_positions
+        .unsqueeze(0)
+        .gt_tensor(&query_positions.unsqueeze(1))
+}
+
 fn attention_against_cache(
     q: &Tensor,
     k: &Tensor,
@@ -1179,7 +1431,9 @@ fn attention_against_cache(
     num_heads: i64,
     num_kv_heads: i64,
     head_dim: i64,
+    blocked: Option<&Tensor>,
 ) -> Tensor {
+    let query_len = q.size()[0];
     let q = q.transpose(0, 1);
     let repeats = num_heads / num_kv_heads;
     let k = k
@@ -1188,16 +1442,17 @@ fn attention_against_cache(
     let v = v
         .transpose(0, 1)
         .repeat_interleave_self_int(repeats, 0, Some(num_heads));
-    let query_len = q.size()[1];
-    let key_len = k.size()[1];
-    let query_positions = Tensor::arange(query_len, (Kind::Int64, q.device())) + prefix_len;
-    let key_positions = Tensor::arange(key_len, (Kind::Int64, q.device()));
-    let mask = key_positions
-        .unsqueeze(0)
-        .le_tensor(&query_positions.unsqueeze(1));
+    let owned_mask;
+    let blocked = match blocked {
+        Some(mask) => mask,
+        None => {
+            owned_mask = blocked_attention_mask(q.size()[1], k.size()[1], prefix_len, q.device());
+            &owned_mask
+        }
+    };
     let scale = (head_dim as f64).sqrt().recip();
     (q.bmm(&k.transpose(1, 2)) * scale)
-        .masked_fill(&mask.logical_not().unsqueeze(0), f64::NEG_INFINITY)
+        .masked_fill(&blocked.unsqueeze(0), f64::NEG_INFINITY)
         .softmax(-1, Kind::Float)
         .to_kind(v.kind())
         .bmm(&v)
@@ -1234,12 +1489,6 @@ fn prefill_boundaries(metadata: &AttentionMetadata, total_tokens: usize) -> Resu
     Ok(boundaries.into_iter().map(i64::from).collect())
 }
 
-fn has_cached_prefix(metadata: &AttentionMetadata) -> Result<bool> {
-    Ok(tensor_i32(metadata.prefix_lens.as_ref(), "prefix_lens")?
-        .into_iter()
-        .any(|prefix| prefix > 0))
-}
-
 fn tensor_i32(tensor: Option<&Tensor>, field: &str) -> Result<Vec<i32>> {
     let tensor = tensor.ok_or_else(|| model_error(&format!("missing {field}")))?;
     Vec::<i32>::try_from(&tensor.to_device(Device::Cpu)).map_err(ModelRunnerError::Torch)
@@ -1252,6 +1501,134 @@ fn model_error(message: &str) -> ModelRunnerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_prefill_reuses_metadata_and_writes_static_outputs() {
+        let device = Device::Cpu;
+        let spec = AttentionSpec {
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            kind: Kind::Float,
+            device,
+        };
+        let mut cache = BaseAttention::default();
+        let keys = Tensor::from_slice(&[1f32, 0., 0., 1., 1., 1., 2., 1., 1., 2., 0., 2.])
+            .view([1, 6, 1, 2]);
+        let values = &keys * 2.;
+        cache
+            .bind_kv_cache(keys.shallow_clone(), values.shallow_clone())
+            .unwrap();
+        let q = Tensor::from_slice(&[1f32, 0., 0., 1., 1., 1.]).view([3, 1, 2]);
+        for backend in ["pt", "fa"] {
+            for prefixes in [[0i32, 0], [1, 0]] {
+                let metadata = AttentionMetadata {
+                    forward_mode: BatchPhase::Prefill,
+                    cu_seqlens_q: Some(Tensor::from_slice(&[0i32, 2, 3])),
+                    prefix_lens: Some(Tensor::from_slice(&prefixes)),
+                    req_to_token: Some(Tensor::from_slice(&[0i32, 1, 2, 3, 4, 5]).view([2, 3])),
+                    write_loc: None,
+                    block_table: None,
+                    cache_seqlens: None,
+                    max_seqlen: None,
+                };
+                let attention = Attention::new(backend, spec).unwrap();
+                let batch = attention.prepare(Some(&metadata), 3).unwrap();
+                let expected = if prefixes[0] == 0 {
+                    Tensor::cat(
+                        &[
+                            sdpa_attention(
+                                &q.narrow(0, 0, 2),
+                                &q.narrow(0, 0, 2),
+                                &q.narrow(0, 0, 2),
+                                0,
+                                1,
+                                1,
+                                2,
+                            )
+                            .unwrap(),
+                            sdpa_attention(
+                                &q.narrow(0, 2, 1),
+                                &q.narrow(0, 2, 1),
+                                &q.narrow(0, 2, 1),
+                                0,
+                                1,
+                                1,
+                                2,
+                            )
+                            .unwrap(),
+                        ],
+                        0,
+                    )
+                } else {
+                    Tensor::cat(
+                        &[
+                            sdpa_attention(
+                                &q.narrow(0, 0, 2),
+                                &keys.view([6, 1, 2]).narrow(0, 0, 3),
+                                &values.view([6, 1, 2]).narrow(0, 0, 3),
+                                1,
+                                1,
+                                1,
+                                2,
+                            )
+                            .unwrap(),
+                            sdpa_attention(
+                                &q.narrow(0, 2, 1),
+                                &keys.view([6, 1, 2]).narrow(0, 3, 1),
+                                &values.view([6, 1, 2]).narrow(0, 3, 1),
+                                0,
+                                1,
+                                1,
+                                2,
+                            )
+                            .unwrap(),
+                        ],
+                        0,
+                    )
+                };
+                // A layer forward must use the invocation snapshot, not re-read
+                // cu_seqlens, prefixes or cached locations from metadata tensors.
+                let _ = metadata
+                    .cu_seqlens_q
+                    .as_ref()
+                    .unwrap()
+                    .shallow_clone()
+                    .fill_(-1);
+                let _ = metadata
+                    .prefix_lens
+                    .as_ref()
+                    .unwrap()
+                    .shallow_clone()
+                    .fill_(-1);
+                let _ = metadata
+                    .req_to_token
+                    .as_ref()
+                    .unwrap()
+                    .shallow_clone()
+                    .fill_(-1);
+                for _ in 0..2 {
+                    let actual = batch.forward(&q, &q, &q, &cache).unwrap();
+                    assert!(
+                        (&actual - &expected).abs().max().double_value(&[]) < 1e-5,
+                        "{backend}"
+                    );
+                    let storage = Tensor::full([5, 2], 99., (Kind::Float, device));
+                    let output = storage.narrow(0, 0, 3);
+                    let ptr = output.data_ptr();
+                    batch.forward_into(&q, &q, &q, &cache, &output).unwrap();
+                    assert_eq!(output.data_ptr(), ptr);
+                    assert!(
+                        (&output - &expected).abs().max().double_value(&[]) < 1e-5,
+                        "{backend}"
+                    );
+                    assert_eq!(storage.narrow(0, 3, 2).min().double_value(&[]), 99.);
+                    assert!(batch.forward_into(&q, &q, &q, &cache, &storage).is_err());
+                }
+                assert!(attention.prepare(Some(&metadata), 3).is_err());
+            }
+        }
+    }
 
     #[cfg(has_flashinfer)]
     #[test]
@@ -1388,6 +1765,27 @@ mod tests {
                     .unwrap();
                 assert!(matches!(batch.plan, BackendPlan::FlashInferPrefill(_, _)));
                 let actual = batch.forward(&q, &k, &v, &cache).unwrap();
+                let storage = Tensor::full([i64::from(bounds[2]) + 3, 2048], 99., (kind, device));
+                let target = storage.narrow(0, 0, i64::from(bounds[2]));
+                let ptr = target.data_ptr();
+                batch.forward_into(&q, &k, &v, &cache, &target).unwrap();
+                assert_eq!(target.data_ptr(), ptr);
+                assert!(Tensor::equal(&actual, &target));
+                assert_eq!(
+                    storage
+                        .narrow(0, i64::from(bounds[2]), 3)
+                        .min()
+                        .double_value(&[]),
+                    99.
+                );
+                let direct =
+                    flashinfer_prefill(&q, &k, &v, &cache, &batch.plan, 128, Some(&target))
+                        .unwrap();
+                assert_eq!(
+                    direct.data_ptr(),
+                    ptr,
+                    "native prefill must return the supplied storage"
+                );
                 let reference = batched_prefill_sdpa(
                     &q,
                     &k,

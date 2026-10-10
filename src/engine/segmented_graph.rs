@@ -17,7 +17,14 @@ pub struct PrefillGraphInputs {
 /// A model describes computation only; the runner owns native graphs and buckets.
 pub trait PrefillGraphProgram {
     fn create_inputs(&self, tokens: usize) -> Result<PrefillGraphInputs>;
-    fn run_segment(&self, index: usize, inputs: &PrefillGraphInputs) -> Result<Vec<Tensor>>;
+    /// Previous captured outputs have stable addresses and remain owned by the runner.
+    /// A segment may consume them directly without a bridge copy.
+    fn run_segment(
+        &self,
+        index: usize,
+        inputs: &PrefillGraphInputs,
+        previous_outputs: &[Tensor],
+    ) -> Result<Vec<Tensor>>;
     /// Prepare backend plans outside graphs, once per live invocation.
     fn prepare_replay<'a>(
         &'a self,
@@ -26,8 +33,9 @@ pub trait PrefillGraphProgram {
 }
 
 pub trait PrefillGraphReplay {
-    /// Run the eager seam after segment `index`; return the next segment's inputs.
-    fn run_eager(&self, index: usize, outputs: &[Tensor]) -> Result<Vec<Tensor>>;
+    /// Write the eager seam into the next segment's fixed inputs. Implementations
+    /// must initialize padding without writing KV for padded tokens.
+    fn run_eager(&self, index: usize, outputs: &[Tensor], inputs: &[Tensor]) -> Result<()>;
     /// Produce independently owned live-request logits, outside captured segments.
     fn finish(&self, outputs: &[Tensor]) -> Result<ForwardOutput>;
 }
@@ -102,6 +110,15 @@ impl SegmentedGraphRunner {
         self.failed.iter().copied().collect()
     }
     #[cfg(all(test, has_cuda_graph))]
+    pub(crate) fn bridge_input_counts(&self, size: usize) -> Vec<usize> {
+        self.graphs[&size]
+            .inputs
+            .segments
+            .iter()
+            .map(Vec::len)
+            .collect()
+    }
+    #[cfg(all(test, has_cuda_graph))]
     pub(crate) fn remove_bucket(&mut self, size: usize) {
         self.graphs.remove(&size);
     }
@@ -129,10 +146,13 @@ impl SegmentedGraphRunner {
                 ));
             }
         }
-        let mut segments = Vec::new();
+        let mut segments: Vec<Segment> = Vec::new();
         for index in 0..inputs.segments.len() {
+            let previous = segments
+                .last()
+                .map_or(&[][..], |segment| segment.outputs.as_slice());
             let (native, outputs) =
-                NativeCudaGraph::capture(device, || program.run_segment(index, &inputs))?;
+                NativeCudaGraph::capture(device, || program.run_segment(index, &inputs, previous))?;
             if outputs.is_empty() {
                 return Err(error("segment must return outputs"));
             }
@@ -184,8 +204,11 @@ impl SegmentedGraphRunner {
             .copy_(&batch.positions.view([-1]));
         graph.segments[0].native.replay()?;
         for index in 0..graph.segments.len() - 1 {
-            let values = replay.run_eager(index, &graph.segments[index].outputs)?;
-            copy_segment_inputs(&graph.inputs.segments[index + 1], &values)?;
+            replay.run_eager(
+                index,
+                &graph.segments[index].outputs,
+                &graph.inputs.segments[index + 1],
+            )?;
             graph.segments[index + 1].native.replay()?;
         }
         replay
@@ -194,32 +217,6 @@ impl SegmentedGraphRunner {
     }
 }
 
-fn copy_segment_inputs(targets: &[Tensor], sources: &[Tensor]) -> Result<()> {
-    if targets.len() != sources.len() {
-        return Err(error("eager seam returned the wrong input count"));
-    }
-    for (target, source) in targets.iter().zip(sources) {
-        let a = target.size();
-        let b = source.size();
-        if a.is_empty()
-            || b.is_empty()
-            || a.len() != b.len()
-            || a[1..] != b[1..]
-            || b[0] > a[0]
-            || source.kind() != target.kind()
-            || source.device() != target.device()
-        {
-            return Err(error("eager seam returned incompatible segment inputs"));
-        }
-    }
-    for (target, source) in targets.iter().zip(sources) {
-        if source.size()[0] < target.size()[0] {
-            let _ = target.shallow_clone().zero_();
-        }
-        target.narrow(0, 0, source.size()[0]).copy_(source);
-    }
-    Ok(())
-}
 fn error(message: &str) -> ModelRunnerError {
     ModelRunnerError::Model(message.into())
 }
@@ -278,29 +275,6 @@ mod tests {
         assert_eq!(bucket(1001, 1000), None);
         assert_eq!(bucket(1, 0), None);
     }
-    #[test]
-    fn validates_all_segment_inputs_before_copying_and_zeroes_padding() {
-        let target = Tensor::ones([4, 2], (Kind::Float, Device::Cpu));
-        let other = Tensor::ones([4, 3], (Kind::Float, Device::Cpu));
-        let source = Tensor::full([2, 2], 7.0, (Kind::Float, Device::Cpu));
-        assert!(
-            copy_segment_inputs(
-                &[target.shallow_clone(), other],
-                &[source.shallow_clone(), source.shallow_clone()]
-            )
-            .is_err()
-        );
-        assert_eq!(target.sum(Kind::Float).double_value(&[]), 8.0);
-        copy_segment_inputs(&[target.shallow_clone()], &[source]).unwrap();
-        assert_eq!(
-            target.narrow(0, 0, 2).sum(Kind::Float).double_value(&[]),
-            28.0
-        );
-        assert_eq!(
-            target.narrow(0, 2, 2).sum(Kind::Float).double_value(&[]),
-            0.0
-        );
-    }
 }
 
 #[cfg(all(test, has_cuda_graph))]
@@ -336,7 +310,7 @@ mod cuda_tests {
             let x = (batch.input_ids.view([-1]).to_kind(Kind::Float) * &self.weight
                 + batch.positions.view([-1]).to_kind(Kind::Float)
                 + 1.)
-                * 6.;
+                * 8.;
             Ok(ForwardOutput::new(
                 x.view([-1, 1])
                     .index_select(0, batch.logits_indices().unwrap()),
@@ -371,7 +345,12 @@ mod cuda_tests {
                 ],
             })
         }
-        fn run_segment(&self, index: usize, inputs: &PrefillGraphInputs) -> Result<Vec<Tensor>> {
+        fn run_segment(
+            &self,
+            index: usize,
+            inputs: &PrefillGraphInputs,
+            previous: &[Tensor],
+        ) -> Result<Vec<Tensor>> {
             Ok(vec![match index {
                 0 => (inputs.ids.to_kind(Kind::Float) * &self.weight
                     + inputs.positions.to_kind(Kind::Float))
@@ -380,6 +359,7 @@ mod cuda_tests {
                 _ => {
                     inputs.segments[2][0].sum_dim_intlist([1i64].as_slice(), true, Kind::Float)
                         + &inputs.segments[2][1]
+                        + &previous[0]
                 }
             }])
         }
@@ -394,13 +374,21 @@ mod cuda_tests {
         batch: ForwardBatch<'a>,
     }
     impl PrefillGraphReplay for ArithmeticReplay<'_> {
-        fn run_eager(&self, index: usize, outputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        fn run_eager(&self, index: usize, outputs: &[Tensor], inputs: &[Tensor]) -> Result<()> {
             let live = outputs[0].narrow(0, 0, self.batch.tokens() as i64);
-            Ok(if index == 0 {
+            let values = if index == 0 {
                 vec![live + 1.]
             } else {
                 vec![live.repeat([1, 2]), outputs[0].shallow_clone()]
-            })
+            };
+            for (target, value) in inputs.iter().zip(values) {
+                let rows = value.size()[0];
+                target.narrow(0, 0, rows).copy_(&value);
+                if rows < target.size()[0] {
+                    let _ = target.narrow(0, rows, target.size()[0] - rows).zero_();
+                }
+            }
+            Ok(())
         }
         fn finish(&self, outputs: &[Tensor]) -> Result<ForwardOutput> {
             Ok(ForwardOutput::new(
@@ -502,7 +490,7 @@ mod cuda_tests {
             );
             assert_eq!(
                 runner.forward(&batch).unwrap().logits.double_value(&[0, 0]),
-                30.
+                40.
             );
             let pool = KVCachePool::new(
                 KVCacheLayout::new(1, 4, 2, 1, 1).unwrap(),
