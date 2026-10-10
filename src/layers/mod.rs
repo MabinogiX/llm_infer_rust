@@ -12,5 +12,3 @@ mod ops;
 pub(crate) use linear::{PackedQkv, embedding, linear, logits};
 pub(crate) use mlp::DenseSwiGlu;
 pub(crate) use ops::{HalfSplitRope, add_rms_norm, qk_norm, rms_norm};
-#[cfg(test)]
-pub(crate) use ops::{rotate_half, silu_and_mul};

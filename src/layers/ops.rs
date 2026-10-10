@@ -266,10 +266,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn fused_cuda_ops_match_eager_bfloat16() {
-        if !Cuda::is_available() {
-            return;
-        }
+        assert!(Cuda::is_available(), "CUDA test requires an available GPU");
         let device = Device::Cuda(0);
         tch::manual_seed(7);
         let hidden = Tensor::randn([3, 1024], (Kind::BFloat16, device));
@@ -321,10 +320,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn fused_add_norm_matches_fp32_sum_for_both_cuda_dtypes() {
-        if !Cuda::is_available() {
-            return;
-        }
+        assert!(Cuda::is_available(), "CUDA test requires an available GPU");
         tch::manual_seed(19);
         for kind in [Kind::BFloat16, Kind::Half] {
             for tokens in [1, 3, 65] {
@@ -359,10 +357,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn cuda_norm_handles_padded_rows_and_partial_head_warps() {
-        if !Cuda::is_available() {
-            return;
-        }
+        assert!(Cuda::is_available(), "CUDA test requires an available GPU");
         tch::manual_seed(41);
         for kind in [Kind::BFloat16, Kind::Half] {
             let tolerance = if kind == Kind::Half {
@@ -417,35 +414,87 @@ mod residual_semantics_tests {
 
     #[test]
     fn normalization_uses_unrounded_fp32_residual_sum() {
-        let mut devices = vec![Device::Cpu];
-        #[cfg(has_layer_cuda)]
-        if tch::Cuda::is_available() {
-            devices.push(Device::Cuda(0));
-        }
-        for device in devices.drain(..) {
-            let x = Tensor::ones([1, 1024], (Kind::BFloat16, device));
-            let residual = Tensor::from_slice(&[0.00390625f32, 0.0078125])
-                .to_kind(Kind::BFloat16)
-                .to_device(device)
-                .view([1, 2])
-                .repeat([1, 512]);
-            let weight = Tensor::ones([1024], (Kind::BFloat16, device));
-            let rounded = rms_norm(&(&x + &residual), &weight, 1e-6);
-            let expected = Tensor::ones_like(&x);
-            assert!(
-                !rounded.equal(&expected),
-                "fixture must distinguish the old semantics"
-            );
-            let (actual, sum) = add_rms_norm(x, residual, &weight, 1e-6);
-            assert!(actual.equal(&expected));
-            assert!(
-                sum.narrow(1, 0, 2).equal(
-                    &Tensor::from_slice(&[1f32, 1.0078125])
-                        .to_kind(Kind::BFloat16)
-                        .to_device(device)
-                        .view([1, 2])
-                )
-            );
+        check_normalization_uses_unrounded_fp32_residual_sum(Device::Cpu);
+    }
+
+    #[cfg(has_layer_cuda)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_normalization_uses_unrounded_fp32_residual_sum() {
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
+        check_normalization_uses_unrounded_fp32_residual_sum(Device::Cuda(0));
+    }
+
+    fn check_normalization_uses_unrounded_fp32_residual_sum(device: Device) {
+        let x = Tensor::ones([1, 1024], (Kind::BFloat16, device));
+        let residual = Tensor::from_slice(&[0.00390625f32, 0.0078125])
+            .to_kind(Kind::BFloat16)
+            .to_device(device)
+            .view([1, 2])
+            .repeat([1, 512]);
+        let weight = Tensor::ones([1024], (Kind::BFloat16, device));
+        let rounded = rms_norm(&(&x + &residual), &weight, 1e-6);
+        let expected = Tensor::ones_like(&x);
+        assert!(
+            !rounded.equal(&expected),
+            "fixture must distinguish the old semantics"
+        );
+        let (actual, sum) = add_rms_norm(x, residual, &weight, 1e-6);
+        assert!(actual.equal(&expected));
+        assert!(
+            sum.narrow(1, 0, 2).equal(
+                &Tensor::from_slice(&[1f32, 1.0078125])
+                    .to_kind(Kind::BFloat16)
+                    .to_device(device)
+                    .view([1, 2])
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod rope_tests {
+    use super::*;
+
+    #[test]
+    fn rope_keeps_bfloat16_query_and_key() {
+        let q = Tensor::ones([2, 2, 4], (Kind::BFloat16, Device::Cpu));
+        let k = Tensor::ones([2, 1, 4], (Kind::BFloat16, Device::Cpu));
+        let positions = Tensor::from_slice(&[0i64, 1]);
+        let rope = HalfSplitRope::new(16, 4, 10_000.0, Kind::BFloat16, Device::Cpu);
+        let (q, k) = rope.apply(&q, &k, &positions);
+        assert_eq!(q.kind(), Kind::BFloat16);
+        assert_eq!(k.kind(), Kind::BFloat16);
+    }
+
+    #[test]
+    fn cached_rope_matches_eager_formula_for_reordered_and_last_positions() {
+        for kind in [Kind::Float, Kind::BFloat16] {
+            let q = Tensor::arange(32, (Kind::Float, Device::Cpu))
+                .view([4, 2, 4])
+                .to_kind(kind);
+            let k = Tensor::arange(16, (Kind::Float, Device::Cpu))
+                .view([4, 1, 4])
+                .to_kind(kind);
+            let positions = Tensor::from_slice(&[0i64, 15, 3, 15]);
+            let rope = HalfSplitRope::new(16, 4, 10_000.0, kind, Device::Cpu);
+            let (cached_q, cached_k) = rope.apply(&q, &k, &positions);
+
+            let inv_freq = (Tensor::arange_start_step(0, 4, 2, (Kind::Float, Device::Cpu))
+                * (-(10_000.0_f64.ln() / 4.0)))
+                .exp();
+            let frequencies = positions.to_kind(Kind::Float).unsqueeze(-1) * inv_freq.unsqueeze(0);
+            let cos = frequencies.cos().to_kind(kind).unsqueeze(1);
+            let sin = frequencies.sin().to_kind(kind).unsqueeze(1);
+            let eager_q = rotate_half(&q, &cos, &sin, 2);
+            let eager_k = rotate_half(&k, &cos, &sin, 2);
+            let q_error = (cached_q - eager_q).abs().max().double_value(&[]);
+            let k_error = (cached_k - eager_k).abs().max().double_value(&[]);
+            assert!(q_error <= 1e-5, "kind={kind:?}, q_error={q_error}");
+            assert!(k_error <= 1e-5, "kind={kind:?}, k_error={k_error}");
         }
     }
 }

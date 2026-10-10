@@ -1255,10 +1255,12 @@ mod tests {
 
     #[cfg(has_flashinfer)]
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn flashinfer_reuses_workspace_and_updates_decode_plans() {
-        if !tch::Cuda::is_available() {
-            return;
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
         unsafe extern "C" {
             fn sglang_flashinfer_workspace_allocations(plan: *const std::ffi::c_void) -> u64;
         }
@@ -1333,10 +1335,12 @@ mod tests {
 
     #[cfg(has_flashinfer)]
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn flashinfer_prefill_matches_reference_for_ragged_and_cached_batches() {
-        if !tch::Cuda::is_available() {
-            return;
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
         let device = Device::Cuda(0);
         for kind in [Kind::BFloat16, Kind::Half] {
             let spec = AttentionSpec {

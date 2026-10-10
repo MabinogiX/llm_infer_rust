@@ -474,10 +474,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn flashinfer_graph_replays_dynamic_pages_lengths_and_padded_batches() {
-        if !Cuda::is_available() {
-            return;
-        }
+        assert!(Cuda::is_available(), "CUDA test requires an available GPU");
         let device = Device::Cuda(0);
         let pool = Rc::new(RefCell::new(
             KVCachePool::new(

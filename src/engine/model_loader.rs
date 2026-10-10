@@ -1,8 +1,7 @@
 //! Hugging Face safetensors discovery and loading.
 //!
 //! This module loads actual checkpoint tensors. Binding their names to Rust
-//! model parameters is intentionally left to the model architecture module;
-//! no architecture has been migrated yet.
+//! model parameters is left to the registered model implementation.
 
 use std::{
     collections::BTreeSet,
@@ -57,7 +56,7 @@ pub type Result<T> = std::result::Result<T, ModelLoadError>;
 ///
 /// The registry itself belongs with the model implementations; keeping this
 /// trait here lets Engine own the same construction lifecycle as mini-sglang
-/// without hard-coding an architecture that has not been migrated.
+/// without hard-coding a model architecture.
 pub trait ModelFactory {
     /// Declare full-attention state in model layer order. The runtime never
     /// infers heterogeneous geometry from a representative global head count.
@@ -231,6 +230,46 @@ mod tests {
             load_hf_safetensors(&path),
             Err(ModelLoadError::UnsafeShardPath(_))
         ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn loads_indexed_shards_once_and_preserves_tensor_values() {
+        let path = model_dir();
+        let first = Tensor::from_slice(&[1f32, 2.]);
+        let second = Tensor::from_slice(&[3f32, 4.]);
+        Tensor::write_safetensors(
+            &[("a", &first), ("b", &second)],
+            path.join("part-1.safetensors"),
+        )
+        .unwrap();
+        Tensor::write_safetensors(&[("c", &second)], path.join("part-2.safetensors")).unwrap();
+        fs::write(path.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"part-1.safetensors","b":"part-1.safetensors","c":"part-2.safetensors"}}"#,
+        ).unwrap();
+        let weights = load_hf_safetensors(&path).unwrap().into_tensors();
+        assert_eq!(weights.len(), 3);
+        for (name, actual) in weights {
+            let expected = if name == "a" { &first } else { &second };
+            assert!(actual.equal(expected), "{name}");
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_names_across_shards() {
+        let path = model_dir();
+        let tensor = Tensor::ones([2], (Kind::Float, Device::Cpu));
+        for shard in ["part-1.safetensors", "part-2.safetensors"] {
+            Tensor::write_safetensors(&[("duplicate", &tensor)], path.join(shard)).unwrap();
+        }
+        fs::write(
+            path.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"part-1.safetensors","b":"part-2.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(load_hf_safetensors(&path),
+            Err(ModelLoadError::DuplicateTensor(name)) if name == "duplicate"));
         fs::remove_dir_all(path).unwrap();
     }
 }

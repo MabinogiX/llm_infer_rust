@@ -26,7 +26,7 @@ export BENCH_TOKENIZER=/path/to/Qwen3-0.6B
 export BENCH_MAX_SEQ_LEN=40960 # 与服务实际 --max-seq-len 一致
 ```
 
-服务目前没有 `GET /v1/models`，必须显式配置 `BENCH_MODEL`（缺省为服务默认的 `default`）。`BENCH_TOKENIZER` 缺省读取相邻 `mini-sglang/Qwen/Qwen3-0.6B`。三个工具都走 `/v1/chat/completions`；`BENCH_BASE_URL` 只填服务根 URL，不加 `/v1`。
+服务支持 `GET /v1/models`。benchmark 脚本仍使用显式配置的 `BENCH_MODEL`（缺省为服务默认的 `default`），不会自动选择模型。`BENCH_TOKENIZER` 缺省读取相邻 `mini-sglang/Qwen/Qwen3-0.6B`。三个工具都走 `/v1/chat/completions`；`BENCH_BASE_URL` 只填服务根 URL，不加 `/v1`。
 
 ## 启动
 

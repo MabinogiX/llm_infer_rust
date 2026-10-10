@@ -470,10 +470,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn cuda_heterogeneous_cache_preserves_prefix_branch_cleanup_and_padding() {
-        if tch::Cuda::is_available() {
-            heterogeneous_lifecycle(Device::Cuda(0));
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
+        heterogeneous_lifecycle(Device::Cuda(0));
     }
 
     fn pool(num_pages: usize) -> KVCachePool {

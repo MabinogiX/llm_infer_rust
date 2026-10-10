@@ -424,10 +424,12 @@ mod cuda_tests {
             .unwrap();
     }
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn non_transformer_segments_handle_padding_failure_fallback_and_rebinding() {
-        if !tch::Cuda::is_available() {
-            return;
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
         tch::no_grad(|| {
             let device = Device::Cuda(0);
             let mut runner = ModelRunner::new(

@@ -12,7 +12,7 @@ fi
 
 echo "OpenAI SDK protocol tests"
 run_or_print env SGLANG_E2E_BASE_URL="${base_url}/v1" SGLANG_E2E_MODEL="$model" \
-    "$protocol_python" -m unittest discover -s "${repo_dir}/tests" -p test_api_e2e.py -v
+    "$protocol_python" -m unittest discover -s "${repo_dir}/tests" -p 'test_*.py' -v
 
 echo "GSM8K small correctness check"
 "${benchmark_dir}/lm_eval/gsm8k.sh"

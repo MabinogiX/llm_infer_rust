@@ -295,10 +295,12 @@ mod tests {
 
     #[cfg(has_flashinfer)]
     #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn flashinfer_sampling_preserves_support_distribution_and_rng() {
-        if !tch::Cuda::is_available() {
-            return;
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
         let device = tch::Device::Cuda(0);
         let logits = Tensor::from_slice(&[4f32, 3., 2., 1., 0.])
             .view([1, 5])
@@ -405,9 +407,10 @@ mod tests {
     #[test]
     #[ignore = "GPU microbenchmark; run alone with --nocapture"]
     fn benchmark_sampling_cuda() {
-        if !tch::Cuda::is_available() {
-            return;
-        }
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
         let device = tch::Device::Cuda(0);
         for rows in [1i64, 8] {
             let logits = Tensor::randn([rows, 151936], (Kind::Float, device));
@@ -461,33 +464,41 @@ mod tests {
 
     #[test]
     fn joint_top_k_top_p_uses_original_probability_mass() {
-        let mut devices = vec![tch::Device::Cpu];
-        #[cfg(has_flashinfer)]
-        if tch::Cuda::is_available() {
-            devices.push(tch::Device::Cuda(0));
-        }
-        for device in devices.drain(..) {
-            // Original nucleus keeps 0.4 and 0.3 for p=0.5; top-k=2 keeps
-            // both. Sequential renormalization would incorrectly keep only 0.4.
-            let logits = Tensor::from_slice(&[0.4f32, 0.3, 0.2, 0.1])
-                .log()
-                .view([1, 4])
-                .to_device(device)
-                .repeat([20000, 1]);
-            let params = SamplingParams {
-                temperature: 1.,
-                top_k: 2,
-                top_p: 0.5,
-                ..Default::default()
-            };
-            let ids = Sampler.sample_batch(&logits, &vec![params; 20000]).unwrap();
-            assert!(ids.iter().all(|&id| id == 0 || id == 1));
-            let frequency = ids.iter().filter(|&&id| id == 1).count() as f64 / 20000.;
-            assert!(
-                (frequency - 3. / 7.).abs() < 0.02,
-                "device={device:?},frequency={frequency}"
-            );
-        }
+        check_joint_top_k_top_p_uses_original_probability_mass(tch::Device::Cpu);
+    }
+
+    #[cfg(has_flashinfer)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_joint_top_k_top_p_uses_original_probability_mass() {
+        assert!(
+            tch::Cuda::is_available(),
+            "CUDA test requires an available GPU"
+        );
+        check_joint_top_k_top_p_uses_original_probability_mass(tch::Device::Cuda(0));
+    }
+
+    fn check_joint_top_k_top_p_uses_original_probability_mass(device: tch::Device) {
+        // Original nucleus keeps 0.4 and 0.3 for p=0.5; top-k=2 keeps
+        // both. Sequential renormalization would incorrectly keep only 0.4.
+        let logits = Tensor::from_slice(&[0.4f32, 0.3, 0.2, 0.1])
+            .log()
+            .view([1, 4])
+            .to_device(device)
+            .repeat([20000, 1]);
+        let params = SamplingParams {
+            temperature: 1.,
+            top_k: 2,
+            top_p: 0.5,
+            ..Default::default()
+        };
+        let ids = Sampler.sample_batch(&logits, &vec![params; 20000]).unwrap();
+        assert!(ids.iter().all(|&id| id == 0 || id == 1));
+        let frequency = ids.iter().filter(|&&id| id == 1).count() as f64 / 20000.;
+        assert!(
+            (frequency - 3. / 7.).abs() < 0.02,
+            "device={device:?},frequency={frequency}"
+        );
     }
 
     #[test]
