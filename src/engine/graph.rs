@@ -34,6 +34,7 @@ impl DecodeGraphRunner {
         runner: &ModelRunner,
         args: &ServerArgs,
         _pool: Rc<RefCell<KVCachePool>>,
+        context: Option<&Rc<NativeGraphCaptureContext>>,
     ) -> Result<Option<Self>> {
         if crate::logging::step_timing_enabled() {
             tracing::info!("CUDA Graph disabled for synchronized SGLANG_PROFILE_STEPS profiling");
@@ -77,6 +78,9 @@ impl DecodeGraphRunner {
             tracing::warn!("CUDA Graph bridge unavailable; using eager decode");
             return Ok(None);
         }
+        let context = context.ok_or_else(|| {
+            ModelRunnerError::Model("CUDA graph capture context is missing".into())
+        })?;
         let pad_pages = Tensor::zeros([limit as i64], (Kind::Int, runner.device()));
         let pad_locations = Tensor::zeros_like(&pad_pages);
         let mut graph_runner = Self {
@@ -90,13 +94,14 @@ impl DecodeGraphRunner {
         if sizes.last().copied() != Some(limit) {
             sizes.push(limit);
         }
-        for size in sizes {
+        for size in sizes.into_iter().rev() {
             tracing::info!(size, "capturing CUDA decode graph");
-            match graph_runner.capture_one(runner, args, device_index, size) {
+            match graph_runner.capture_one(runner, args, context, device_index, size) {
                 Ok(graph) => {
                     graph_runner.graphs.insert(size, graph);
                 }
                 Err(error) => {
+                    context.check_execution_stream()?;
                     tracing::warn!(size, %error, "CUDA Graph capture failed; this batch size uses eager decode");
                 }
             }
@@ -113,6 +118,7 @@ impl DecodeGraphRunner {
         &self,
         runner: &ModelRunner,
         args: &ServerArgs,
+        context: &Rc<NativeGraphCaptureContext>,
         device_index: usize,
         size: usize,
     ) -> Result<CapturedGraph> {
@@ -148,7 +154,7 @@ impl DecodeGraphRunner {
             metadata.req_to_token = None;
         }
         Cuda::synchronize(device_index as i64);
-        let native = NativeCudaGraph::create(device_index)?;
+        let native = NativeCudaGraph::create(context)?;
         for _ in 0..3 {
             let _ = runner
                 .run_model(&ForwardBatch {
@@ -310,9 +316,73 @@ fn copy_field(target: &Option<Tensor>, source: &Option<Tensor>, rows: i64) -> Re
     Ok(())
 }
 
+/// One model/device capture catalog. Rc also prevents cross-thread graph use.
+pub(crate) struct NativeGraphCaptureContext {
+    device: usize,
+    #[cfg(has_cuda_graph)]
+    ptr: *mut std::ffi::c_void,
+}
+
+impl NativeGraphCaptureContext {
+    pub(crate) fn device_index(&self) -> usize {
+        self.device
+    }
+    pub(crate) fn new(device: usize) -> Result<Rc<Self>> {
+        #[cfg(has_cuda_graph)]
+        {
+            let ptr = unsafe { sglang_graph_context_create(device as i32) };
+            if ptr.is_null() {
+                return Err(native_error());
+            }
+            Ok(Rc::new(Self { device, ptr }))
+        }
+        #[cfg(not(has_cuda_graph))]
+        {
+            let _ = device;
+            Err(ModelRunnerError::Model(
+                "CUDA Graph bridge unavailable".into(),
+            ))
+        }
+    }
+
+    /// Check before copying inputs, planning attention or launching any graph work.
+    pub(crate) fn check_execution_stream(&self) -> Result<()> {
+        #[cfg(has_cuda_graph)]
+        if !unsafe { sglang_graph_context_check(self.ptr) } {
+            return Err(native_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn memory_bytes(&self) -> Result<(i64, i64)> {
+        #[cfg(has_cuda_graph)]
+        {
+            let (mut allocated, mut reserved) = (0, 0);
+            if !unsafe { sglang_graph_memory(self.device as i32, &mut allocated, &mut reserved) } {
+                return Err(native_error());
+            }
+            Ok((allocated, reserved))
+        }
+        #[cfg(not(has_cuda_graph))]
+        {
+            Ok((0, 0))
+        }
+    }
+}
+
+impl Drop for NativeGraphCaptureContext {
+    fn drop(&mut self) {
+        #[cfg(has_cuda_graph)]
+        unsafe {
+            sglang_graph_context_free(self.ptr)
+        };
+    }
+}
+
 pub(crate) struct NativeCudaGraph {
     #[cfg(has_cuda_graph)]
     ptr: *mut std::ffi::c_void,
+    _context: Rc<NativeGraphCaptureContext>,
 }
 
 impl NativeCudaGraph {
@@ -323,15 +393,15 @@ impl NativeCudaGraph {
     /// Warm and capture a GPU-only segment on a side stream. The caller owns
     /// all fixed inputs and outputs until this graph is destroyed.
     pub(crate) fn capture<T>(
-        device: usize,
+        context: &Rc<NativeGraphCaptureContext>,
         mut forward: impl FnMut() -> Result<T>,
     ) -> Result<(Self, T)> {
-        Cuda::synchronize(device as i64);
-        let graph = Self::create(device)?;
+        Cuda::synchronize(context.device as i64);
+        let graph = Self::create(context)?;
         for _ in 0..3 {
             let _ = forward()?;
         }
-        Cuda::synchronize(device as i64);
+        Cuda::synchronize(context.device as i64);
         graph.begin()?;
         let output = match forward() {
             Ok(output) => output,
@@ -344,18 +414,21 @@ impl NativeCudaGraph {
         Ok((graph, output))
     }
 
-    fn create(device: usize) -> Result<Self> {
+    fn create(context: &Rc<NativeGraphCaptureContext>) -> Result<Self> {
         #[cfg(has_cuda_graph)]
         {
-            let ptr = unsafe { sglang_graph_create(device as i32) };
+            let ptr = unsafe { sglang_graph_create(context.ptr) };
             if ptr.is_null() {
                 return Err(native_error());
             }
-            return Ok(Self { ptr });
+            return Ok(Self {
+                ptr,
+                _context: context.clone(),
+            });
         }
         #[cfg(not(has_cuda_graph))]
         {
-            let _ = device;
+            let _ = context;
             Err(ModelRunnerError::Model(
                 "CUDA Graph bridge unavailable".to_owned(),
             ))
@@ -404,7 +477,11 @@ fn native_error() -> ModelRunnerError {
 
 #[cfg(has_cuda_graph)]
 unsafe extern "C" {
-    fn sglang_graph_create(device: i32) -> *mut std::ffi::c_void;
+    fn sglang_graph_memory(device: i32, allocated: *mut i64, reserved: *mut i64) -> bool;
+    fn sglang_graph_context_create(device: i32) -> *mut std::ffi::c_void;
+    fn sglang_graph_context_free(context: *mut std::ffi::c_void);
+    fn sglang_graph_context_check(context: *mut std::ffi::c_void) -> bool;
+    fn sglang_graph_create(context: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
     fn sglang_graph_begin(graph: *mut std::ffi::c_void) -> bool;
     fn sglang_graph_end(graph: *mut std::ffi::c_void) -> bool;
     fn sglang_graph_replay(graph: *mut std::ffi::c_void) -> bool;
@@ -516,9 +593,14 @@ mod tests {
         args.cuda_graph_bs = Some(4);
         args.max_seq_len = 1024;
         let free = pool.borrow().free_count();
-        let graph = DecodeGraphRunner::capture(&runner, &args, pool.clone())
-            .unwrap()
-            .unwrap();
+        let graph = DecodeGraphRunner::capture(
+            &runner,
+            &args,
+            pool.clone(),
+            Some(&NativeGraphCaptureContext::new(0).unwrap()),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(graph.graphs.keys().copied().collect::<Vec<_>>(), [1, 2, 4]);
         assert_eq!(pool.borrow().free_count(), free);
         let mut retained = None;
@@ -615,17 +697,113 @@ mod tests {
         }
         drop(graph);
         assert_eq!(pool.borrow().free_count(), free);
-        let graph = DecodeGraphRunner::capture(&runner, &args, pool.clone())
-            .unwrap()
-            .unwrap();
+        let graph = DecodeGraphRunner::capture(
+            &runner,
+            &args,
+            pool.clone(),
+            Some(&NativeGraphCaptureContext::new(0).unwrap()),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(graph.graphs.len(), 3);
         drop(graph);
         args.cuda_graph_bs = Some(0);
         assert!(
-            DecodeGraphRunner::capture(&runner, &args, pool.clone())
-                .unwrap()
-                .is_none()
+            DecodeGraphRunner::capture(
+                &runner,
+                &args,
+                pool.clone(),
+                Some(&NativeGraphCaptureContext::new(0).unwrap())
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(pool.borrow().free_count(), free);
+    }
+}
+
+#[cfg(all(test, has_cuda_graph))]
+mod shared_pool_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn shared_pool_replays_retained_outputs_and_recovers_closure_failure() {
+        let context = NativeGraphCaptureContext::new(0).unwrap();
+        let weak = Rc::downgrade(&context);
+        let x = Tensor::ones([256, 1024], (Kind::Float, Device::Cuda(0)));
+        let calls = Cell::new(0);
+        // Three successful warmups, then a Rust error during real capture.
+        let failed = NativeCudaGraph::capture(&context, || {
+            let temporary = &x * 3.;
+            calls.set(calls.get() + 1);
+            if calls.get() == 4 {
+                return Err(ModelRunnerError::Model(
+                    "injected capture closure failure".into(),
+                ));
+            }
+            Ok(temporary)
+        });
+        assert!(failed.is_err());
+        context.check_execution_stream().unwrap();
+        let (a, output_a) =
+            NativeCudaGraph::capture(&context, || Ok((&x * 2.).repeat([1, 4]))).unwrap();
+        let (b, output_b) =
+            NativeCudaGraph::capture(&context, || Ok((&x * 5.).repeat([1, 2]))).unwrap();
+        // Check before any subsequent graph can overwrite temporary storage.
+        a.replay().unwrap();
+        let retained = output_a.copy();
+        for graph in [&b, &a, &a, &b, &b, &a] {
+            graph.replay().unwrap();
+        }
+        assert_eq!(output_a.double_value(&[0, 0]), 2.);
+        assert_eq!(output_b.double_value(&[0, 0]), 5.);
+        assert_eq!(retained.double_value(&[0, 0]), 2.);
+        // A graph cannot be launched on another catalog's selected capture stream.
+        let other = NativeGraphCaptureContext::new(0).unwrap();
+        let unfinished = NativeCudaGraph::create(&other).unwrap();
+        assert!(a.replay().is_err());
+        drop(unfinished);
+        a.replay().unwrap();
+        Cuda::synchronize(0);
+        drop(context);
+        assert!(
+            weak.upgrade().is_some(),
+            "native graphs retain the shared context"
+        );
+        drop((a, b, output_a, output_b));
+        assert!(weak.upgrade().is_none());
+        let fresh = NativeGraphCaptureContext::new(0).unwrap();
+        let (graph, output) = NativeCudaGraph::capture(&fresh, || Ok(&x + 7.)).unwrap();
+        graph.replay().unwrap();
+        assert_eq!(output.double_value(&[0, 0]), 8.);
+        Cuda::synchronize(0);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn shared_pool_invalid_cuda_capture_restores_stream_and_requires_new_context() {
+        let context = NativeGraphCaptureContext::new(0).unwrap();
+        let x = Tensor::ones([1], (Kind::Float, Device::Cuda(0)));
+        let calls = Cell::new(0);
+        let failed = NativeCudaGraph::capture(&context, || {
+            calls.set(calls.get() + 1);
+            let output = &x + 1.;
+            if calls.get() == 4 {
+                // A synchronous device->host read is forbidden inside capture.
+                let _ = output.f_double_value(&[0])?;
+            }
+            Ok(output)
+        });
+        assert!(failed.is_err());
+        assert!(context.check_execution_stream().is_err());
+        drop(context);
+        let fresh = NativeGraphCaptureContext::new(0).unwrap();
+        fresh.check_execution_stream().unwrap();
+        let (graph, output) = NativeCudaGraph::capture(&fresh, || Ok(&x + 3.)).unwrap();
+        graph.replay().unwrap();
+        assert_eq!(output.double_value(&[0]), 4.);
+        Cuda::synchronize(0);
     }
 }

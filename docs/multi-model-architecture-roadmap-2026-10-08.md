@@ -110,7 +110,7 @@ ForwardOutput 初期以生成所需 logits 为核心，后续按真实需求增�
 
 已将 prefill 的桶目录、固定缓冲区、捕获、回放与失效释放移到通用 `SegmentedGraphRunner`。Qwen3 通过 `PrefillGraphProgram` 提供计算段和图外 attention；通用管理器不访问 decoder layers。另一个三段算术测试程序验证接口不依赖 Transformer 层结构，第二个实际模型的验证仍待后续接入。
 
-已优化分段 prefill 的图外执行：attention 元数据、缓存索引与 mask 在每批次准备一次，各层复用；相邻 graph 直接沿用 residual 固定地址；attention 写入固定输出，FlashInfer 直接输出到该地址，SDPA／`pt` 按接口能力保留必要写回。分段仍以 attention 为断点；共享 graph 内存池留待后续评估，性能收益需单独测量。
+已优化分段 prefill 的图外执行：attention 元数据、缓存索引与 mask 在每批次准备一次，各层复用；相邻 graph 直接沿用 residual 固定地址；attention 写入固定输出，FlashInfer 直接输出到该地址，SDPA／`pt` 按接口能力保留必要写回。分段仍以 attention 为断点。共享 graph 内存池按 [共享 pool 评估与分阶段方案](shared-cuda-graph-pool-assessment-2026-10-10.md) 推进：先共享实例内 pool/capture stream，再复用静态输出和移植原版非 owning 中间量，收益分别测量。
 
 graph 已使用按模式划分的 `GraphCapabilities` 显式声明，默认不启用；声明根据实际模型、backend、dtype 和 KV 绑定状态产生，并携带请求数／token／上下文与 padding 约束。未验证的组合回退 eager，启动日志说明能力拒绝原因，动态形状回退记录 debug 原因。
 
@@ -261,6 +261,16 @@ attention 元数据改为每个批次准备一次：`pt` 复用 query boundaries
 真实 Qwen3-0.6B／BF16／FlashInfer 下，优化版 eager／graph 各 12 项 HTTP 回归通过。另以改动前 `8e493744c995db99244038254e03a27384630b2b` 的原始实现构建基线，两种模式各 8 组贪心请求的 text／usage／finish_reason 在优化前后完全一致。额外发现其中一组共享前缀请求的 eager／graph 文本不一致：两请求最小复现及原始基线均出现相同差异，因此不是本次优化引入；本次不宣称两种模式任意输入都逐 token 一致，也不扩大为该既有差异的修复。
 
 五个源码文件同步并通过 SHA-256 核对；基线验证后远端源码与优化版 release 二进制均已恢复，临时服务退出后 GPU 1 显存恢复为 4 MiB。验收日志使用 `logs/prefill-output-opt-*-20261010.*`；旧版基线和最小复现分别使用 `logs/prefill-output-baseline*-20261010.*` 与 `logs/prefill-output-repro-*-20261010.*`。本次未做耗时／吞吐基准，不给出提速比例。
+
+### 5.7 共享 graph pool 阶段一（2026-10-10）
+
+共享方案与完整复刻的阶段边界见 [共享 pool 评估与实施记录](shared-cuda-graph-pool-assessment-2026-10-10.md)。同一模型实例的 decode/prefill 捕获目录共用 pool 与 capture stream，decode 改为大桶先捕获；保留现有固定张量强引用和 residual 原地复用。执行入口先校验 replay stream，允许完整批次连续 prefill 或任意切换两种模式，段内保持固定顺序。没有改 Scheduler 或增加批次间同步。
+
+Context 对 device/pinned-host allocator pool 显式保留引用，避免首次 graph 捕获失败或被丢弃后 pool handle 失效；native begin/end 失败立即终止该目录初始化，普通闭包失败可按桶回退。clear、权重／缓存重绑定与 teardown 按 graph/outputs/context 顺序释放，下一目录使用新 handle。
+
+本地 CPU 124 项、远端 A100 GPU 1 release CUDA 17 项回归通过。真实 Qwen3-0.6B／BF16／FlashInfer，max-running-req=4、max-seq-len=40960、decode bs=4、prefill limit=2048、memory-ratio=0.4：启动后 GPU 驻留显存从独立池的 35723 MiB 降至共享版本的 24293 MiB，减少 11430 MiB（约 11.16 GiB／32.0%）。此为整张 GPU 的驻留显存，不是仅 graph pool 或 capture 峰值。独立 graph、共享 graph、eager 各 12 项 HTTP 回归通过；8 组同模式改动前后输出完全一致。
+
+验收使用 `logs/shared-pool-stage1-*-20261010.*`，最终服务二进制已更新；临时服务退出后两张 GPU 各为 4 MiB。启动时间为单次观测，没有耗时／吞吐提速结论。阶段二的最大容量 attention 静态输出复用、阶段三的非 owning 中间量迁移和阶段四的组合性能基准仍按独立验收推进。
 
 ## 6. 本阶段范围之外
 

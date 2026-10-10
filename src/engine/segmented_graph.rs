@@ -1,8 +1,10 @@
 //! Model-independent startup capture and replay of GPU segments with eager seams.
+use super::graph::NativeGraphCaptureContext;
 use super::{
     ForwardBatch, ForwardOutput, GraphLimits, GraphPadding, ModelRunnerError, NativeCudaGraph,
 };
 use std::collections::{BTreeMap, HashSet};
+use std::rc::Rc;
 use tch::{Device, Kind, Tensor};
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
@@ -63,10 +65,14 @@ pub(crate) struct SegmentedGraphRunner {
     admission: GraphLimits,
 }
 impl SegmentedGraphRunner {
+    pub(crate) fn has_graphs(&self) -> bool {
+        !self.graphs.is_empty()
+    }
     pub(crate) fn capture(
         program: &dyn PrefillGraphProgram,
         limit: usize,
         admission: GraphLimits,
+        context: &Rc<NativeGraphCaptureContext>,
     ) -> Result<Self> {
         if admission.padding != GraphPadding::InertTokenRows {
             return Err(error("segmented prefill requires inert token padding"));
@@ -84,7 +90,7 @@ impl SegmentedGraphRunner {
             "prefill segmented CUDA Graph configured for startup capture"
         );
         for &size in sizes.iter().rev() {
-            match Self::capture_one(program, size) {
+            match Self::capture_one(program, size, context) {
                 Ok(graph) => {
                     tracing::info!(
                         tokens = size,
@@ -94,6 +100,7 @@ impl SegmentedGraphRunner {
                     runner.graphs.insert(size, graph);
                 }
                 Err(err) => {
+                    context.check_execution_stream()?;
                     runner.failed.insert(size);
                     tracing::warn!(tokens = size, %err, "prefill CUDA Graph capture failed; bucket uses eager");
                 }
@@ -123,11 +130,18 @@ impl SegmentedGraphRunner {
         self.graphs.remove(&size);
     }
 
-    fn capture_one(program: &dyn PrefillGraphProgram, tokens: usize) -> Result<PrefillGraph> {
+    fn capture_one(
+        program: &dyn PrefillGraphProgram,
+        tokens: usize,
+        context: &Rc<NativeGraphCaptureContext>,
+    ) -> Result<PrefillGraph> {
         let inputs = program.create_inputs(tokens)?;
         let Device::Cuda(device) = inputs.ids.device() else {
             return Err(error("segment inputs require CUDA"));
         };
+        if device != context.device_index() {
+            return Err(error("segment inputs differ from capture context device"));
+        }
         if inputs.segments.is_empty()
             || inputs.ids.size() != [tokens as i64]
             || inputs.positions.size() != [tokens as i64]
@@ -151,8 +165,9 @@ impl SegmentedGraphRunner {
             let previous = segments
                 .last()
                 .map_or(&[][..], |segment| segment.outputs.as_slice());
-            let (native, outputs) =
-                NativeCudaGraph::capture(device, || program.run_segment(index, &inputs, previous))?;
+            let (native, outputs) = NativeCudaGraph::capture(context, || {
+                program.run_segment(index, &inputs, previous)
+            })?;
             if outputs.is_empty() {
                 return Err(error("segment must return outputs"));
             }

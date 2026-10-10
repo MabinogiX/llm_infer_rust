@@ -50,7 +50,19 @@ Qwen3 捕获下一段时直接使用上一段的 residual tensor 地址，不再
 4. 有效批次的 cache-table 宽度与静态 decode graph 不同时，复制前回退 eager；非法 metadata 直接返回错误。缺失／失败／超出限制的 prefill 桶也回退 eager，保留已捕获的其他桶。
 5. 权重、缓存绑定和 reserved-slot 设置变化之前，Runner 同时失效两种 graph。重复 clear 安全。模型不再自己持有 prefill native graphs。
 6. Capture 安装采用局部所有权：先构建 decode／prefill 管理器，整体初始化失败时局部资源自动释放，不留下半安装状态。单桶捕获失败是可记录的 eager 回退，不阻止其他桶使用。
-7. 两种管理器释放前同步设备，确保排队计算不再访问 native graph 私有 allocation pool 和计划缓冲；graph 在模型、权重和缓存视图之前释放。
+7. 两种管理器释放前同步设备，确保排队计算不再访问 native graph allocation pool 和计划缓冲；graph 在模型、权重和缓存视图之前释放。
+
+## 共享 graph pool：阶段一
+
+共享范围为同一模型实例、设备及本次捕获目录。`NativeGraphCaptureContext` 持有 pool handle、统一 capture stream 和既定 execution stream；decode 与 segmented prefill 的全部 native graph 共享该 context，保留现有 owning 输入／输出及 residual 原地复用关系。两种模式均按大桶到小桶捕获。没有加入跨模型全局池、非 owning tensor 或共享 attention 大缓冲。
+
+graph capture stream 用于 allocator 有效复用，execution stream 用于回放与图外操作的串行顺序，两者职责不同。执行入口在静态输入复制和 backend planning 之前验证当前 execution stream；native replay 同样拒绝其他 stream。若没有实际捕获到 graph，不安装该执行限制。完整 forward 可以任意选择 bucket，连续 prefill 或任意切换 prefill/decode；单个 segmented forward 中各段与 eager seam 保持固定顺序。KV、请求状态与独立 logits 不依赖 graph 临时池继续保存。
+
+native bridge 保存 caller stream 并在成功结束、闭包错误、未开始捕获的 warmup 错误及释放时恢复。Rust closure 返回错误但 native capture 正常结束时可继续捕获其他桶；native begin/end 失败则标记整个 context 无效，立即终止目录初始化，局部 graph 释放，不安装损坏目录。clear／权重或缓存重绑定先释放两种 runner，再释放 context；新目录取得新 pool handle。native graph 的 Rust/C++ 所有权引用均保证 context 不早于 graph 销毁。
+
+pool handle 只是唯一 ID，不是 allocator 保活引用。Context 创建前先 lazy-init LibTorch CUDA allocator；对 device pool 调用 `createOrIncrefPool`，销毁时对称 `releasePool`。部署版 LibTorch 同时给 graph 保留相同 ID 的 pinned-host pool，因此 context 通过 host allocator 的 `begin_allocate_to_pool`／`end_allocate_to_pool` 获取引用，filter 始终返回 false，不接管任何 host allocation；销毁时对称 `release_pool`。各 graph 仍由 LibTorch 增减自己的两份引用。这样首次 capture 在生成成功 graph 之前被丢弃，也不会把任一 pool 的 use_count 降到零。新增 CUDA 回归先复现 device/host allocator 的断言，再验证保活后的闭包失败／后续 capture 路径。
+
+启动日志增加捕获前后 device-wide allocator `allocated`／`reserved`、增量与捕获耗时，便于真实模型验收；这些不是仅 graph pool 的统计，也不是同步重置后的峰值。完整约束、原版来源、隔离实验及后续阶段见 [共享 pool 评估与分阶段方案](shared-cuda-graph-pool-assessment-2026-10-10.md)。
 
 ## 验证与范围
 
