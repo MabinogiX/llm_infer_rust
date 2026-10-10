@@ -37,7 +37,7 @@ HTTP / OpenAI 协议
 | 模型注册 | 注册项构造 Scheduler、Tokenizer 和 OutputParser | Registry 选择模型实现，运行时负责加载和执行 | 注册提供模型定义，启动流程集中组装 |
 | 模型配置 | 通用 ModelArgs 包含 Qwen 风格计算字段与缓存尺寸 | 保留 HF 配置并提取运行时信息 | 每模型强类型配置 + 公共运行时描述 |
 | 基础算子 | Qwen3 已使用共享 layers；第二模型验证待完成 | layers 共享算子，模型组合这些算子 | 提取共享 layers，保留模型数值差异 |
-| 状态缓存 | 统一逐层、同尺寸的分页 K/V 张量 | 不同 attention 与状态缓存实现 | 模型声明分层缓存需求，运行时管理资源 |
+| 状态缓存 | 已支持逐层声明与按几何分组的 full-history 分页 K/V | 不同 attention 与状态缓存实现 | 模型声明分层缓存需求，运行时管理资源 |
 | 模型执行 | 多个独立输入参数，返回 logits Tensor | ForwardBatch 与结构化执行输出 | 统一批次输入和输出语义 |
 | CUDA graph | decode 在通用 runner，prefill 直接访问 Qwen3 层 | runner 与 backend 分工，明确图内／图外操作 | graph 生命周期通用化，模型提供计算段 |
 | 聊天格式 | Qwen3 使用固定自定义模板与输出 parser | 模板、reasoning parser、tool parser 分别配置 | 独立 ChatProfile |
@@ -78,8 +78,9 @@ Dense FFN 与 MoE FFN 可以在 decoder 组合处替换。MoE 的 routing、专�
 
 ### 3.3 分层状态缓存
 
-当前 KVCachePool 假设每层使用同尺寸的 K/V 分页张量，ModelExecutor 接收两个全局 Tensor。该约定适合当前模型，但不足以表达不同层的 attention 几何、其他持久状态或多个缓存组。
+已于 2026-10-09 实现通用 full-history 分页 KV 的分层声明与分组存储：`ModelFactory::cache_spec` 声明每层 KV 几何，`KVCachePool` 按相同几何合并层，`ModelExecutor::bind_state_cache` 接收逐层稳定视图。各组共用逻辑页表与生命周期，支持层间不同的 KV heads／head dimension；Qwen3 已迁移到新接口。详见 [分层状态缓存设计与实现](layered-state-cache-design-2026-10-09.md)。
 
+本次支持范围为普通 MHA／GQA／MQA 的 full-history 分页 K/V；FFN 为 dense 或 MoE 不改变其缓存约定，但没有新增 MoE 模型计算支持。线性 attention／SSM、MLA、滑窗独立淘汰和量化 KV 不纳入本次实现，不以普通 KV 接口冒充这些状态。
 目标是由模型声明每层／每组需要的状态，由 Runtime 负责显存预算、分配与释放，模型通过稳定句柄或逐层视图访问状态。具体类型由目标模型配置决定；现有分页 K/V 实现应作为一种受支持的缓存实现保留。
 
 必须明确以下生命周期约定：
@@ -168,7 +169,7 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 | 0：目标模型确认 | 待实施 | 完整模型名／目录、配置和权重结构；功能与资源矩阵 | 明确 attention、状态、dense／MoE、量化、上下文、文本路径和硬件需求；列出支持／缺失／待验证项 |
 | 1：注册与配置 | 已实现；本地 CPU 与远端 Qwen3／CUDA 验证通过 | 模型定义注册、每模型配置、公共能力与运行时描述；统一启动流程 | Qwen3 保持可运行；未知 architecture 和不支持配置在加载前报错；模型模块不再组装 Scheduler 和服务对象 |
 | 2：共享算子与加载 | 部分实施：Qwen3 共享层提取完成；第二模型与逐步加载待办 | 共享 layers、逐步加载与权重映射接口 | Qwen3 数值与 API 回归通过；测试覆盖 packed／tied 权重和加载错误；记录启动时间与 CPU/GPU 内存峰值 |
-| 3：执行与状态缓存 | 待实施 | ForwardBatch／ForwardOutput、分层状态需求与生命周期 | 现有分页 KV 路径通过；按目标模型验证所需状态的取消、前缀复用和中间 chunk 行为；无资源泄漏或共享状态污染 |
+| 3：执行与状态缓存 | 分层 full-history 分页 KV 已实现；执行输入输出与其他状态待实施 | ForwardBatch／ForwardOutput、分层状态需求与生命周期 | 现有分页 KV 路径通过；按目标模型验证所需状态的取消、前缀复用和中间 chunk 行为；无资源泄漏或共享状态污染 |
 | 4：graph 接口整理 | 待实施 | 通用 graph 管理、模型计算段和 backend 元数据契约 | Qwen3 eager／decode graph／prefill graph 对照通过；不同桶、padding、前缀命中、失效与回退正常；未验证组合不启用 |
 | 5：目标模型接入 | 待实施 | 实际 dense／MoE／其他所需模块的模型实现与注册 | 对齐可信参考的模板、logits／数值容差、生成和用量语义；多批次与不同长度测试通过；记录支持限制与性能 |
 | 6：协议与运行时完善 | 待实施 | ChatProfile、统一事件、模型名／参数校验、readiness、容量控制和增量解码 | 普通／流式响应一致；思考与工具格式、UTF-8、断连、超时、过载和故障测试通过 |
@@ -216,6 +217,18 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 新增 packed QKV 对照独立 projection、packed SwiGLU 对照 gate/up/down、embedding／tied weight 与 live logits 行重排测试；原有 norm、RoPE、CUDA 和 graph 数值测试随提取保留。用户已确认先完成 Qwen3 提取和回归，第二模型验证待办；尚未完成阶段 2 的全部加载与内存验收，本次不作为推理提速证据。
 
 本地 macOS／CPU 全目标 Rust 测试 114 项通过。最终源码同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust` 并以 SHA-256 校验；远端 A100 GPU 1 release 全目标测试 124 项通过、1 项已有采样微基准忽略，release 二进制更新。真实 Qwen3-0.6B／BF16／FlashInfer 下，eager 和 decode＋segmented prefill graph 各 12 项 HTTP 测试通过；每种模式的 8 组不同长度与重复前缀请求，其 text／usage／finish_reason 均与提取前基线完全一致，两种模式也互相一致。临时服务退出后 GPU 显存恢复。远端验收记录为 `logs/shared-layers-tests-20261009.log`、`logs/shared-layers-build-20261009.log`、`logs/shared-layers-http-summary-20261009.log`、`logs/shared-layers-eager-graph-comparison-20261009.json` 及各模式服务／API 日志。
+
+### 5.4 分层分页 KV 实施记录（2026-10-09）
+
+已完成逐层 `ModelCacheSpec`、同几何缓存组、公共页布局与模型逐层视图绑定。模型计算不再接收两个全局同尺寸 K/V Tensor；生产加载使用 factory 的状态声明，运行时预算按所有层的实际几何累加，并在预算不足以容纳保留页和一页真实 KV 时拒绝启动。现有 radix／naive ownership 统一涵盖所有组，取消、前缀分支与 graph padding 的已有约定保持有效。
+
+范围按用户要求收敛到通用 full-history Transformer KV，没有增加少数架构的特殊分支。新增异构 A／B／A 缓存组的生命周期测试，以及通过 Engine 加载和绑定接口的异构 attention 数值对照；此测试 factory 不作为生产模型注册。Qwen3 的 backend／内核限制继续校验。详细接口、生命周期、支持范围和后续工作见 [设计文档](layered-state-cache-design-2026-10-09.md)。
+
+本地 macOS／CPU 全目标测试 121 项通过，`cargo fmt --all -- --check` 和 `git diff --check` 通过；CUDA 专用分支在本地无 GPU 时不执行实际计算。最终代码同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust`，两端基于 `0904a14`，本次修改及新增文件通过 SHA-256 校验；远端 `tmp.sh`、benchmark 脚本和已有日志保留。
+
+远端 A100 GPU 1 使用完整 CUDA／FlashInfer 构建，release 全目标测试 131 项通过、1 项已有采样微基准忽略，release 服务二进制已更新。真实 Qwen3-0.6B／BF16／FlashInfer 下，eager 和 decode＋segmented prefill graph 各 12 项 HTTP 回归通过；8 组不同长度及重复前缀请求的 text／usage／finish_reason 在两种模式间、与既有重构前基线均完全一致。服务日志确认 graph 捕获，临时服务已退出，GPU 1 显存恢复到测试前的 7 MiB。
+
+远端验收记录为 `logs/layered-cache-tests-20261009.log`、`logs/layered-cache-build-20261009.log`、`logs/layered-cache-http-summary-20261009.log`、`logs/layered-cache-eager-graph-comparison-20261009.json` 及两种模式的服务／API 日志。本次没有性能测量，不作为推理提速证据。
 
 ## 6. 本阶段范围之外
 

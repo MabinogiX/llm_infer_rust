@@ -59,6 +59,13 @@ pub type Result<T> = std::result::Result<T, ModelLoadError>;
 /// trait here lets Engine own the same construction lifecycle as mini-sglang
 /// without hard-coding an architecture that has not been migrated.
 pub trait ModelFactory {
+    /// Declare full-attention state in model layer order. The runtime never
+    /// infers heterogeneous geometry from a representative global head count.
+    fn cache_spec(
+        &self,
+        runtime: RuntimeModelConfig,
+    ) -> std::result::Result<super::kvcache::ModelCacheSpec, ModelRunnerError>;
+
     /// Check that runtime geometry matches the model configuration and that the
     /// execution combination is supported, before model or weight allocation.
     fn validate_runtime(

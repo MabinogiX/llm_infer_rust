@@ -349,12 +349,19 @@ mod cuda_tests {
         let ev = Tensor::zeros_like(&ek);
         let gk = ek.copy();
         let gv = ev.copy();
-        eager
-            .bind_kv_cache(ek.shallow_clone(), ev.shallow_clone())
-            .unwrap();
-        graph
-            .bind_kv_cache(gk.shallow_clone(), gv.shallow_clone())
-            .unwrap();
+        for (model, k, v) in [(&mut eager, &ek, &ev), (&mut graph, &gk, &gv)] {
+            model
+                .bind_state_cache(crate::engine::kvcache::ModelKvCache {
+                    page_size: k.size()[2] as usize,
+                    layers: (0..k.size()[0])
+                        .map(|i| crate::engine::kvcache::LayerKvCache {
+                            k: k.get(i),
+                            v: v.get(i),
+                        })
+                        .collect(),
+                })
+                .unwrap();
+        }
         graph.configure_prefill_graph(64);
         graph.capture_prefill_graphs().unwrap();
         assert_eq!(

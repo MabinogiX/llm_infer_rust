@@ -14,7 +14,7 @@ use tch::{Cuda, Device, Kind, Tensor};
 
 use super::kvcache::{
     KVCacheAllocationConfig, KVCacheAllocator, KVCacheError, KVCacheModelConfig, KVCachePool,
-    KVCacheServerConfig,
+    KVCacheServerConfig, ModelCacheSpec,
 };
 use super::sampling::{Sampler, SamplingError, SamplingParams};
 use super::{Batch, ModelFactory, ModelRunner, ModelRunnerError, load_hf_safetensors};
@@ -198,7 +198,9 @@ impl Engine {
         })?;
         runner.load_weights(weights)?;
 
-        let mut engine = Self::with_runtime(server_args, runtime_config, tp_rank, kind, device)?;
+        let spec = factory.cache_spec(runtime_config)?;
+        let mut engine =
+            Self::with_cache_spec(server_args, runtime_config, tp_rank, kind, device, spec)?;
         engine.attach_model_runner(runner)?;
         engine.capture_graphs()?;
         tracing::info!(?device, ?kind, "model loaded for inference");
@@ -220,8 +222,11 @@ impl Engine {
         validate_max_seq_len(&server_args, runtime_config)?;
         let device = resolve_device(&server_args.device, Cuda::is_available())?;
         let kind = resolve_kind(&server_args.dtype, runtime_config.checkpoint_kind, device)?;
-        KVCacheAllocator::new(allocation_config(server_args, runtime_config))?;
         factory.validate_runtime(runtime_config, kind, device, &server_args.attention_backend)?;
+        KVCacheAllocator::with_spec(
+            allocation_config(server_args, runtime_config),
+            factory.cache_spec(runtime_config)?,
+        )?;
         Ok((kind, device))
     }
 
@@ -233,13 +238,30 @@ impl Engine {
         kind: Kind,
         device: Device,
     ) -> Result<Self> {
+        let spec = ModelCacheSpec::uniform(
+            runtime_config.num_layers,
+            runtime_config.num_kv_heads,
+            runtime_config.head_dim,
+        )?;
+        Self::with_cache_spec(server_args, runtime_config, tp_rank, kind, device, spec)
+    }
+
+    pub fn with_cache_spec(
+        server_args: ServerArgs,
+        runtime_config: RuntimeModelConfig,
+        tp_rank: usize,
+        kind: Kind,
+        device: Device,
+        spec: ModelCacheSpec,
+    ) -> Result<Self> {
         validate_model_path(&server_args.model_path)?;
         validate_parallelism(server_args.tp_size, tp_rank)?;
         if server_args.tp_size > 1 {
             return Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"));
         }
         validate_max_seq_len(&server_args, runtime_config)?;
-        let allocator = KVCacheAllocator::new(allocation_config(&server_args, runtime_config))?;
+        let allocator =
+            KVCacheAllocator::with_spec(allocation_config(&server_args, runtime_config), spec)?;
         let kv_cache_pool = allocator.allocate(kind, device, server_args.tp_size)?;
 
         Ok(Self {
@@ -305,9 +327,9 @@ impl Engine {
                 self.device
             )));
         }
-        let (k_cache, v_cache) = self.kv_cache_pool()?.get_all_kv_cache()?;
+        let cache = self.kv_cache_pool()?.model_cache()?;
         let mut model_runner = model_runner;
-        model_runner.bind_kv_cache(k_cache, v_cache)?;
+        model_runner.bind_state_cache(cache)?;
         model_runner.set_kv_reserved_slot(0);
         self.model_runner = Some(model_runner);
         Ok(())
@@ -329,6 +351,11 @@ impl Engine {
             self.device,
             &self.server_args.attention_backend,
         )?;
+        if self.kv_cache_pool()?.spec() != &factory.cache_spec(self.runtime_config)? {
+            return Err(EngineError::InvalidArgument(
+                "model cache specification differs from allocated pool".into(),
+            ));
+        }
         let model = factory.create(self.kind, self.device, &self.server_args.attention_backend)?;
         self.attach_model_runner(ModelRunner::new(model, self.device))
     }
@@ -751,6 +778,14 @@ mod tests {
     struct LoadingFactory;
 
     impl ModelFactory for LoadingFactory {
+        fn cache_spec(
+            &self,
+            runtime: RuntimeModelConfig,
+        ) -> std::result::Result<ModelCacheSpec, ModelRunnerError> {
+            ModelCacheSpec::uniform(runtime.num_layers, runtime.num_kv_heads, runtime.head_dim)
+                .map_err(|e| ModelRunnerError::Model(e.to_string()))
+        }
+
         fn validate_runtime(
             &self,
             _runtime_config: RuntimeModelConfig,

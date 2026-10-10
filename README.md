@@ -191,6 +191,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+缓存声明由 `ModelFactory::cache_spec` 提供：普通 full-history MHA／GQA／MQA 模型可按层声明 KV heads 和 head dimension，运行时把同几何层合并为缓存组，并通过 `ModelExecutor::bind_state_cache` 绑定稳定的逐层视图。各组共用页表，显存预算计入所有组及保留页；支持异构缓存布局不代表已经实现新的模型或 backend。线性 attention／SSM、MLA 与滑窗独立淘汰不在此次实现范围。详见 [分层状态缓存设计](docs/layered-state-cache-design-2026-10-09.md)。
+
 当前 dense Qwen3 支持 eager/分段图 prefill、带缓存前缀的 prefill 和 paged-KV decode；模型接入 `Engine` 时会自动绑定 `KVCachePool` 的逐层 K/V 切片。Qwen3-MoE 与张量并行尚未迁移，调用时会返回明确错误。
 
 Decode 的 KV 映射按请求 ID、已有长度和页号快照增量更新；稳定请求只上传新增 token 的映射，换行、页号变化或序列回退时更新相应区间。CUDA BF16/FP16 的 Qwen3 decoder 通过独立 residual 流使用原位 fused add-RMSNorm，按原版语义使用未舍入的 FP32 残差和计算方差与归一化，写回的 residual 仍舍入到激活类型。KV 池额外预留并清零 page 0，真实请求的 page IDs 从 1 开始；decode graph padding 读取该页并跳过 slot 0 写入。非法 KV 写入索引触发 GPU 断言（CPU 返回错误），不再接受 -1 padding。

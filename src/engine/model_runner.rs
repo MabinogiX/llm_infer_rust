@@ -4,7 +4,11 @@ use std::{cell::RefCell, fmt, rc::Rc};
 
 use tch::{Device, TchError, Tensor, no_grad};
 
-use super::{ModelWeights, ServerArgs, graph::GraphRunner, kvcache::KVCachePool};
+use super::{
+    ModelWeights, ServerArgs,
+    graph::GraphRunner,
+    kvcache::{KVCachePool, ModelKvCache},
+};
 
 /// Identifies the scheduler phase that produced a [`Batch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +87,7 @@ pub trait DecodeGraphState {
     }
 }
 
-/// Boundary implemented by the future Rust model architecture.
+/// Model execution and cache-binding interface implemented by each architecture.
 pub trait ModelExecutor {
     fn set_kv_reserved_slot(&mut self, _slot: i64) {}
     /// Configure model-specific segmented prefill capture; zero clears/disables.
@@ -123,9 +127,9 @@ pub trait ModelExecutor {
         ))
     }
 
-    /// Binds `(layers, pages, page_size, kv_heads, head_dim)` cache views.
+    /// Bind stable, layer-local K/V views in model order, before graph capture.
     /// Cache-less executors may keep the default no-op implementation.
-    fn bind_kv_cache(&mut self, _k_cache: Tensor, _v_cache: Tensor) -> Result<()> {
+    fn bind_state_cache(&mut self, _cache: ModelKvCache) -> Result<()> {
         Ok(())
     }
 }
@@ -206,9 +210,9 @@ impl ModelRunner {
         self.model.set_kv_reserved_slot(slot);
     }
 
-    pub fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {
+    pub fn bind_state_cache(&mut self, cache: ModelKvCache) -> Result<()> {
         self.clear_graphs();
-        self.model.bind_kv_cache(k_cache, v_cache)
+        self.model.bind_state_cache(cache)
     }
 
     pub fn capture_graphs(

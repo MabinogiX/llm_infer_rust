@@ -32,6 +32,18 @@ pub struct Qwen3Factory {
 }
 
 impl ModelFactory for Qwen3Factory {
+    fn cache_spec(
+        &self,
+        _runtime: RuntimeModelConfig,
+    ) -> Result<crate::engine::kvcache::ModelCacheSpec> {
+        crate::engine::kvcache::ModelCacheSpec::uniform(
+            self.config.num_layers,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+        )
+        .map_err(|e| model_error(&e.to_string()))
+    }
+
     fn validate_runtime(
         &self,
         runtime_config: RuntimeModelConfig,
@@ -326,22 +338,40 @@ impl ModelExecutor for Qwen3ForCausalLM {
         }
     }
 
-    fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {
+    fn bind_state_cache(&mut self, cache: crate::engine::kvcache::ModelKvCache) -> Result<()> {
         self.prefill_graphs.get_mut().clear();
-        if k_cache.dim() != 5
-            || v_cache.size() != k_cache.size()
-            || k_cache.size()[0] != self.layers.len() as i64
-        {
-            return Err(model_error(
-                "Qwen3 KV cache must be (layers, pages, page_size, kv_heads, head_dim)",
-            ));
+        // Validate every view before mutating bindings, so a bad later layer
+        // cannot leave the model half-bound to a new cache.
+        if cache.layers.len() != self.layers.len() || cache.page_size == 0 {
+            return Err(model_error("Qwen3 cache layer count or page size mismatch"));
         }
-        self.attention.bind_cache_layout(k_cache.size()[2]);
-        for (index, layer) in self.layers.iter().enumerate() {
+        let pages = cache.layers[0].k.size().first().copied().unwrap_or(0);
+        for layer in &cache.layers {
+            let expected = vec![
+                pages,
+                cache.page_size as i64,
+                self.config.num_kv_heads as i64,
+                self.config.head_dim as i64,
+            ];
+            if pages < 2
+                || layer.k.size() != expected
+                || layer.v.size() != expected
+                || layer.k.device() != self.device
+                || layer.v.device() != self.device
+                || layer.k.kind() != self.kind
+                || layer.v.kind() != self.kind
+            {
+                return Err(model_error(
+                    "Qwen3 cache view geometry, dtype or device mismatch",
+                ));
+            }
+        }
+        self.attention.bind_cache_layout(cache.page_size as i64);
+        for (layer, view) in self.layers.iter().zip(cache.layers) {
             layer
                 .base_attention
                 .borrow_mut()
-                .bind_kv_cache(k_cache.get(index as i64), v_cache.get(index as i64))?;
+                .bind_kv_cache(view.k, view.v)?;
         }
         Ok(())
     }
@@ -717,7 +747,15 @@ mod tests {
         let k_cache = Tensor::zeros([1, 2, 2, 1, 2], (Kind::Float, Device::Cpu));
         let v_cache = Tensor::zeros([1, 2, 2, 1, 2], (Kind::Float, Device::Cpu));
         model
-            .bind_kv_cache(k_cache.shallow_clone(), v_cache.shallow_clone())
+            .bind_state_cache(crate::engine::kvcache::ModelKvCache {
+                page_size: k_cache.size()[2] as usize,
+                layers: (0..k_cache.size()[0])
+                    .map(|i| crate::engine::kvcache::LayerKvCache {
+                        k: k_cache.get(i),
+                        v: v_cache.get(i),
+                    })
+                    .collect(),
+            })
             .unwrap();
 
         let first_prefill = AttentionMetadata {

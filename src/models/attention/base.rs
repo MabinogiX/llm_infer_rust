@@ -6,7 +6,7 @@ use crate::engine::{BatchPhase, ModelRunnerError};
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
-/// Owns one attention layer's K/V views into the global [`KVCachePool`].
+/// Owns one attention layer's stable K/V views into its cache group.
 #[derive(Debug)]
 pub struct BaseAttention {
     k_cache: Option<Tensor>,
