@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAGraph.h>
+#include <ATen/ATen.h>
 #include <ATen/Context.h>
 #include <ATen/core/CachingHostAllocator.h>
 #include <c10/cuda/CUDAStream.h>
@@ -168,4 +169,18 @@ extern "C" void sglang_graph_free(GraphBridge* bridge) {
   // already completed graph must not change the caller's current stream.
   bridge->restore_stream();
   delete bridge;
+}
+
+// Metadata-only alias: unlike shallow_clone, this does not retain allocator
+// storage. The caller must keep the graph pool live and enforce the value's
+// capture/replay live range. Preserve strides and the view's offset data pointer.
+extern "C" at::Tensor* sglang_graph_non_owning_view(const at::Tensor* tensor) {
+  try {
+    TORCH_CHECK(tensor->is_cuda(), "non-owning graph output requires CUDA");
+    return new at::Tensor(at::from_blob(
+        tensor->data_ptr(), tensor->sizes(), tensor->strides(), tensor->options()));
+  } catch (const std::exception& error) {
+    last_error = error.what();
+    return nullptr;
+  }
 }

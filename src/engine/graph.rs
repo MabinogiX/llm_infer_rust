@@ -391,7 +391,7 @@ impl NativeCudaGraph {
     }
 
     /// Warm and capture a GPU-only segment on a side stream. The caller owns
-    /// all fixed inputs and outputs until this graph is destroyed.
+    /// fixed inputs and the declared storage live ranges of captured outputs.
     pub(crate) fn capture<T>(
         context: &Rc<NativeGraphCaptureContext>,
         mut forward: impl FnMut() -> Result<T>,
@@ -451,6 +451,35 @@ impl NativeCudaGraph {
         Ok(())
     }
 
+    /// Make a metadata-only alias of a captured allocation.
+    ///
+    /// # Safety
+    /// The output must belong to this graph's pool. The graph/context must
+    /// outlive every alias use. Its owning allocation must remain live through
+    /// all dependent capture operations, and replay consumers must finish before
+    /// another graph can reuse the allocation. Never return this alias to users.
+    pub(crate) unsafe fn non_owning_output(&self, output: &Tensor) -> Result<Tensor> {
+        if output.device() != Device::Cuda(self._context.device) {
+            return Err(ModelRunnerError::Model(
+                "graph output device mismatch".into(),
+            ));
+        }
+        #[cfg(has_cuda_graph)]
+        {
+            let ptr = unsafe { sglang_graph_non_owning_view(output.as_ptr().cast()) };
+            if ptr.is_null() {
+                return Err(native_error());
+            }
+            Ok(unsafe { Tensor::from_ptr(ptr.cast()) })
+        }
+        #[cfg(not(has_cuda_graph))]
+        {
+            Err(ModelRunnerError::Model(
+                "CUDA Graph bridge unavailable".into(),
+            ))
+        }
+    }
+
     pub(crate) fn replay(&self) -> Result<()> {
         #[cfg(has_cuda_graph)]
         if !unsafe { sglang_graph_replay(self.ptr) } {
@@ -477,6 +506,7 @@ fn native_error() -> ModelRunnerError {
 
 #[cfg(has_cuda_graph)]
 unsafe extern "C" {
+    fn sglang_graph_non_owning_view(tensor: *const std::ffi::c_void) -> *mut std::ffi::c_void;
     fn sglang_graph_memory(device: i32, allocated: *mut i64, reserved: *mut i64) -> bool;
     fn sglang_graph_context_create(device: i32) -> *mut std::ffi::c_void;
     fn sglang_graph_context_free(context: *mut std::ffi::c_void);
@@ -726,6 +756,53 @@ mod tests {
 mod shared_pool_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn non_owning_graph_output_releases_storage_preserves_views_and_replays_reused_blocks() {
+        let context = NativeGraphCaptureContext::new(0).unwrap();
+        let x = Tensor::ones([256, 1024], (Kind::Float, Device::Cuda(0)));
+        let (a, owning) = NativeCudaGraph::capture(&context, || Ok(&x * 2.)).unwrap();
+        let address = owning.data_ptr();
+        let slice = owning.narrow(1, 17, 31).transpose(0, 1);
+        let alias = unsafe { a.non_owning_output(&slice) }.unwrap();
+        assert_eq!(alias.data_ptr(), slice.data_ptr());
+        assert_eq!(alias.size(), slice.size());
+        assert_eq!(alias.stride(), slice.stride());
+        let before = context.memory_bytes().unwrap().0;
+        drop((slice, owning));
+        let after = context.memory_bytes().unwrap().0;
+        assert!(
+            before - after >= 256 * 1024 * 4,
+            "non-owning alias retained allocator storage"
+        );
+        let (b, owning_b) = NativeCudaGraph::capture(&context, || Ok(&x * 5.)).unwrap();
+        assert_eq!(
+            owning_b.data_ptr(),
+            address,
+            "pool did not reuse released allocation"
+        );
+        let alias_b = unsafe { b.non_owning_output(&owning_b) }.unwrap();
+        drop(owning_b);
+        a.replay().unwrap();
+        let retained = alias.copy();
+        for (graph, view, expected) in [
+            (&b, &alias_b, 5.),
+            (&a, &alias, 2.),
+            (&a, &alias, 2.),
+            (&b, &alias_b, 5.),
+        ] {
+            graph.replay().unwrap();
+            assert_eq!(view.double_value(&[0, 0]), expected);
+        }
+        assert_eq!(retained.double_value(&[0, 0]), 2.);
+        Cuda::synchronize(0);
+        drop((alias, alias_b, retained));
+        drop((a, b));
+        // No output owner remains. Graph-private allocations (e.g. RNG state)
+        // can also disappear at graph teardown, so the total may fall further.
+        assert!(context.memory_bytes().unwrap().0 <= after);
+    }
 
     #[test]
     #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]

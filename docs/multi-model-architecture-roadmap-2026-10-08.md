@@ -272,6 +272,18 @@ Context 对 device/pinned-host allocator pool 显式保留引用，避免首次 
 
 验收使用 `logs/shared-pool-stage1-*-20261010.*`，最终服务二进制已更新；临时服务退出后两张 GPU 各为 4 MiB。启动时间为单次观测，没有耗时／吞吐提速结论。阶段二的最大容量 attention 静态输出复用、阶段三的非 owning 中间量迁移和阶段四的组合性能基准仍按独立验收推进。
 
+### 5.8 共享 attention 静态输出：阶段二
+
+Qwen3 通过 `create_shared_buffers(max_tokens)` 在每次捕获目录分配一个最大容量 attention 输出，全部层与桶只保留其连续 owning view；通用 runner 不依赖 Transformer 宽度。每个 eager seam 写 live 行、清当前桶 padding，下一 graph 读取完才允许覆盖。QKV/residual/final hidden 仍保留 owning storage，非 owning 迁移留待阶段三。
+
+CPU 124 项、CUDA 17 项通过，新增共享地址、NaN 污染、大桶→小桶→大桶、保留 logits 检查，覆盖 BF16/FP16 与 FlashInfer/fa/pt。阶段一 graph、阶段二 graph、eager 各 12 项 HTTP 回归通过，8 组同模式输出一致。同配置真实 Qwen3 启动后 GPU 驻留 24293→23575 MiB，减少 718 MiB；allocator allocated 减少 1347.64 MiB、reserved 减少 716 MiB。逻辑静态 attention payload 约 1.319 GiB→8 MiB，不将逻辑节省与驻留降幅混用；没有吞吐/延迟结论。详见[阶段二实施与计量](shared-cuda-graph-pool-assessment-2026-10-10.md)。本地/远端源码与文档同步，临时服务已停止。
+
+### 5.9 非 owning 中间量：阶段三
+
+通用 runner 增加输出使用区间声明，默认 `Owned`；Qwen3 QKV/final hidden 在 capture 后转为非 owning view，residual 的 owner 保留到整个桶捕获完成。`at::from_blob` 保留 offset/stride，native graph/context 维持 pool 生命周期；replay 必须在值被覆盖前消费，各段按固定顺序执行。最大容量 attention 输入、权重/KV 与 decode 输出仍保持 owning。半成品桶失败退出先同步并释放已有图，再释放 residual owners，防止 capture 的 live range 与 replay 不一致。
+
+CPU 124 项、CUDA 18 项通过；新增实际 pool allocation 复用、非连续 view、保留副本，以及后继段 capture 错误后其他桶回放的数值检查。阶段二 graph、阶段三 graph、eager 各 12 项 HTTP 回归通过，8 组同模式输出一致。同配置真实模型启动后 GPU 驻留 23575→20821 MiB，减少 2754 MiB（约 2.69 GiB）；相对初始独立池累计减少约 41.7%。阶段三 capture 前后 allocated delta 约 19.12 MiB、reserved delta 126 MiB，不能当作 capture 峰值；没有吞吐/延迟提速结论。详情见[阶段三实施和验收](shared-cuda-graph-pool-assessment-2026-10-10.md)。源码/文档同步到远端，临时服务已停止。阶段四组合性能基准尚未开始。
+
 ## 6. 本阶段范围之外
 
 当前未决定实现同进程多模型驻留、多模态请求、跨进程 worker、Tensor／Expert Parallel、speculative decoding 或所有量化格式。若目标模型的体积或结构要求其中某项，应在阶段 0 明确列为必要前置条件，再安排对应阶段，不能因本文未展开就视为已支持。

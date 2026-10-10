@@ -1,24 +1,54 @@
 //! Qwen3 computation segments. Buckets, buffers and graph lifetime belong to Runner.
 use super::*;
 use crate::engine::{
-    ForwardBatch, ForwardOutput, PrefillGraphInputs, PrefillGraphProgram, PrefillGraphReplay,
+    ForwardBatch, ForwardOutput, PrefillGraphInputs, PrefillGraphOutputLifetime,
+    PrefillGraphProgram, PrefillGraphReplay,
 };
 
 impl PrefillGraphProgram for Qwen3ForCausalLM {
-    fn create_inputs(&self, tokens: usize) -> Result<PrefillGraphInputs> {
+    fn create_shared_buffers(&self, max_tokens: usize) -> Result<Vec<Tensor>> {
+        // Attention consumes QKV first, then writes this slot. The next graph
+        // reads it before another layer or bucket can overwrite it. QKV and
+        // residual use separately captured storage.
+        Ok(vec![Tensor::zeros(
+            [max_tokens as i64, self.layers[0].qkv_proj.widths()[0]],
+            (self.kind, self.device),
+        )])
+    }
+    fn create_inputs(&self, tokens: usize, shared: &[Tensor]) -> Result<PrefillGraphInputs> {
         let rows = tokens as i64;
         let mut segments = vec![vec![]];
         for layer in &self.layers {
-            segments.push(vec![Tensor::zeros(
-                [rows, layer.qkv_proj.widths()[0]],
-                (self.kind, self.device),
-            )]);
+            if shared.len() != 1
+                || shared[0].size().len() != 2
+                || shared[0].size()[0] < rows
+                || shared[0].size()[1] != layer.qkv_proj.widths()[0]
+                || shared[0].kind() != self.kind
+                || shared[0].device() != self.device
+                || !shared[0].is_contiguous()
+            {
+                return Err(ModelRunnerError::Model(
+                    "invalid shared attention output buffer".into(),
+                ));
+            }
+            segments.push(vec![shared[0].narrow(0, 0, rows)]);
         }
         Ok(PrefillGraphInputs {
             ids: Tensor::ones([rows], (Kind::Int64, self.device)),
             positions: Tensor::zeros([rows], (Kind::Int64, self.device)),
             segments,
         })
+    }
+    fn output_lifetime(&self, segment: usize, output: usize) -> PrefillGraphOutputLifetime {
+        if segment < self.layers.len() && output == 3 {
+            // The same residual allocation is read and updated by every later
+            // graph. Keep its owning alias until all bucket segments are captured.
+            PrefillGraphOutputLifetime::BucketCapture
+        } else {
+            // QKV is consumed by attention before launching the next segment;
+            // final hidden is consumed by finish before another forward starts.
+            PrefillGraphOutputLifetime::EagerSeam
+        }
     }
     fn run_segment(
         &self,
@@ -110,6 +140,45 @@ mod cuda_tests {
     use super::*;
     use crate::engine::{Batch, ModelRunner, ServerArgs, segmented_graph::capture_sizes};
     use tch::no_grad;
+    struct FailLaterSegment<'a> {
+        model: &'a Qwen3ForCausalLM,
+        calls: std::cell::Cell<usize>,
+    }
+    impl PrefillGraphProgram for FailLaterSegment<'_> {
+        fn create_shared_buffers(&self, max: usize) -> Result<Vec<Tensor>> {
+            self.model.create_shared_buffers(max)
+        }
+        fn create_inputs(&self, tokens: usize, shared: &[Tensor]) -> Result<PrefillGraphInputs> {
+            self.model.create_inputs(tokens, shared)
+        }
+        fn output_lifetime(&self, segment: usize, role: usize) -> PrefillGraphOutputLifetime {
+            self.model.output_lifetime(segment, role)
+        }
+        fn run_segment(
+            &self,
+            index: usize,
+            inputs: &PrefillGraphInputs,
+            previous: &[Tensor],
+        ) -> Result<Vec<Tensor>> {
+            let result = self.model.run_segment(index, inputs, previous)?;
+            if index == 1 {
+                let calls = self.calls.get() + 1;
+                self.calls.set(calls);
+                if calls == 4 {
+                    return Err(ModelRunnerError::Model(
+                        "injected later-segment capture failure".into(),
+                    ));
+                }
+            }
+            Ok(result)
+        }
+        fn prepare_replay<'a>(
+            &'a self,
+            batch: ForwardBatch<'a>,
+        ) -> Result<Box<dyn PrefillGraphReplay + 'a>> {
+            self.model.prepare_replay(batch)
+        }
+    }
     fn capture(runner: &mut ModelRunner, limit: usize) {
         use crate::engine::kvcache::{KVCacheLayout, KVCachePool};
         use std::rc::Rc;
@@ -122,6 +191,19 @@ mod cuda_tests {
             KVCacheLayout::new(3, 32, 16, 1, 128).unwrap(),
         )));
         runner.capture_graphs(&args, pool).unwrap();
+        let cache = runner.prefill_graph_runner.as_ref().unwrap();
+        let buffers = cache.bridge_inputs();
+        assert!(!buffers.is_empty());
+        let address = buffers[0].data_ptr();
+        for buffer in buffers {
+            assert_eq!(
+                buffer.data_ptr(),
+                address,
+                "layers and buckets must share one attention slot"
+            );
+            assert!(buffer.is_contiguous());
+            assert_eq!(buffer.size()[1], 256);
+        }
     }
 
     fn pair(
@@ -239,6 +321,7 @@ mod cuda_tests {
                 (Kind::Half, "pt"),
             ] {
                 let (eager, mut graph, ek, ev, gk, gv) = pair(kind, backend);
+                let mut retained: Option<(Tensor, Tensor)> = None;
                 for (iteration, (lengths, prefixes)) in [
                     (vec![17, 6], vec![0, 0]),
                     (vec![3, 5], vec![17, 6]),
@@ -253,6 +336,15 @@ mod cuda_tests {
                     (vec![192, 193], vec![0, 0]),
                     (vec![224, 225], vec![0, 0]),
                     (vec![64, 65], vec![0, 0]),
+                    (vec![3, 5], vec![0, 0]),
+                    (vec![224, 225], vec![0, 0]),
+                    // Deterministic irregular order after every bucket is live.
+                    (vec![31, 2], vec![0, 0]),
+                    (vec![192, 191], vec![0, 0]),
+                    (vec![7, 2], vec![0, 0]),
+                    (vec![128, 127], vec![0, 0]),
+                    (vec![63, 64], vec![0, 0]),
+                    (vec![224, 223], vec![0, 0]),
                 ]
                 .into_iter()
                 .enumerate()
@@ -318,6 +410,11 @@ mod cuda_tests {
                     let expected = eager
                         .forward_impl(&ids, &pos, Some(&metadata), Some(&indices))
                         .unwrap();
+                    // Poison the entire shared slot, including rows beyond this
+                    // bucket, to expose missing live writes and padding clears.
+                    for buffer in graph.prefill_graph_runner.as_ref().unwrap().bridge_inputs() {
+                        let _ = buffer.shallow_clone().fill_(f64::NAN);
+                    }
                     let actual = graph
                         .forward(&Batch::prefill(
                             ids.shallow_clone(),
@@ -328,6 +425,13 @@ mod cuda_tests {
                         .unwrap()
                         .logits;
                     assert_eq!(actual.size(), [2, 32]);
+                    if let Some((previous, snapshot)) = &retained {
+                        assert!(
+                            previous.equal(snapshot),
+                            "next forward overwrote retained logits"
+                        );
+                    }
+                    retained = Some((actual.shallow_clone(), actual.copy()));
                     if iteration == 2 {
                         assert!(
                             !graph
@@ -357,6 +461,62 @@ mod cuda_tests {
                 assert!(cache.failed_sizes().is_empty());
                 graph.clear_graphs();
                 assert!(graph.prefill_graph_runner.is_none());
+                // Fail inside capture after the preceding segment's QKV owners
+                // have been released. Partial bucket cleanup must synchronize
+                // before dropping the retained residual, then allow other sizes.
+                let context = crate::engine::NativeGraphCaptureContext::new(0).unwrap();
+                let failing = FailLaterSegment {
+                    model: &eager,
+                    calls: std::cell::Cell::new(0),
+                };
+                let partial = crate::engine::segmented_graph::SegmentedGraphRunner::capture(
+                    &failing,
+                    64,
+                    crate::engine::GraphLimits {
+                        max_tokens: 64,
+                        max_batch_size: 2,
+                        max_context_len: 256,
+                        padding: crate::engine::GraphPadding::InertTokenRows,
+                    },
+                    &context,
+                )
+                .unwrap();
+                assert_eq!(partial.failed_sizes(), vec![64]);
+                assert_eq!(
+                    partial.captured_sizes(),
+                    capture_sizes(64)
+                        .into_iter()
+                        .filter(|&n| n != 64)
+                        .collect::<Vec<_>>()
+                );
+                context.check_execution_stream().unwrap();
+                for count in [9, 17, 3, 9] {
+                    let ids = Tensor::arange(count, (Kind::Int64, Device::Cuda(0))).remainder(32);
+                    let positions = Tensor::arange(count, (Kind::Int64, Device::Cuda(0)));
+                    let indices = Tensor::from_slice(&[count - 1]).to_device(Device::Cuda(0));
+                    let expected = eager
+                        .forward_impl(&ids, &positions, None, Some(&indices))
+                        .unwrap();
+                    let batch = ForwardBatch {
+                        input_ids: &ids,
+                        positions: &positions,
+                        attention: None,
+                        mode: crate::engine::ForwardMode::Prefill {
+                            logits_indices: &indices,
+                        },
+                    };
+                    batch.validate(Device::Cuda(0)).unwrap();
+                    let actual = partial.replay(&failing, batch).unwrap().unwrap().logits;
+                    let error = (actual.to_kind(Kind::Float) - expected.to_kind(Kind::Float))
+                        .abs()
+                        .max()
+                        .double_value(&[]);
+                    assert!(
+                        error < 0.005,
+                        "{kind:?}/{backend}: replay after partial failure error={error}"
+                    );
+                }
+                drop((partial, context));
                 capture(&mut graph, 64);
                 assert_eq!(
                     graph
