@@ -1,11 +1,6 @@
 //! Scheduler request lifecycle and configuration handling.
 
-use std::{
-    collections::{BTreeSet, VecDeque},
-    fs,
-};
-
-use serde_json::Value;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::engine::kvcache::{CacheManager, NaiveCacheManager, RadixCacheManager};
 use crate::engine::{
@@ -37,13 +32,16 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(engine: Engine) -> Result<Self> {
-        Self::with_cache_strategy(engine, CacheStrategy::Radix)
+    pub fn new(engine: Engine, eos_token_ids: BTreeSet<i64>) -> Result<Self> {
+        Self::with_cache_strategy(engine, CacheStrategy::Radix, eos_token_ids)
     }
 
-    pub fn with_cache_strategy(engine: Engine, cache_strategy: CacheStrategy) -> Result<Self> {
+    pub fn with_cache_strategy(
+        engine: Engine,
+        cache_strategy: CacheStrategy,
+        eos_token_ids: BTreeSet<i64>,
+    ) -> Result<Self> {
         let args = engine.server_args().clone();
-        let eos_token_ids = load_eos_token_ids(&args.model_path)?;
         let pool = engine.shared_kv_cache_pool()?;
         let cache: Box<dyn CacheManager> = match cache_strategy {
             CacheStrategy::Radix => Box::new(RadixCacheManager::new(pool.clone(), args.page_size)?),
@@ -292,76 +290,15 @@ impl Scheduler {
         Ok(())
     }
 
+    // Abort/error events carry a placeholder token when the model has no EOS.
+    // Consumers inspect finish_reason before decoding this event.
     fn terminal_result(&self, uid: RequestId, reason: FinishReason) -> OutputToken {
         OutputToken {
             uid,
-            token_id: *self.eos_token_ids.first().expect("EOS set is never empty"),
+            token_id: self.eos_token_ids.first().copied().unwrap_or(0),
             finished: true,
             finish_reason: Some(reason),
         }
-    }
-}
-
-fn load_eos_token_ids(model_path: &std::path::Path) -> Result<BTreeSet<i64>> {
-    for filename in [
-        "generation_config.json",
-        "tokenizer_config.json",
-        "config.json",
-    ] {
-        let path = model_path.join(filename);
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(SchedulerError::InvalidModelConfig {
-                    path,
-                    message: error.to_string(),
-                });
-            }
-        };
-        let config: Value = serde_json::from_str(&contents).map_err(|error| {
-            SchedulerError::InvalidModelConfig {
-                path: path.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        if let Some(raw) = config.get("eos_token_id") {
-            if !raw.is_null() {
-                let ids = normalize_eos(raw);
-                return Ok(if ids.is_empty() {
-                    BTreeSet::from([0])
-                } else {
-                    ids
-                });
-            }
-        }
-        if filename == "config.json" {
-            break;
-        }
-    }
-    Ok(BTreeSet::from([0]))
-}
-
-fn normalize_eos(raw: &Value) -> BTreeSet<i64> {
-    let raw = if let Some(object) = raw.as_object() {
-        object
-            .get("token_id")
-            .or_else(|| object.get("id"))
-            .unwrap_or(raw)
-    } else {
-        raw
-    };
-    match raw {
-        Value::Number(value) => value.as_i64().into_iter().collect(),
-        Value::Array(values) => values
-            .iter()
-            .filter_map(|value| {
-                value
-                    .as_i64()
-                    .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-            })
-            .collect(),
-        _ => BTreeSet::new(),
     }
 }
 
@@ -378,9 +315,7 @@ mod tests {
     use tch::{Device, Tensor};
 
     use crate::engine::kvcache::{AcquireOutcome, BaseCacheHandle, KVCacheError};
-    use crate::engine::{
-        AttentionMetadata, ModelArgs, ModelExecutor, ModelRunner, ModelRunnerError,
-    };
+    use crate::engine::{ModelExecutor, ModelRunner, ModelRunnerError, RuntimeModelConfig};
 
     use super::*;
 
@@ -415,19 +350,14 @@ mod tests {
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("config.json"), r#"{"eos_token_id": 2}"#).unwrap();
-        fs::write(
-            path.join("generation_config.json"),
-            r#"{"eos_token_id": [7, 8]}"#,
-        )
-        .unwrap();
+        fs::write(path.join("config.json"), "{}").unwrap();
         let mut args = ServerArgs::new(&path);
         args.max_running_req = max_running_req;
         args.max_seq_len = max_seq_len;
         args.page_size = 2;
         let engine = Engine::new(
             args,
-            ModelArgs {
+            RuntimeModelConfig {
                 num_layers: 1,
                 num_kv_heads: 1,
                 head_dim: 1,
@@ -438,13 +368,13 @@ mod tests {
         )
         .unwrap();
         (
-            Scheduler::with_cache_strategy(engine, strategy).unwrap(),
+            Scheduler::with_cache_strategy(engine, strategy, BTreeSet::from([7, 8])).unwrap(),
             path,
         )
     }
 
     #[test]
-    fn oversized_prompt_emits_abort_and_uses_generation_config_eos() {
+    fn oversized_prompt_emits_abort_and_uses_injected_eos() {
         let (mut scheduler, path) = scheduler();
         assert_eq!(scheduler.eos_token_ids(), &BTreeSet::from([7, 8]));
         let uid = scheduler
@@ -500,19 +430,23 @@ mod tests {
     impl ModelExecutor for FixedTokenModel {
         fn forward(
             &self,
-            input_ids: &Tensor,
-            _positions: &Tensor,
-            _attention_metadata: Option<&AttentionMetadata>,
-            logits_indices: Option<&Tensor>,
-        ) -> std::result::Result<Tensor, ModelRunnerError> {
-            let rows = logits_indices
-                .map(|indices| indices.size()[0])
-                .unwrap_or_else(|| input_ids.size()[0]);
-            let mut logits = vec![0f32; rows as usize * 9];
-            for row in 0..rows as usize {
-                logits[row * 9 + self.0 as usize] = 1.0;
-            }
-            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let _attention_metadata = batch.attention;
+            let logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> {
+                let rows = logits_indices
+                    .map(|indices| indices.size()[0])
+                    .unwrap_or_else(|| input_ids.size()[0]);
+                let mut logits = vec![0f32; rows as usize * 9];
+                for row in 0..rows as usize {
+                    logits[row * 9 + self.0 as usize] = 1.0;
+                }
+                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            })()
+            .map(crate::engine::ForwardOutput::new)
         }
     }
 
@@ -556,24 +490,28 @@ mod tests {
     impl ModelExecutor for DecodeFailModel {
         fn forward(
             &self,
-            _input_ids: &Tensor,
-            _positions: &Tensor,
-            attention_metadata: Option<&AttentionMetadata>,
-            logits_indices: Option<&Tensor>,
-        ) -> std::result::Result<Tensor, ModelRunnerError> {
-            if attention_metadata
-                .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Decode)
-            {
-                return Err(ModelRunnerError::Model("decode failed".to_owned()));
-            }
-            let rows = logits_indices
-                .expect("prefill passes logits indices")
-                .size()[0];
-            let mut logits = vec![0f32; rows as usize * 9];
-            for row in 0..rows as usize {
-                logits[row * 9 + 3] = 1.0;
-            }
-            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let _input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let attention_metadata = batch.attention;
+            let logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> {
+                if attention_metadata
+                    .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Decode)
+                {
+                    return Err(ModelRunnerError::Model("decode failed".to_owned()));
+                }
+                let rows = logits_indices
+                    .expect("prefill passes logits indices")
+                    .size()[0];
+                let mut logits = vec![0f32; rows as usize * 9];
+                for row in 0..rows as usize {
+                    logits[row * 9 + 3] = 1.0;
+                }
+                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            })()
+            .map(crate::engine::ForwardOutput::new)
         }
     }
 
@@ -584,28 +522,32 @@ mod tests {
     impl ModelExecutor for FailSecondPrefillModel {
         fn forward(
             &self,
-            input_ids: &Tensor,
-            _positions: &Tensor,
-            attention_metadata: Option<&AttentionMetadata>,
-            logits_indices: Option<&Tensor>,
-        ) -> std::result::Result<Tensor, ModelRunnerError> {
-            let is_prefill = attention_metadata
-                .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Prefill);
-            if is_prefill {
-                let count = self.prefill_calls.get() + 1;
-                self.prefill_calls.set(count);
-                if count == 2 {
-                    return Err(ModelRunnerError::Model("second prefill failed".to_owned()));
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let attention_metadata = batch.attention;
+            let logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> {
+                let is_prefill = attention_metadata
+                    .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Prefill);
+                if is_prefill {
+                    let count = self.prefill_calls.get() + 1;
+                    self.prefill_calls.set(count);
+                    if count == 2 {
+                        return Err(ModelRunnerError::Model("second prefill failed".to_owned()));
+                    }
                 }
-            }
-            let rows = logits_indices
-                .map(|indices| indices.size()[0])
-                .unwrap_or_else(|| input_ids.size()[0]);
-            let mut logits = vec![0f32; rows as usize * 9];
-            for row in 0..rows as usize {
-                logits[row * 9 + 3] = 1.0;
-            }
-            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+                let rows = logits_indices
+                    .map(|indices| indices.size()[0])
+                    .unwrap_or_else(|| input_ids.size()[0]);
+                let mut logits = vec![0f32; rows as usize * 9];
+                for row in 0..rows as usize {
+                    logits[row * 9 + 3] = 1.0;
+                }
+                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            })()
+            .map(crate::engine::ForwardOutput::new)
         }
     }
 
@@ -902,14 +844,5 @@ mod tests {
             total_pages - 2
         );
         fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn eos_normalization_handles_config_variants() {
-        assert_eq!(
-            normalize_eos(&serde_json::json!({"token_id": [1, "2", null]})),
-            BTreeSet::from([1, 2])
-        );
-        assert!(normalize_eos(&serde_json::json!({"unexpected": 3})).is_empty());
     }
 }

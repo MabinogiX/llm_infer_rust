@@ -4,7 +4,16 @@ use std::{cell::RefCell, fmt, rc::Rc};
 
 use tch::{Device, TchError, Tensor, no_grad};
 
-use super::{ModelWeights, ServerArgs, graph::GraphRunner, kvcache::KVCachePool};
+use super::{
+    ModelWeights, ServerArgs,
+    graph::DecodeGraphRunner,
+    kvcache::{KVCachePool, ModelKvCache},
+};
+
+use super::{
+    ForwardBatch, ForwardOutput, GraphCapabilities, GraphSupport, PrefillGraphProgram,
+    segmented_graph::SegmentedGraphRunner,
+};
 
 /// Identifies the scheduler phase that produced a [`Batch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,26 +86,23 @@ impl Batch {
 /// Owns address-stable backend planning buffers for one captured decode batch.
 /// Planning updates happen before replay, outside stream capture.
 pub trait DecodeGraphState {
-    fn update(&self) -> Result<()>;
+    /// Refresh plans and metadata outside stream capture, before every replay.
+    fn prepare_replay(&self) -> Result<()>;
     fn needs_req_to_token(&self) -> bool {
         true
     }
 }
 
-/// Boundary implemented by the future Rust model architecture.
+/// Model execution and cache-binding interface implemented by each architecture.
 pub trait ModelExecutor {
     fn set_kv_reserved_slot(&mut self, _slot: i64) {}
-    /// Configure model-specific segmented prefill capture; zero clears/disables.
-    fn configure_prefill_graph(&mut self, _max_tokens: usize) {}
-
-    /// Capture configured prefill buckets after weights and KV cache are bound.
-    fn capture_prefill_graphs(&self) -> Result<()> {
-        Ok(())
+    /// Evaluated only after dtype/backend and full-history cache binding.
+    /// Each forward mode is opt-in, with explicit shape and padding limits.
+    fn graph_capabilities(&self) -> GraphCapabilities {
+        GraphCapabilities::default()
     }
-
-    /// Whether decode forwards can be safely captured as CUDA Graphs.
-    fn supports_cuda_graph(&self) -> bool {
-        true
+    fn prefill_graph_program(&self) -> Option<&dyn PrefillGraphProgram> {
+        None
     }
 
     fn prepare_decode_graph(
@@ -106,13 +112,7 @@ pub trait ModelExecutor {
         Ok(None)
     }
 
-    fn forward(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        attention_metadata: Option<&AttentionMetadata>,
-        logits_indices: Option<&Tensor>,
-    ) -> Result<Tensor>;
+    fn forward(&self, batch: &ForwardBatch<'_>) -> Result<ForwardOutput>;
 
     /// Receives native Hugging Face checkpoint tensors after model assembly.
     /// Concrete model architectures override this when their parameter naming
@@ -123,9 +123,9 @@ pub trait ModelExecutor {
         ))
     }
 
-    /// Binds `(layers, pages, page_size, kv_heads, head_dim)` cache views.
+    /// Bind stable, layer-local K/V views in model order, before graph capture.
     /// Cache-less executors may keep the default no-op implementation.
-    fn bind_kv_cache(&mut self, _k_cache: Tensor, _v_cache: Tensor) -> Result<()> {
+    fn bind_state_cache(&mut self, _cache: ModelKvCache) -> Result<()> {
         Ok(())
     }
 }
@@ -171,10 +171,11 @@ impl From<TchError> for ModelRunnerError {
 
 pub type Result<T> = std::result::Result<T, ModelRunnerError>;
 
-/// Owns model execution, decode graphs, and model-specific prefill graph configuration.
+/// Owns model execution and both decode and segmented prefill graph lifecycles.
 pub struct ModelRunner {
     // Graphs must release their backend state before model/cache ownership.
-    graph_runner: Option<GraphRunner>,
+    decode_graph_runner: Option<DecodeGraphRunner>,
+    pub(crate) prefill_graph_runner: Option<SegmentedGraphRunner>,
     model: Box<dyn ModelExecutor>,
     device: Device,
 }
@@ -184,7 +185,8 @@ impl ModelRunner {
         Self {
             model,
             device,
-            graph_runner: None,
+            decode_graph_runner: None,
+            prefill_graph_runner: None,
         }
     }
 
@@ -192,8 +194,8 @@ impl ModelRunner {
         self.device
     }
 
-    pub fn supports_cuda_graph(&self) -> bool {
-        self.model.supports_cuda_graph()
+    pub fn graph_capabilities(&self) -> GraphCapabilities {
+        self.model.graph_capabilities()
     }
 
     /// Hands loaded Hugging Face tensors to the concrete model architecture.
@@ -203,12 +205,13 @@ impl ModelRunner {
     }
 
     pub fn set_kv_reserved_slot(&mut self, slot: i64) {
+        self.clear_graphs();
         self.model.set_kv_reserved_slot(slot);
     }
 
-    pub fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {
+    pub fn bind_state_cache(&mut self, cache: ModelKvCache) -> Result<()> {
         self.clear_graphs();
-        self.model.bind_kv_cache(k_cache, v_cache)
+        self.model.bind_state_cache(cache)
     }
 
     pub fn capture_graphs(
@@ -216,16 +219,43 @@ impl ModelRunner {
         args: &ServerArgs,
         pool: Rc<RefCell<KVCachePool>>,
     ) -> Result<()> {
-        self.graph_runner = None;
-        let prefill_limit =
-            if matches!(self.device, Device::Cuda(_)) && !crate::logging::step_timing_enabled() {
-                args.prefill_cuda_graph_max_tokens
-            } else {
-                0
-            };
-        self.model.configure_prefill_graph(prefill_limit);
-        self.graph_runner = GraphRunner::capture(self, args, pool)?;
-        no_grad(|| self.model.capture_prefill_graphs())?;
+        self.clear_graphs();
+        let decode = DecodeGraphRunner::capture(self, args, pool)?;
+        let mut prefill = None;
+        let capabilities = self.model.graph_capabilities();
+        if args.prefill_cuda_graph_max_tokens > 0
+            && matches!(self.device, Device::Cuda(_))
+            && !crate::logging::step_timing_enabled()
+            && super::NativeCudaGraph::available()
+        {
+            match capabilities.segmented_prefill {
+                GraphSupport::Unsupported(reason) => {
+                    tracing::info!(reason, "segmented prefill graphs unavailable; using eager")
+                }
+                GraphSupport::Supported(limits) => {
+                    let program = self.model.prefill_graph_program().ok_or_else(|| {
+                        ModelRunnerError::Model(
+                            "model declares segmented graphs without a computation program".into(),
+                        )
+                    })?;
+                    if args.max_seq_len > limits.max_context_len {
+                        tracing::info!(
+                            "segmented prefill context exceeds model capability; using eager"
+                        );
+                    } else {
+                        prefill = Some(no_grad(|| {
+                            SegmentedGraphRunner::capture(
+                                program,
+                                args.prefill_cuda_graph_max_tokens,
+                                limits,
+                            )
+                        })?);
+                    }
+                }
+            }
+        }
+        self.decode_graph_runner = decode;
+        self.prefill_graph_runner = prefill;
         Ok(())
     }
 
@@ -236,68 +266,36 @@ impl ModelRunner {
         self.model.prepare_decode_graph(metadata)
     }
 
-    /// The single model-forward entry point used by eager and capture paths.
-    pub fn run_model(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        attention_metadata: Option<&AttentionMetadata>,
-        logits_indices: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        self.validate_tensors(input_ids, positions)?;
-        no_grad(|| {
-            self.model
-                .forward(input_ids, positions, attention_metadata, logits_indices)
-        })
+    /// Eager/capture model execution uses the same typed input and output.
+    pub fn run_model(&self, batch: &ForwardBatch<'_>) -> Result<ForwardOutput> {
+        batch.validate(self.device)?;
+        no_grad(|| self.model.forward(batch))
     }
 
-    /// Uses captured CUDA graphs for decode when a fitting graph exists.
-    pub fn forward(&self, batch: &Batch) -> Result<Tensor> {
-        if batch.phase == BatchPhase::Decode {
-            if let Some(graph) = &self.graph_runner {
-                if let Some(output) = graph.replay(batch)? {
+    pub fn forward(&self, batch: &Batch) -> Result<ForwardOutput> {
+        let forward = ForwardBatch::from_scheduler(batch)?;
+        // Validation precedes bucket lookup, buffer copies and backend planning.
+        forward.validate(self.device)?;
+        if forward.phase() == BatchPhase::Decode {
+            if let Some(graph) = &self.decode_graph_runner {
+                if let Some(output) = graph.replay(forward)? {
                     return Ok(output);
                 }
             }
+        } else if let Some(graph) = &self.prefill_graph_runner {
+            let program = self.model.prefill_graph_program().ok_or_else(|| {
+                ModelRunnerError::Model("prefill graph program disappeared after capture".into())
+            })?;
+            if let Some(output) = no_grad(|| graph.replay(program, forward))? {
+                return Ok(output);
+            }
         }
-        let logits_indices = match batch.phase {
-            BatchPhase::Prefill => Some(
-                batch
-                    .logits_indices
-                    .as_ref()
-                    .ok_or(ModelRunnerError::MissingPrefillLogitsIndices)?,
-            ),
-            BatchPhase::Decode => None,
-        };
-        self.run_model(
-            &batch.input_ids,
-            &batch.positions,
-            batch.attention_metadata.as_ref(),
-            logits_indices,
-        )
+        no_grad(|| self.model.forward(&forward))
     }
 
     pub fn clear_graphs(&mut self) {
-        self.graph_runner = None;
-        self.model.configure_prefill_graph(0);
-    }
-
-    fn validate_tensors(&self, input_ids: &Tensor, positions: &Tensor) -> Result<()> {
-        if input_ids.numel() != positions.numel() {
-            return Err(ModelRunnerError::InputPositionLengthMismatch {
-                input_ids: input_ids.numel(),
-                positions: positions.numel(),
-            });
-        }
-        for tensor in [input_ids, positions] {
-            if tensor.device() != self.device {
-                return Err(ModelRunnerError::TensorOnWrongDevice {
-                    expected: self.device,
-                    actual: tensor.device(),
-                });
-            }
-        }
-        Ok(())
+        self.decode_graph_runner = None;
+        self.prefill_graph_runner = None;
     }
 }
 
@@ -312,17 +310,38 @@ mod tests {
     impl ModelExecutor for IndicesModel {
         fn forward(
             &self,
-            input_ids: &Tensor,
-            _positions: &Tensor,
-            _attention_metadata: Option<&AttentionMetadata>,
-            logits_indices: Option<&Tensor>,
-        ) -> Result<Tensor> {
-            Ok(logits_indices
-                .map(Tensor::shallow_clone)
-                .unwrap_or_else(|| {
-                    Tensor::zeros([input_ids.numel() as i64], (Kind::Int64, Device::Cpu))
-                }))
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let _attention_metadata = batch.attention;
+            let logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> {
+                Ok(logits_indices
+                    .map(Tensor::shallow_clone)
+                    .unwrap_or_else(|| {
+                        Tensor::zeros([input_ids.numel() as i64], (Kind::Int64, Device::Cpu))
+                    }))
+            })()
+            .map(crate::engine::ForwardOutput::new)
         }
+    }
+
+    #[test]
+    fn invalid_execution_inputs_never_enter_model_computation() {
+        struct MustNotRun;
+        impl ModelExecutor for MustNotRun {
+            fn forward(&self, _: &ForwardBatch<'_>) -> Result<ForwardOutput> {
+                panic!("invalid batch reached model computation")
+            }
+        }
+        let runner = ModelRunner::new(Box::new(MustNotRun), Device::Cpu);
+        let batch = Batch::decode(
+            Tensor::ones([1], (Kind::Float, Device::Cpu)),
+            Tensor::zeros([1], (Kind::Int64, Device::Cpu)),
+            None,
+        );
+        assert!(runner.forward(&batch).is_err());
     }
 
     #[test]
@@ -336,7 +355,7 @@ mod tests {
         );
 
         assert_eq!(
-            Vec::<i64>::try_from(&runner.forward(&batch).unwrap()).unwrap(),
+            Vec::<i64>::try_from(&runner.forward(&batch).unwrap().logits).unwrap(),
             vec![2]
         );
     }
@@ -351,7 +370,7 @@ mod tests {
         );
 
         assert_eq!(
-            Vec::<i64>::try_from(&runner.forward(&batch).unwrap()).unwrap(),
+            Vec::<i64>::try_from(&runner.forward(&batch).unwrap().logits).unwrap(),
             vec![0, 0]
         );
     }

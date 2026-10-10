@@ -66,6 +66,17 @@ pub struct AttentionBatch<'a> {
 
 impl Attention {
     pub fn new(name: &str, spec: AttentionSpec) -> Result<Self> {
+        Self::validate(name, spec)?;
+        let kind = AttentionBackendKind::parse(name)?;
+        Ok(Self {
+            backend: create_attention_backend(kind),
+            spec,
+            page_size: None,
+        })
+    }
+
+    /// Validate a backend combination without allocating model tensors.
+    pub fn validate(name: &str, spec: AttentionSpec) -> Result<()> {
         let kind = AttentionBackendKind::parse(name)?;
         if kind == AttentionBackendKind::FlashInfer {
             if !cfg!(has_flashinfer) {
@@ -86,11 +97,7 @@ impl Attention {
                 ));
             }
         }
-        Ok(Self {
-            backend: create_attention_backend(kind),
-            spec,
-            page_size: None,
-        })
+        Ok(())
     }
 
     pub fn bind_cache_layout(&mut self, page_size: i64) {
@@ -164,7 +171,7 @@ enum BackendPlan {
 /// Internal seam for the three existing attention implementations.
 trait AttentionBackend {
     fn supports_cuda_graph(&self) -> bool {
-        true
+        false
     }
 
     fn prepare_decode_graph(
@@ -385,7 +392,7 @@ struct FlashInferGraphState {
 
 #[cfg(has_flashinfer)]
 impl DecodeGraphState for FlashInferGraphState {
-    fn update(&self) -> Result<()> {
+    fn prepare_replay(&self) -> Result<()> {
         let metadata = AttentionMetadata {
             forward_mode: BatchPhase::Decode,
             write_loc: None,

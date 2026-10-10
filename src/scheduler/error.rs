@@ -1,13 +1,12 @@
 //! Scheduler construction and execution errors.
 
-use std::{fmt, path::PathBuf};
+use std::fmt;
 
 use crate::engine::kvcache::KVCacheError;
 use crate::engine::{BatchContextError, EngineError};
 
 #[derive(Debug)]
 pub enum SchedulerError {
-    InvalidModelConfig { path: PathBuf, message: String },
     RequestIdExhausted,
     Cache(KVCacheError),
     Batch(BatchContextError),
@@ -18,9 +17,6 @@ pub enum SchedulerError {
 impl fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidModelConfig { path, message } => {
-                write!(f, "invalid model config {}: {message}", path.display())
-            }
             Self::RequestIdExhausted => write!(f, "scheduler request ID space exhausted"),
             Self::Cache(error) => write!(f, "KV cache scheduling failed: {error}"),
             Self::Batch(error) => write!(f, "prefill batch preparation failed: {error}"),

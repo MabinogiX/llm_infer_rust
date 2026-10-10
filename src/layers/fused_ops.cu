@@ -207,7 +207,7 @@ const char* launch_error() {
 }
 }  // namespace
 
-extern "C" const char* sglang_qwen3_native_norm(
+extern "C" const char* sglang_layers_native_norm(
     const void* x, const void* weight, void* out, int64_t tokens,
     int64_t heads, int64_t width, int64_t token_stride, int64_t head_stride,
     double eps, int dtype, void* stream) {
@@ -251,7 +251,7 @@ extern "C" const char* sglang_qwen3_native_norm(
   return launch_error();
 }
 
-extern "C" const char* sglang_qwen3_native_qk_norm(
+extern "C" const char* sglang_layers_native_qk_norm(
     void* q, void* k, const void* qw, const void* kw,
     int64_t tokens, int64_t qheads, int64_t kheads,
     int64_t width, int64_t q_token_stride, int64_t q_head_stride,
@@ -297,7 +297,7 @@ extern "C" const char* sglang_qwen3_native_qk_norm(
   return launch_error();
 }
 
-extern "C" const char* sglang_qwen3_native_add_norm(
+extern "C" const char* sglang_layers_native_add_norm(
     void* x, void* residual, const void* weight, int64_t tokens,
     int64_t width, int64_t x_stride, int64_t residual_stride,
     double eps, int dtype, void* stream) {
@@ -337,7 +337,7 @@ extern "C" const char* sglang_qwen3_native_add_norm(
   return launch_error();
 }
 
-extern "C" const char* sglang_qwen3_native_rope(
+extern "C" const char* sglang_layers_native_rope(
     void* q, void* k, const int64_t* positions,
     const float* cos, const float* sin, int64_t tokens,
     int64_t qheads, int64_t kheads, int64_t width,
@@ -361,7 +361,7 @@ extern "C" const char* sglang_qwen3_native_rope(
   return launch_error();
 }
 
-extern "C" const char* sglang_qwen3_native_silu_mul(
+extern "C" const char* sglang_layers_native_silu_mul(
     const void* gate_up, void* out, int64_t tokens, int64_t width,
     int dtype, void* stream) {
   const dim3 grid((tokens * width + 255) / 256);

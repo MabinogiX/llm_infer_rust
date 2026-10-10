@@ -5,9 +5,9 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use tch::{Cuda, Device, Kind, Tensor};
 
 use super::{
-    AttentionMetadata, Batch, BatchPhase, DecodeGraphState, ModelRunner, ModelRunnerError,
-    ServerArgs,
+    AttentionMetadata, BatchPhase, DecodeGraphState, ModelRunner, ModelRunnerError, ServerArgs,
 };
+use super::{ForwardBatch, ForwardMode, ForwardOutput, GraphLimits, GraphPadding, GraphSupport};
 use crate::engine::kvcache::KVCachePool;
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
@@ -22,13 +22,14 @@ struct CapturedGraph {
 }
 
 /// Holds one graph per batch size; padding reads the permanent reserved page 0.
-pub struct GraphRunner {
+pub(crate) struct DecodeGraphRunner {
     graphs: BTreeMap<usize, CapturedGraph>,
     pad_pages: Tensor,
     pad_locations: Tensor,
+    admission: GraphLimits,
 }
 
-impl GraphRunner {
+impl DecodeGraphRunner {
     pub fn capture(
         runner: &ModelRunner,
         args: &ServerArgs,
@@ -38,10 +39,20 @@ impl GraphRunner {
             tracing::info!("CUDA Graph disabled for synchronized SGLANG_PROFILE_STEPS profiling");
             return Ok(None);
         }
-        if !runner.supports_cuda_graph() {
-            tracing::info!(
-                "selected model does not support CUDA Graph capture; using eager decode"
-            );
+        let admission = match runner.graph_capabilities().decode {
+            GraphSupport::Unsupported(reason) => {
+                tracing::info!(reason, "decode graphs unavailable; using eager");
+                return Ok(None);
+            }
+            GraphSupport::Supported(limits) => limits,
+        };
+        if admission.padding != GraphPadding::ReservedKvPageZero {
+            return Err(ModelRunnerError::Model(
+                "decode graphs require reserved KV page zero padding".into(),
+            ));
+        }
+        if args.max_seq_len > admission.max_context_len {
+            tracing::info!("decode graph context exceeds model capability; using eager");
             return Ok(None);
         }
         let Device::Cuda(device_index) = runner.device() else {
@@ -55,7 +66,9 @@ impl GraphRunner {
         let limit = args
             .cuda_graph_bs
             .unwrap_or(args.max_running_req)
-            .min(args.max_running_req);
+            .min(args.max_running_req)
+            .min(admission.max_batch_size)
+            .min(admission.max_tokens);
         if limit == 0 {
             tracing::info!("CUDA Graph capture disabled; using eager decode");
             return Ok(None);
@@ -70,6 +83,7 @@ impl GraphRunner {
             graphs: BTreeMap::new(),
             pad_pages,
             pad_locations,
+            admission,
         };
         let mut sizes = vec![1, 2, 4, 8, 16, 32, 64, 128, 256];
         sizes.retain(|&size| size <= limit);
@@ -136,12 +150,24 @@ impl GraphRunner {
         Cuda::synchronize(device_index as i64);
         let native = NativeCudaGraph::create(device_index)?;
         for _ in 0..3 {
-            let _ = runner.run_model(&input_ids, &positions, Some(&metadata), None)?;
+            let _ = runner
+                .run_model(&ForwardBatch {
+                    input_ids: &input_ids,
+                    positions: &positions,
+                    attention: Some(&metadata),
+                    mode: ForwardMode::Decode,
+                })?
+                .logits;
         }
         Cuda::synchronize(device_index as i64);
         native.begin()?;
-        let output = match runner.run_model(&input_ids, &positions, Some(&metadata), None) {
-            Ok(output) => output,
+        let output = match runner.run_model(&ForwardBatch {
+            input_ids: &input_ids,
+            positions: &positions,
+            attention: Some(&metadata),
+            mode: ForwardMode::Decode,
+        }) {
+            Ok(output) => output.logits,
             Err(error) => {
                 let _ = native.end();
                 return Err(error);
@@ -158,17 +184,59 @@ impl GraphRunner {
         })
     }
 
-    pub fn replay(&self, batch: &Batch) -> Result<Option<Tensor>> {
-        let size = batch.input_ids.size()[0] as usize;
+    fn admission_admits(&self, rows: usize, context: usize) -> bool {
+        GraphSupport::Supported(self.admission).admits(rows, rows, context)
+    }
+
+    /// Replay a batch already validated by ModelRunner, or request eager fallback.
+    pub(crate) fn replay(&self, batch: ForwardBatch<'_>) -> Result<Option<ForwardOutput>> {
+        if batch.phase() != BatchPhase::Decode {
+            return Ok(None);
+        }
+        let size = batch.input_ids.numel();
+        let context = batch
+            .attention
+            .as_ref()
+            .and_then(|m| m.max_seqlen)
+            .unwrap_or(0);
+        if !self.admission_admits(size, context) {
+            tracing::debug!(
+                size,
+                context,
+                "decode shape exceeds graph capability; using eager"
+            );
+            return Ok(None);
+        }
         let Some((_, graph)) = self.graphs.range(size..).next() else {
+            tracing::debug!(size, "no captured decode bucket; using eager");
             return Ok(None);
         };
         let rows = size as i64;
-        graph.input_ids.narrow(0, 0, rows).copy_(&batch.input_ids);
-        graph.positions.narrow(0, 0, rows).copy_(&batch.positions);
-        let source = batch.attention_metadata.as_ref().ok_or_else(|| {
+        let source = batch.attention.ok_or_else(|| {
             ModelRunnerError::Model("decode batch requires attention metadata".to_owned())
         })?;
+        // A valid eager batch can have a different cache-table width. Admit the
+        // graph only when every static shape matches, before copying anything.
+        for (target, value) in [
+            (&graph.metadata.block_table, &source.block_table),
+            (&graph.metadata.req_to_token, &source.req_to_token),
+        ] {
+            if let Some(target) = target {
+                let Some(value) = value else { return Ok(None) };
+                if value.size()[1..] != target.size()[1..] {
+                    tracing::debug!("decode cache table differs from captured shape; using eager");
+                    return Ok(None);
+                }
+            }
+        }
+        graph
+            .input_ids
+            .narrow(0, 0, rows)
+            .copy_(&batch.input_ids.view([rows, 1]));
+        graph
+            .positions
+            .narrow(0, 0, rows)
+            .copy_(&batch.positions.view([rows, 1]));
         copy_field(&graph.metadata.write_loc, &source.write_loc, rows)?;
         copy_field(&graph.metadata.cache_seqlens, &source.cache_seqlens, rows)?;
         copy_field(&graph.metadata.block_table, &source.block_table, rows)?;
@@ -213,15 +281,21 @@ impl GraphRunner {
             }
         }
         if let Some(backend) = graph.backend.as_ref() {
-            backend.update()?;
+            backend.prepare_replay()?;
         }
         graph.native.replay()?;
-        Ok(Some(graph.output.narrow(0, 0, rows).copy()))
+        Ok(Some(ForwardOutput::new(
+            graph.output.narrow(0, 0, rows).copy(),
+        )))
     }
 }
 
-impl Drop for GraphRunner {
+impl Drop for DecodeGraphRunner {
     fn drop(&mut self) {
+        // Native graph pools and planning buffers can still be in flight.
+        if let Device::Cuda(device) = self.pad_pages.device() {
+            Cuda::synchronize(device as i64);
+        }
         self.graphs.clear();
     }
 }
@@ -342,7 +416,7 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use crate::{
-        engine::{ModelExecutor, kvcache::KVCacheLayout},
+        engine::{Batch, ModelExecutor, kvcache::KVCacheLayout},
         models::attention::{Attention, AttentionSpec, BaseAttention},
     };
 
@@ -352,6 +426,18 @@ mod tests {
     }
 
     impl ModelExecutor for DecodeModel {
+        fn graph_capabilities(&self) -> super::super::GraphCapabilities {
+            super::super::GraphCapabilities {
+                decode: GraphSupport::Supported(GraphLimits {
+                    max_batch_size: 5,
+                    max_tokens: 5,
+                    max_context_len: 1024,
+                    padding: GraphPadding::ReservedKvPageZero,
+                }),
+                ..Default::default()
+            }
+        }
+
         fn prepare_decode_graph(
             &self,
             metadata: &AttentionMetadata,
@@ -361,25 +447,29 @@ mod tests {
 
         fn forward(
             &self,
-            ids: &Tensor,
-            positions: &Tensor,
-            metadata: Option<&AttentionMetadata>,
-            _: Option<&Tensor>,
-        ) -> Result<Tensor> {
-            let rows = ids.size()[0];
-            let scalar = (ids + positions).to_kind(Kind::Float).view([rows, 1, 1]) * 0.001;
-            let q = scalar.repeat([1, 16, 128]).to_kind(Kind::BFloat16);
-            let kv = q.narrow(1, 0, 8).contiguous();
-            let mut cache = self.cache.borrow_mut();
-            cache.write_kv(
-                &kv,
-                &(&kv + 1.0),
-                metadata.unwrap().write_loc.as_ref(),
-                BatchPhase::Decode,
-            )?;
-            self.attention
-                .prepare(metadata, rows as usize)?
-                .forward(&q, &kv, &kv, &cache)
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let ids = batch.input_ids;
+            let positions = batch.positions;
+            let metadata = batch.attention;
+            let _ = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> {
+                let rows = ids.size()[0];
+                let scalar = (ids + positions).to_kind(Kind::Float).view([rows, 1, 1]) * 0.001;
+                let q = scalar.repeat([1, 16, 128]).to_kind(Kind::BFloat16);
+                let kv = q.narrow(1, 0, 8).contiguous();
+                let mut cache = self.cache.borrow_mut();
+                cache.write_kv(
+                    &kv,
+                    &(&kv + 1.0),
+                    metadata.unwrap().write_loc.as_ref(),
+                    BatchPhase::Decode,
+                )?;
+                self.attention
+                    .prepare(metadata, rows as usize)?
+                    .forward(&q, &kv, &kv, &cache)
+            })()
+            .map(crate::engine::ForwardOutput::new)
         }
     }
 
@@ -427,7 +517,7 @@ mod tests {
         args.cuda_graph_bs = Some(4);
         args.max_seq_len = 1024;
         let free = pool.borrow().free_count();
-        let graph = GraphRunner::capture(&runner, &args, pool.clone())
+        let graph = DecodeGraphRunner::capture(&runner, &args, pool.clone())
             .unwrap()
             .unwrap();
         assert_eq!(graph.graphs.keys().copied().collect::<Vec<_>>(), [1, 2, 4]);
@@ -458,7 +548,7 @@ mod tests {
                     .push(pages[((length - 1) / 16) as usize] * 16 + ((length - 1) % 16) as i32);
                 table.extend(pages);
             }
-            let batch = Batch::decode(
+            let mut batch = Batch::decode(
                 (Tensor::arange(rows, (Kind::Int64, device)) + iteration as i64 + 1)
                     .view([rows, 1]),
                 Tensor::from_slice(&lengths)
@@ -481,17 +571,36 @@ mod tests {
                     max_seqlen: Some(1024),
                 }),
             );
-            let replay = graph.replay(&batch).unwrap();
-            assert_eq!(replay.is_some(), rows <= 4);
-            let actual = replay.unwrap_or_else(|| runner.forward(&batch).unwrap());
-            let expected = runner
-                .run_model(
-                    &batch.input_ids,
-                    &batch.positions,
-                    batch.attention_metadata.as_ref(),
-                    None,
-                )
+            if iteration == 0 {
+                let table = batch
+                    .attention_metadata
+                    .as_mut()
+                    .unwrap()
+                    .block_table
+                    .take()
+                    .unwrap();
+                batch.attention_metadata.as_mut().unwrap().block_table =
+                    Some(table.narrow(1, 0, 1));
+                assert!(
+                    graph
+                        .replay(ForwardBatch::from_scheduler(&batch).unwrap())
+                        .unwrap()
+                        .is_none(),
+                    "table width mismatch must fall back to eager"
+                );
+                batch.attention_metadata.as_mut().unwrap().block_table = Some(table);
+            }
+            let replay = graph
+                .replay(ForwardBatch::from_scheduler(&batch).unwrap())
                 .unwrap();
+            assert_eq!(replay.is_some(), rows <= 4);
+            let actual = replay
+                .unwrap_or_else(|| runner.forward(&batch).unwrap())
+                .logits;
+            let expected = runner
+                .run_model(&ForwardBatch::from_scheduler(&batch).unwrap())
+                .unwrap()
+                .logits;
             let error = (&actual.to_kind(Kind::Float) - expected.to_kind(Kind::Float))
                 .abs()
                 .max()
@@ -507,14 +616,14 @@ mod tests {
         }
         drop(graph);
         assert_eq!(pool.borrow().free_count(), free);
-        let graph = GraphRunner::capture(&runner, &args, pool.clone())
+        let graph = DecodeGraphRunner::capture(&runner, &args, pool.clone())
             .unwrap()
             .unwrap();
         assert_eq!(graph.graphs.len(), 3);
         drop(graph);
         args.cuda_graph_bs = Some(0);
         assert!(
-            GraphRunner::capture(&runner, &args, pool.clone())
+            DecodeGraphRunner::capture(&runner, &args, pool.clone())
                 .unwrap()
                 .is_none()
         );

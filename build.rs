@@ -3,7 +3,7 @@ use std::{env, fs, path::Path, process::Command};
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_cuda_graph)");
     println!("cargo:rustc-check-cfg=cfg(has_flashinfer)");
-    println!("cargo:rustc-check-cfg=cfg(has_qwen3_cuda)");
+    println!("cargo:rustc-check-cfg=cfg(has_layer_cuda)");
     println!("cargo:rustc-check-cfg=cfg(has_cuda_kv_store)");
     println!("cargo:rerun-if-changed=src/models/attention/kv_store_bridge.cpp");
     println!("cargo:rerun-if-changed=src/models/attention/kv_store.cu");
@@ -12,8 +12,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/engine/sampling_flashinfer.cu");
     println!("cargo:rerun-if-changed=src/models/attention/flashinfer_bridge.cpp");
     println!("cargo:rerun-if-changed=src/models/attention/flashinfer_plan_run.cu");
-    println!("cargo:rerun-if-changed=src/models/qwen3/fused_ops_bridge.cpp");
-    println!("cargo:rerun-if-changed=src/models/qwen3/fused_ops.cu");
+    println!("cargo:rerun-if-changed=src/layers/fused_ops_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/layers/fused_ops.cu");
     println!("cargo:rerun-if-changed=third_party/sglang");
     println!("cargo:rerun-if-env-changed=VIRTUAL_ENV");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -69,7 +69,7 @@ fn main() {
     let mut fused_bridge = cc::Build::new();
     fused_bridge
         .cpp(true)
-        .file("src/models/qwen3/fused_ops_bridge.cpp")
+        .file("src/layers/fused_ops_bridge.cpp")
         .file("src/models/attention/kv_store_bridge.cpp")
         .flag_if_supported("-std=c++20")
         .warnings(false)
@@ -77,13 +77,13 @@ fn main() {
     for include in &torch_includes {
         fused_bridge.include(include);
     }
-    fused_bridge.compile("sglang_qwen3_fused_bridge");
+    fused_bridge.compile("sglang_layers_fused_bridge");
     let mut fused_kernels = cc::Build::new();
     fused_kernels
         .cuda(true)
         .debug(false)
         .opt_level(3)
-        .file("src/models/qwen3/fused_ops.cu")
+        .file("src/layers/fused_ops.cu")
         .file("src/models/attention/kv_store.cu")
         .include("third_party/sglang")
         .include("third_party/sglang/include")
@@ -103,8 +103,8 @@ fn main() {
             .include(data.join("cccl/cub"))
             .include(data.join("cccl/thrust"));
     }
-    fused_kernels.compile("sglang_qwen3_fused_kernels");
-    println!("cargo:rustc-cfg=has_qwen3_cuda");
+    fused_kernels.compile("sglang_layers_fused_kernels");
+    println!("cargo:rustc-cfg=has_layer_cuda");
     println!("cargo:rustc-cfg=has_cuda_kv_store");
 
     // Compile the thin native adapter against the wheel's official CUDA headers.

@@ -7,43 +7,76 @@ use std::{cell::RefCell, collections::HashMap};
 
 use tch::{Device, Kind, Tensor};
 
-use super::ops::{RopeCache, add_rms_norm, qk_norm, rms_norm, silu_and_mul};
+use super::config::Qwen3Config;
 use crate::engine::{
-    AttentionMetadata, BatchPhase, DecodeGraphState, ModelArgs, ModelExecutor, ModelFactory,
-    ModelRunnerError, ModelWeights,
+    AttentionMetadata, BatchPhase, DecodeGraphState, ModelExecutor, ModelFactory, ModelRunnerError,
+    ModelWeights, RuntimeModelConfig,
+};
+use crate::layers::{
+    DenseSwiGlu, HalfSplitRope, PackedQkv, add_rms_norm, embedding, linear, logits, qk_norm,
+    rms_norm,
 };
 use crate::models::attention::{Attention, AttentionBatch, AttentionSpec, BaseAttention};
 use crate::profiling::{ModelProfiler, ModelStage};
 
 #[path = "prefill_graph.rs"]
 mod prefill_graph;
-use prefill_graph::PrefillGraphCache;
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
 /// Factory for the dense `Qwen3ForCausalLM` architecture.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Qwen3Factory;
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen3Factory {
+    pub config: Qwen3Config,
+}
 
 impl ModelFactory for Qwen3Factory {
-    fn create(
+    fn cache_spec(
         &self,
-        model_args: ModelArgs,
-        kind: Kind,
-        device: Device,
-    ) -> Result<Box<dyn ModelExecutor>> {
-        Ok(Box::new(Qwen3ForCausalLM::new(model_args, kind, device)?))
+        _runtime: RuntimeModelConfig,
+    ) -> Result<crate::engine::kvcache::ModelCacheSpec> {
+        crate::engine::kvcache::ModelCacheSpec::uniform(
+            self.config.num_layers,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+        )
+        .map_err(|e| model_error(&e.to_string()))
     }
 
-    fn create_with_attention_backend(
+    fn validate_runtime(
         &self,
-        model_args: ModelArgs,
+        runtime_config: RuntimeModelConfig,
+        kind: Kind,
+        device: Device,
+        attention_backend: &str,
+    ) -> Result<()> {
+        validate_config(self.config)?;
+        let expected = self.config.runtime(runtime_config.checkpoint_kind);
+        if runtime_config != expected {
+            return Err(model_error(&format!(
+                "runtime model configuration does not match Qwen3 config: expected {expected:?}, received {runtime_config:?}"
+            )));
+        }
+        Attention::validate(
+            attention_backend,
+            AttentionSpec {
+                num_heads: self.config.num_attention_heads as i64,
+                num_kv_heads: self.config.num_kv_heads as i64,
+                head_dim: self.config.head_dim as i64,
+                kind,
+                device,
+            },
+        )
+    }
+
+    fn create(
+        &self,
         kind: Kind,
         device: Device,
         attention_backend: &str,
     ) -> Result<Box<dyn ModelExecutor>> {
         Ok(Box::new(Qwen3ForCausalLM::new_with_attention_backend(
-            model_args,
+            self.config,
             kind,
             device,
             attention_backend,
@@ -53,13 +86,11 @@ impl ModelFactory for Qwen3Factory {
 
 /// Dense Qwen3 decoder-only model with QK-RMSNorm, RoPE, GQA, and SwiGLU.
 pub struct Qwen3ForCausalLM {
-    // Drop captured segments before any parameters that their kernels reference.
-    prefill_graphs: RefCell<PrefillGraphCache>,
-    config: ModelArgs,
+    config: Qwen3Config,
     device: Device,
     kind: Kind,
     attention: Attention,
-    rope: RopeCache,
+    rope: HalfSplitRope,
     embed_tokens: Tensor,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
@@ -67,12 +98,12 @@ pub struct Qwen3ForCausalLM {
 }
 
 impl Qwen3ForCausalLM {
-    pub fn new(config: ModelArgs, kind: Kind, device: Device) -> Result<Self> {
+    pub fn new(config: Qwen3Config, kind: Kind, device: Device) -> Result<Self> {
         Self::new_with_attention_backend(config, kind, device, "pt")
     }
 
     pub fn new_with_attention_backend(
-        config: ModelArgs,
+        config: Qwen3Config,
         kind: Kind,
         device: Device,
         attention_backend: &str,
@@ -97,12 +128,11 @@ impl Qwen3ForCausalLM {
         )?;
 
         Ok(Self {
-            prefill_graphs: RefCell::new(PrefillGraphCache::default()),
             config,
             device,
             kind,
             attention,
-            rope: RopeCache::new(max_positions, head_dim, config.rope_theta, kind, device),
+            rope: HalfSplitRope::new(max_positions, head_dim, config.rope_theta, kind, device),
             embed_tokens: parameter([vocab, hidden], kind, device),
             layers: (0..config.num_layers)
                 .map(|_| {
@@ -129,16 +159,6 @@ impl Qwen3ForCausalLM {
         attention_metadata: Option<&AttentionMetadata>,
         logits_indices: Option<&Tensor>,
     ) -> Result<Tensor> {
-        if attention_metadata.is_some_and(|meta| meta.forward_mode == BatchPhase::Prefill) {
-            if let Some(logits) = self.forward_prefill_graph(
-                input_ids,
-                positions,
-                attention_metadata,
-                logits_indices,
-            )? {
-                return Ok(logits);
-            }
-        }
         let mut profiler = ModelProfiler::new(self.device);
         let ids = input_ids.view([-1]);
         let positions = positions.view([-1]);
@@ -153,7 +173,7 @@ impl Qwen3ForCausalLM {
         let attention = attention?;
 
         let timer = profiler.start(ModelStage::Embed);
-        let mut hidden_states = self.embed_tokens.index_select(0, &ids);
+        let mut hidden_states = embedding(&ids, &self.embed_tokens);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::Layers);
@@ -186,10 +206,7 @@ impl Qwen3ForCausalLM {
         } else {
             rms_norm(&hidden_states, &self.norm, self.config.rms_norm_eps)
         };
-        if let Some(indices) = logits_indices {
-            hidden_states = hidden_states.index_select(0, indices);
-        }
-        let logits = linear(&hidden_states, &self.lm_head);
+        let logits = logits(&hidden_states, &self.lm_head, logits_indices);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::PlanDrop);
@@ -204,7 +221,6 @@ impl Qwen3ForCausalLM {
     }
 
     fn load_weights_impl(&mut self, weights: ModelWeights) -> Result<usize> {
-        self.prefill_graphs.get_mut().clear();
         let mut weights = weights
             .into_tensors()
             .into_iter()
@@ -250,31 +266,52 @@ impl Qwen3ForCausalLM {
 }
 
 impl ModelExecutor for Qwen3ForCausalLM {
-    fn configure_prefill_graph(&mut self, max_tokens: usize) {
-        let limit = if matches!(self.device, Device::Cuda(_))
-            && matches!(self.kind, Kind::BFloat16 | Kind::Half)
-            && crate::engine::NativeCudaGraph::available()
-            && !crate::logging::step_timing_enabled()
+    fn graph_capabilities(&self) -> crate::engine::GraphCapabilities {
+        use crate::engine::{GraphCapabilities, GraphLimits, GraphPadding, GraphSupport};
+        let reason = if !matches!(self.device, Device::Cuda(_)) {
+            Some("Qwen3 graphs require CUDA")
+        } else if !matches!(self.kind, Kind::BFloat16 | Kind::Half) {
+            Some("Qwen3 graphs require BF16 or FP16")
+        } else if !self
+            .layers
+            .iter()
+            .all(|layer| layer.base_attention.borrow().is_bound())
         {
-            max_tokens
+            Some("Qwen3 graphs require bound full-history KV")
         } else {
-            0
+            None
         };
-        *self.prefill_graphs.get_mut() = PrefillGraphCache::new(limit);
-        if limit > 0 {
-            tracing::info!(
-                max_tokens = limit,
-                "prefill segmented CUDA Graph configured for startup capture"
-            );
+        if let Some(reason) = reason {
+            return GraphCapabilities {
+                decode: GraphSupport::Unsupported(reason),
+                segmented_prefill: GraphSupport::Unsupported(reason),
+            };
+        }
+        let limit = |padding| GraphLimits {
+            max_batch_size: usize::MAX,
+            max_tokens: usize::MAX,
+            max_context_len: self.config.max_position_embeddings,
+            padding,
+        };
+        GraphCapabilities {
+            decode: if !self
+                .layers
+                .iter()
+                .all(|layer| layer.base_attention.borrow().reserved_write_slot() == 0)
+            {
+                GraphSupport::Unsupported("decode graph requires reserved KV slot zero")
+            } else if self.attention.supports_cuda_graph() {
+                GraphSupport::Supported(limit(GraphPadding::ReservedKvPageZero))
+            } else {
+                GraphSupport::Unsupported(
+                    "attention backend has no verified full decode graph path",
+                )
+            },
+            segmented_prefill: GraphSupport::Supported(limit(GraphPadding::InertTokenRows)),
         }
     }
-
-    fn capture_prefill_graphs(&self) -> Result<()> {
-        self.capture_prefill_buckets()
-    }
-
-    fn supports_cuda_graph(&self) -> bool {
-        self.attention.supports_cuda_graph()
+    fn prefill_graph_program(&self) -> Option<&dyn crate::engine::PrefillGraphProgram> {
+        Some(self)
     }
 
     fn prepare_decode_graph(
@@ -286,12 +323,15 @@ impl ModelExecutor for Qwen3ForCausalLM {
 
     fn forward(
         &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        attention_metadata: Option<&AttentionMetadata>,
-        logits_indices: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        self.forward_impl(input_ids, positions, attention_metadata, logits_indices)
+        batch: &crate::engine::ForwardBatch<'_>,
+    ) -> Result<crate::engine::ForwardOutput> {
+        self.forward_impl(
+            batch.input_ids,
+            batch.positions,
+            batch.attention,
+            batch.logits_indices(),
+        )
+        .map(crate::engine::ForwardOutput::new)
     }
 
     fn load_weights(&mut self, weights: ModelWeights) -> Result<usize> {
@@ -307,22 +347,39 @@ impl ModelExecutor for Qwen3ForCausalLM {
         }
     }
 
-    fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {
-        self.prefill_graphs.get_mut().clear();
-        if k_cache.dim() != 5
-            || v_cache.size() != k_cache.size()
-            || k_cache.size()[0] != self.layers.len() as i64
-        {
-            return Err(model_error(
-                "Qwen3 KV cache must be (layers, pages, page_size, kv_heads, head_dim)",
-            ));
+    fn bind_state_cache(&mut self, cache: crate::engine::kvcache::ModelKvCache) -> Result<()> {
+        // Validate every view before mutating bindings, so a bad later layer
+        // cannot leave the model half-bound to a new cache.
+        if cache.layers.len() != self.layers.len() || cache.page_size == 0 {
+            return Err(model_error("Qwen3 cache layer count or page size mismatch"));
         }
-        self.attention.bind_cache_layout(k_cache.size()[2]);
-        for (index, layer) in self.layers.iter().enumerate() {
+        let pages = cache.layers[0].k.size().first().copied().unwrap_or(0);
+        for layer in &cache.layers {
+            let expected = vec![
+                pages,
+                cache.page_size as i64,
+                self.config.num_kv_heads as i64,
+                self.config.head_dim as i64,
+            ];
+            if pages < 2
+                || layer.k.size() != expected
+                || layer.v.size() != expected
+                || layer.k.device() != self.device
+                || layer.v.device() != self.device
+                || layer.k.kind() != self.kind
+                || layer.v.kind() != self.kind
+            {
+                return Err(model_error(
+                    "Qwen3 cache view geometry, dtype or device mismatch",
+                ));
+            }
+        }
+        self.attention.bind_cache_layout(cache.page_size as i64);
+        for (layer, view) in self.layers.iter().zip(cache.layers) {
             layer
                 .base_attention
                 .borrow_mut()
-                .bind_kv_cache(k_cache.get(index as i64), v_cache.get(index as i64))?;
+                .bind_kv_cache(view.k, view.v)?;
         }
         Ok(())
     }
@@ -331,16 +388,12 @@ impl ModelExecutor for Qwen3ForCausalLM {
 struct DecoderLayer {
     base_attention: RefCell<BaseAttention>,
     input_layernorm: Tensor,
-    qkv_proj: Tensor,
+    qkv_proj: PackedQkv,
     o_proj: Tensor,
     q_norm: Tensor,
     k_norm: Tensor,
     post_attention_layernorm: Tensor,
-    gate_up_proj: Tensor,
-    down_proj: Tensor,
-    num_heads: i64,
-    num_kv_heads: i64,
-    head_dim: i64,
+    mlp: DenseSwiGlu,
 }
 
 impl DecoderLayer {
@@ -356,20 +409,12 @@ impl DecoderLayer {
         Self {
             base_attention: RefCell::new(BaseAttention::default()),
             input_layernorm: parameter([hidden], kind, device),
-            qkv_proj: parameter(
-                [(num_heads + 2 * num_kv_heads) * head_dim, hidden],
-                kind,
-                device,
-            ),
+            qkv_proj: PackedQkv::new(hidden, num_heads, num_kv_heads, head_dim, kind, device),
             o_proj: parameter([hidden, num_heads * head_dim], kind, device),
             q_norm: parameter([head_dim], kind, device),
             k_norm: parameter([head_dim], kind, device),
             post_attention_layernorm: parameter([hidden], kind, device),
-            gate_up_proj: parameter([2 * intermediate, hidden], kind, device),
-            down_proj: parameter([hidden, intermediate], kind, device),
-            num_heads,
-            num_kv_heads,
-            head_dim,
+            mlp: DenseSwiGlu::new(hidden, intermediate, kind, device),
         }
     }
 
@@ -381,7 +426,7 @@ impl DecoderLayer {
         attention_batch: &AttentionBatch<'_>,
         attention_metadata: Option<&AttentionMetadata>,
         eps: f64,
-        rope: &RopeCache,
+        rope: &HalfSplitRope,
         profiler: &mut ModelProfiler,
     ) -> Result<(Tensor, Tensor)> {
         let timer = profiler.start(ModelStage::Norm);
@@ -408,27 +453,11 @@ impl DecoderLayer {
         hidden_states: &Tensor,
         positions: &Tensor,
         eps: f64,
-        rope: &RopeCache,
+        rope: &HalfSplitRope,
         profiler: &mut ModelProfiler,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let timer = profiler.start(ModelStage::QkvLinear);
-        let total_tokens = hidden_states.size()[0];
-        let qkv = linear(hidden_states, &self.qkv_proj);
-        let q_width = self.num_heads * self.head_dim;
-        let kv_width = self.num_kv_heads * self.head_dim;
-        let q = qkv
-            .narrow(-1, 0, q_width)
-            .view([total_tokens, self.num_heads, self.head_dim]);
-        let k = qkv.narrow(-1, q_width, kv_width).view([
-            total_tokens,
-            self.num_kv_heads,
-            self.head_dim,
-        ]);
-        let v = qkv.narrow(-1, q_width + kv_width, kv_width).view([
-            total_tokens,
-            self.num_kv_heads,
-            self.head_dim,
-        ]);
+        let (q, k, v) = self.qkv_proj.forward(hidden_states);
         profiler.finish(timer);
 
         let timer = profiler.start(ModelStage::QkNorm);
@@ -482,9 +511,7 @@ impl DecoderLayer {
             add_rms_norm(output, residual, &self.post_attention_layernorm, eps);
         profiler.finish(timer);
         let timer = profiler.start(ModelStage::Mlp);
-        let gate_up = linear(&normalized, &self.gate_up_proj);
-        let mlp = silu_and_mul(&gate_up);
-        let output = linear(&mlp, &self.down_proj);
+        let output = self.mlp.forward(&normalized);
         profiler.finish(timer);
         (output, residual)
     }
@@ -506,7 +533,7 @@ impl DecoderLayer {
                 &mut self.post_attention_layernorm,
                 "post_attention_layernorm.weight",
             ),
-            (&mut self.down_proj, "mlp.down_proj.weight"),
+            (&mut self.mlp.down_proj, "mlp.down_proj.weight"),
         ] {
             load_parameter(
                 parameter,
@@ -516,26 +543,23 @@ impl DecoderLayer {
                 device,
             )?;
         }
+        let qkv_rows = self.qkv_proj.widths();
         load_packed_parameter(
-            &mut self.qkv_proj,
+            &mut self.qkv_proj.weight,
             &prefix,
             &[
                 "self_attn.q_proj.weight",
                 "self_attn.k_proj.weight",
                 "self_attn.v_proj.weight",
             ],
-            &[
-                self.num_heads * self.head_dim,
-                self.num_kv_heads * self.head_dim,
-                self.num_kv_heads * self.head_dim,
-            ],
+            &qkv_rows,
             weights,
             kind,
             device,
         )?;
-        let intermediate = self.gate_up_proj.size()[0] / 2;
+        let intermediate = self.mlp.gate_up_proj.size()[0] / 2;
         load_packed_parameter(
-            &mut self.gate_up_proj,
+            &mut self.mlp.gate_up_proj,
             &prefix,
             &["mlp.gate_proj.weight", "mlp.up_proj.weight"],
             &[intermediate, intermediate],
@@ -547,38 +571,8 @@ impl DecoderLayer {
     }
 }
 
-fn validate_config(config: ModelArgs) -> Result<()> {
-    if config.hidden_size == 0
-        || config.num_layers == 0
-        || config.num_attention_heads == 0
-        || config.num_kv_heads == 0
-        || config.intermediate_size == 0
-        || config.vocab_size == 0
-        || config.head_dim == 0
-        || config.max_position_embeddings == 0
-    {
-        return Err(model_error(
-            "Qwen3 configuration dimensions must be greater than zero",
-        ));
-    }
-    if config.num_attention_heads % config.num_kv_heads != 0 {
-        return Err(model_error(
-            "num_attention_heads must be divisible by num_kv_heads",
-        ));
-    }
-    if config.head_dim % 2 != 0 {
-        return Err(model_error("Qwen3 RoPE requires an even head_dim"));
-    }
-    if !config.rope_theta.is_finite() || config.rope_theta <= 0.0 {
-        return Err(model_error(
-            "Qwen3 RoPE requires a positive finite rope_theta",
-        ));
-    }
-    Ok(())
-}
-
-fn linear(x: &Tensor, weight: &Tensor) -> Tensor {
-    x.matmul(&weight.transpose(0, 1))
+fn validate_config(config: Qwen3Config) -> Result<()> {
+    config.validate().map_err(|message| model_error(&message))
 }
 
 fn parameter(shape: impl AsRef<[i64]>, kind: Kind, device: Device) -> Tensor {
@@ -650,14 +644,14 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::super::ops::rotate_half;
     use super::*;
     use crate::engine::load_hf_safetensors;
+    use crate::layers::{rotate_half, silu_and_mul};
 
     static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
-    fn config() -> ModelArgs {
-        ModelArgs {
+    fn config() -> Qwen3Config {
+        Qwen3Config {
             hidden_size: 4,
             num_layers: 1,
             num_attention_heads: 2,
@@ -674,7 +668,7 @@ mod tests {
     fn produces_prefill_logits_with_the_expected_shape() {
         let model = Qwen3ForCausalLM::new(config(), Kind::Float, Device::Cpu).unwrap();
         let logits = model
-            .forward(
+            .forward_impl(
                 &Tensor::from_slice(&[1i64, 2, 3]),
                 &Tensor::from_slice(&[0i64, 1, 2]),
                 None,
@@ -690,7 +684,7 @@ mod tests {
         config.head_dim = 4;
         let model = Qwen3ForCausalLM::new(config, Kind::Float, Device::Cpu).unwrap();
         let logits = model
-            .forward(
+            .forward_impl(
                 &Tensor::from_slice(&[1i64]),
                 &Tensor::from_slice(&[0i64]),
                 None,
@@ -706,7 +700,7 @@ mod tests {
             Qwen3ForCausalLM::new_with_attention_backend(config(), Kind::Float, Device::Cpu, "fa")
                 .unwrap();
         let logits = model
-            .forward(
+            .forward_impl(
                 &Tensor::from_slice(&[1i64]),
                 &Tensor::from_slice(&[0i64]),
                 None,
@@ -721,7 +715,7 @@ mod tests {
         let q = Tensor::ones([2, 2, 4], (Kind::BFloat16, Device::Cpu));
         let k = Tensor::ones([2, 1, 4], (Kind::BFloat16, Device::Cpu));
         let positions = Tensor::from_slice(&[0i64, 1]);
-        let rope = RopeCache::new(16, 4, 10_000.0, Kind::BFloat16, Device::Cpu);
+        let rope = HalfSplitRope::new(16, 4, 10_000.0, Kind::BFloat16, Device::Cpu);
         let (q, k) = rope.apply(&q, &k, &positions);
         assert_eq!(q.kind(), Kind::BFloat16);
         assert_eq!(k.kind(), Kind::BFloat16);
@@ -737,7 +731,7 @@ mod tests {
                 .view([4, 1, 4])
                 .to_kind(kind);
             let positions = Tensor::from_slice(&[0i64, 15, 3, 15]);
-            let rope = RopeCache::new(16, 4, 10_000.0, kind, Device::Cpu);
+            let rope = HalfSplitRope::new(16, 4, 10_000.0, kind, Device::Cpu);
             let (cached_q, cached_k) = rope.apply(&q, &k, &positions);
 
             let inv_freq = (Tensor::arange_start_step(0, 4, 2, (Kind::Float, Device::Cpu))
@@ -761,7 +755,15 @@ mod tests {
         let k_cache = Tensor::zeros([1, 2, 2, 1, 2], (Kind::Float, Device::Cpu));
         let v_cache = Tensor::zeros([1, 2, 2, 1, 2], (Kind::Float, Device::Cpu));
         model
-            .bind_kv_cache(k_cache.shallow_clone(), v_cache.shallow_clone())
+            .bind_state_cache(crate::engine::kvcache::ModelKvCache {
+                page_size: k_cache.size()[2] as usize,
+                layers: (0..k_cache.size()[0])
+                    .map(|i| crate::engine::kvcache::LayerKvCache {
+                        k: k_cache.get(i),
+                        v: v_cache.get(i),
+                    })
+                    .collect(),
+            })
             .unwrap();
 
         let first_prefill = AttentionMetadata {
@@ -776,7 +778,7 @@ mod tests {
         };
         assert_eq!(
             model
-                .forward(
+                .forward_impl(
                     &Tensor::from_slice(&[1i64, 2]),
                     &Tensor::from_slice(&[0i64, 1]),
                     Some(&first_prefill),
@@ -799,7 +801,7 @@ mod tests {
         };
         assert_eq!(
             model
-                .forward(
+                .forward_impl(
                     &Tensor::from_slice(&[3i64]),
                     &Tensor::from_slice(&[2i64]),
                     Some(&decode),
@@ -822,7 +824,7 @@ mod tests {
         };
         assert_eq!(
             model
-                .forward(
+                .forward_impl(
                     &Tensor::from_slice(&[4i64]),
                     &Tensor::from_slice(&[3i64]),
                     Some(&cached_prefill),

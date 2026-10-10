@@ -1,35 +1,40 @@
 //! Startup model registration and standalone chat-template detection.
 
+use serde_json::Value;
+use tch::Kind;
+
 use crate::{
-    server::{ServeArgs, ServeComponents, ServeError},
+    engine::{ModelFactory, RuntimeModelConfig},
+    server::output::ChatOutputParserConstructor,
     tokenizer::ChatTemplateRenderFn,
 };
 
 use super::qwen3;
 
-type ComponentBuilder = fn(&ServeArgs) -> Result<ServeComponents, ServeError>;
+pub(crate) struct ModelDefinition {
+    pub runtime: RuntimeModelConfig,
+    pub factory: Box<dyn ModelFactory>,
+}
 
 pub(crate) struct ModelRegistration {
     pub model_type: &'static str,
     pub architecture: &'static str,
-    pub build: ComponentBuilder,
+    pub parse: fn(&Value, Kind) -> Result<ModelDefinition, String>,
     pub template_probe: Option<fn(&str) -> bool>,
     pub template_renderer: Option<ChatTemplateRenderFn>,
+    pub output_parser_constructor: ChatOutputParserConstructor,
 }
 
 const MODELS: &[ModelRegistration] = &[qwen3::REGISTRATION];
 
-pub(crate) fn component_builder(
+pub(crate) fn model_registration(
     model_type: &str,
     architectures: &[String],
-) -> Option<ComponentBuilder> {
-    MODELS
-        .iter()
-        .find(|model| {
-            model.model_type == model_type
-                && architectures.iter().any(|name| name == model.architecture)
-        })
-        .map(|model| model.build)
+) -> Option<&'static ModelRegistration> {
+    MODELS.iter().find(|model| {
+        model.model_type == model_type
+            && architectures.iter().any(|name| name == model.architecture)
+    })
 }
 
 pub(crate) fn detect_chat_template(source: &str) -> Option<ChatTemplateRenderFn> {
@@ -48,13 +53,13 @@ mod tests {
 
     #[test]
     fn selects_dense_qwen3_and_rejects_other_architectures() {
-        assert!(component_builder("qwen3", &["Qwen3ForCausalLM".to_owned()]).is_some());
+        assert!(model_registration("qwen3", &["Qwen3ForCausalLM".to_owned()]).is_some());
         for (model_type, architecture) in [
             ("qwen3_moe", "Qwen3MoeForCausalLM"),
             ("qwen3", "OtherForCausalLM"),
             ("llama", "LlamaForCausalLM"),
         ] {
-            assert!(component_builder(model_type, &[architecture.to_owned()]).is_none());
+            assert!(model_registration(model_type, &[architecture.to_owned()]).is_none());
         }
     }
 

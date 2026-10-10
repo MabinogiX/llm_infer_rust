@@ -6,7 +6,7 @@ use crate::engine::{BatchPhase, ModelRunnerError};
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
-/// Owns one attention layer's K/V views into the global [`KVCachePool`].
+/// Owns one attention layer's stable K/V views into its cache group.
 #[derive(Debug)]
 pub struct BaseAttention {
     k_cache: Option<Tensor>,
@@ -26,6 +26,10 @@ impl Default for BaseAttention {
 
 impl BaseAttention {
     /// Pool-backed production models skip slot 0; raw test caches can disable it.
+    pub(crate) fn reserved_write_slot(&self) -> i64 {
+        self.reserved_write_slot
+    }
+
     pub fn set_reserved_write_slot(&mut self, slot: i64) {
         self.reserved_write_slot = slot;
     }
