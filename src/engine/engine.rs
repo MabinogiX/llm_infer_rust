@@ -407,7 +407,8 @@ impl Engine {
             .model_runner
             .as_ref()
             .ok_or(EngineError::ModelRunnerNotAttached)?
-            .forward(batch)?)
+            .forward(batch)?
+            .logits)
     }
 
     /// Samples one token per logits row using request-aligned parameters.
@@ -542,7 +543,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::super::{AttentionMetadata, ModelExecutor, ModelFactory, ModelWeights};
+    use super::super::{ModelExecutor, ModelFactory, ModelWeights};
     use super::*;
 
     static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -745,12 +746,15 @@ mod tests {
     impl ModelExecutor for EchoModel {
         fn forward(
             &self,
-            input_ids: &Tensor,
-            _positions: &Tensor,
-            _attention_metadata: Option<&AttentionMetadata>,
-            _logits_indices: Option<&Tensor>,
-        ) -> std::result::Result<Tensor, ModelRunnerError> {
-            Ok(input_ids.shallow_clone())
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let _attention_metadata = batch.attention;
+            let _logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> { Ok(input_ids.shallow_clone()) })(
+            )
+            .map(crate::engine::ForwardOutput::new)
         }
     }
 
@@ -759,12 +763,15 @@ mod tests {
     impl ModelExecutor for LoadingModel {
         fn forward(
             &self,
-            input_ids: &Tensor,
-            _positions: &Tensor,
-            _attention_metadata: Option<&AttentionMetadata>,
-            _logits_indices: Option<&Tensor>,
-        ) -> std::result::Result<Tensor, ModelRunnerError> {
-            Ok(input_ids.shallow_clone())
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let _attention_metadata = batch.attention;
+            let _logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> { Ok(input_ids.shallow_clone()) })(
+            )
+            .map(crate::engine::ForwardOutput::new)
         }
 
         fn load_weights(

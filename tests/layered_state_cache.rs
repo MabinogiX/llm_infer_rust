@@ -101,37 +101,41 @@ impl ModelExecutor for HeterogeneousModel {
     }
     fn forward(
         &self,
-        ids: &Tensor,
-        positions: &Tensor,
-        metadata: Option<&AttentionMetadata>,
-        indices: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let tokens = ids.numel() as i64;
-        let scalar = (ids + positions).to_kind(self.kind).view([tokens, 1, 1]) * 0.1;
-        let mut outputs = Vec::new();
-        for (i, geometry) in specification().layers().iter().enumerate() {
-            let q = scalar.repeat([1, 2, geometry.head_dim as i64]);
-            let kv = scalar.repeat([1, geometry.num_kv_heads as i64, geometry.head_dim as i64]);
-            let v = &kv + i as f64;
-            let mut cache = self.caches[i].borrow_mut();
-            cache.write_kv(
-                &kv,
-                &v,
-                metadata.and_then(|m| m.write_loc.as_ref()),
-                metadata.map_or(BatchPhase::Prefill, |m| m.forward_mode),
-            )?;
-            outputs.push(
-                self.attention[i]
-                    .prepare(metadata, tokens as usize)?
-                    .forward(&q, &kv, &v, &cache)?
-                    .view([tokens, -1]),
-            );
-        }
-        let result = Tensor::cat(&outputs, 1);
-        Ok(match indices {
-            Some(indices) => result.index_select(0, indices),
-            None => result,
-        })
+        batch: &sglang_rust::engine::ForwardBatch<'_>,
+    ) -> std::result::Result<sglang_rust::engine::ForwardOutput, ModelRunnerError> {
+        let ids = batch.input_ids;
+        let positions = batch.positions;
+        let metadata = batch.attention;
+        let indices = batch.logits_indices();
+        (|| -> std::result::Result<Tensor, ModelRunnerError> {
+            let tokens = ids.numel() as i64;
+            let scalar = (ids + positions).to_kind(self.kind).view([tokens, 1, 1]) * 0.1;
+            let mut outputs = Vec::new();
+            for (i, geometry) in specification().layers().iter().enumerate() {
+                let q = scalar.repeat([1, 2, geometry.head_dim as i64]);
+                let kv = scalar.repeat([1, geometry.num_kv_heads as i64, geometry.head_dim as i64]);
+                let v = &kv + i as f64;
+                let mut cache = self.caches[i].borrow_mut();
+                cache.write_kv(
+                    &kv,
+                    &v,
+                    metadata.and_then(|m| m.write_loc.as_ref()),
+                    metadata.map_or(BatchPhase::Prefill, |m| m.forward_mode),
+                )?;
+                outputs.push(
+                    self.attention[i]
+                        .prepare(metadata, tokens as usize)?
+                        .forward(&q, &kv, &v, &cache)?
+                        .view([tokens, -1]),
+                );
+            }
+            let result = Tensor::cat(&outputs, 1);
+            Ok(match indices {
+                Some(indices) => result.index_select(0, indices),
+                None => result,
+            })
+        })()
+        .map(sglang_rust::engine::ForwardOutput::new)
     }
 }
 
@@ -196,7 +200,18 @@ fn compare_cached_and_full_forward(device: Device) {
     let reference = HeterogeneousFactory
         .create(Kind::Float, device, "pt")
         .unwrap();
-    let full = reference.forward(&ids, &positions, None, None).unwrap();
+    let all_indices = Tensor::arange(4, (Kind::Int64, device));
+    let full = reference
+        .forward(&sglang_rust::engine::ForwardBatch {
+            input_ids: &ids,
+            positions: &positions,
+            attention: None,
+            mode: sglang_rust::engine::ForwardMode::Prefill {
+                logits_indices: &all_indices,
+            },
+        })
+        .unwrap()
+        .logits;
     let prefill = Batch::prefill(
         ids.narrow(0, 0, 2),
         positions.narrow(0, 0, 2),

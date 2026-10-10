@@ -195,6 +195,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 当前 dense Qwen3 支持 eager/分段图 prefill、带缓存前缀的 prefill 和 paged-KV decode；模型接入 `Engine` 时会自动绑定 `KVCachePool` 的逐层 K/V 切片。Qwen3-MoE 与张量并行尚未迁移，调用时会返回明确错误。
 
+模型执行使用带 prefill／decode 模式约束的 `ForwardBatch` 和 `ForwardOutput`，Runner 在 graph 回放前校验输入与 metadata。decode 和分段 prefill 的 native graph、桶及固定缓冲都由 Runner 管理；Qwen3 提供计算段和图外 attention 操作。Graph 能力按模式显式声明，默认禁用；当前 FlashInfer 支持完整 decode graph，`pt`／`fa` 可用分段 prefill，decode 保持 eager。权重／缓存／padding 设置变化时统一失效 graph。详见 [执行与 CUDA graph 设计](docs/execution-cuda-graph-design-2026-10-10.md)。
+
 Decode 的 KV 映射按请求 ID、已有长度和页号快照增量更新；稳定请求只上传新增 token 的映射，换行、页号变化或序列回退时更新相应区间。CUDA BF16/FP16 的 Qwen3 decoder 通过独立 residual 流使用原位 fused add-RMSNorm，按原版语义使用未舍入的 FP32 残差和计算方差与归一化，写回的 residual 仍舍入到激活类型。KV 池额外预留并清零 page 0，真实请求的 page IDs 从 1 开始；decode graph padding 读取该页并跳过 slot 0 写入。非法 KV 写入索引触发 GPU 断言（CPU 返回错误），不再接受 -1 padding。
 
 Attention 通过 `ServerArgs::attention_backend` 选择后端，默认 `"fa"` 使用 LibTorch 的 scaled dot product attention。Prefill 会把不同长度的请求填充成一个 batch，每层调用一次 SDPA，再还原输出顺序；无缓存前缀时使用 causal mask，让符合条件的 CUDA BF16/FP16 输入可由 LibTorch 选择 fused FlashAttention kernel。带缓存前缀时使用显式掩码，LibTorch 可能选择其他 SDPA kernel。`"pt"` 保留原有 eager 实现。`--dtype auto` 读取模型 `config.json` 中的 `torch_dtype`（或 `dtype`），CPU 推理回退到 float32。

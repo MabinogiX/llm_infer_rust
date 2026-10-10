@@ -315,9 +315,7 @@ mod tests {
     use tch::{Device, Tensor};
 
     use crate::engine::kvcache::{AcquireOutcome, BaseCacheHandle, KVCacheError};
-    use crate::engine::{
-        AttentionMetadata, ModelExecutor, ModelRunner, ModelRunnerError, RuntimeModelConfig,
-    };
+    use crate::engine::{ModelExecutor, ModelRunner, ModelRunnerError, RuntimeModelConfig};
 
     use super::*;
 
@@ -432,19 +430,23 @@ mod tests {
     impl ModelExecutor for FixedTokenModel {
         fn forward(
             &self,
-            input_ids: &Tensor,
-            _positions: &Tensor,
-            _attention_metadata: Option<&AttentionMetadata>,
-            logits_indices: Option<&Tensor>,
-        ) -> std::result::Result<Tensor, ModelRunnerError> {
-            let rows = logits_indices
-                .map(|indices| indices.size()[0])
-                .unwrap_or_else(|| input_ids.size()[0]);
-            let mut logits = vec![0f32; rows as usize * 9];
-            for row in 0..rows as usize {
-                logits[row * 9 + self.0 as usize] = 1.0;
-            }
-            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let _attention_metadata = batch.attention;
+            let logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> {
+                let rows = logits_indices
+                    .map(|indices| indices.size()[0])
+                    .unwrap_or_else(|| input_ids.size()[0]);
+                let mut logits = vec![0f32; rows as usize * 9];
+                for row in 0..rows as usize {
+                    logits[row * 9 + self.0 as usize] = 1.0;
+                }
+                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            })()
+            .map(crate::engine::ForwardOutput::new)
         }
     }
 
@@ -488,24 +490,28 @@ mod tests {
     impl ModelExecutor for DecodeFailModel {
         fn forward(
             &self,
-            _input_ids: &Tensor,
-            _positions: &Tensor,
-            attention_metadata: Option<&AttentionMetadata>,
-            logits_indices: Option<&Tensor>,
-        ) -> std::result::Result<Tensor, ModelRunnerError> {
-            if attention_metadata
-                .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Decode)
-            {
-                return Err(ModelRunnerError::Model("decode failed".to_owned()));
-            }
-            let rows = logits_indices
-                .expect("prefill passes logits indices")
-                .size()[0];
-            let mut logits = vec![0f32; rows as usize * 9];
-            for row in 0..rows as usize {
-                logits[row * 9 + 3] = 1.0;
-            }
-            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let _input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let attention_metadata = batch.attention;
+            let logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> {
+                if attention_metadata
+                    .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Decode)
+                {
+                    return Err(ModelRunnerError::Model("decode failed".to_owned()));
+                }
+                let rows = logits_indices
+                    .expect("prefill passes logits indices")
+                    .size()[0];
+                let mut logits = vec![0f32; rows as usize * 9];
+                for row in 0..rows as usize {
+                    logits[row * 9 + 3] = 1.0;
+                }
+                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            })()
+            .map(crate::engine::ForwardOutput::new)
         }
     }
 
@@ -516,28 +522,32 @@ mod tests {
     impl ModelExecutor for FailSecondPrefillModel {
         fn forward(
             &self,
-            input_ids: &Tensor,
-            _positions: &Tensor,
-            attention_metadata: Option<&AttentionMetadata>,
-            logits_indices: Option<&Tensor>,
-        ) -> std::result::Result<Tensor, ModelRunnerError> {
-            let is_prefill = attention_metadata
-                .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Prefill);
-            if is_prefill {
-                let count = self.prefill_calls.get() + 1;
-                self.prefill_calls.set(count);
-                if count == 2 {
-                    return Err(ModelRunnerError::Model("second prefill failed".to_owned()));
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let input_ids = batch.input_ids;
+            let _positions = batch.positions;
+            let attention_metadata = batch.attention;
+            let logits_indices = batch.logits_indices();
+            (|| -> std::result::Result<Tensor, ModelRunnerError> {
+                let is_prefill = attention_metadata
+                    .is_some_and(|metadata| metadata.forward_mode == BatchPhase::Prefill);
+                if is_prefill {
+                    let count = self.prefill_calls.get() + 1;
+                    self.prefill_calls.set(count);
+                    if count == 2 {
+                        return Err(ModelRunnerError::Model("second prefill failed".to_owned()));
+                    }
                 }
-            }
-            let rows = logits_indices
-                .map(|indices| indices.size()[0])
-                .unwrap_or_else(|| input_ids.size()[0]);
-            let mut logits = vec![0f32; rows as usize * 9];
-            for row in 0..rows as usize {
-                logits[row * 9 + 3] = 1.0;
-            }
-            Ok(Tensor::from_slice(&logits).view([rows, 9]))
+                let rows = logits_indices
+                    .map(|indices| indices.size()[0])
+                    .unwrap_or_else(|| input_ids.size()[0]);
+                let mut logits = vec![0f32; rows as usize * 9];
+                for row in 0..rows as usize {
+                    logits[row * 9 + 3] = 1.0;
+                }
+                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+            })()
+            .map(crate::engine::ForwardOutput::new)
         }
     }
 

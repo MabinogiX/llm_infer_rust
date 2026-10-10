@@ -38,8 +38,8 @@ HTTP / OpenAI 协议
 | 模型配置 | 通用 ModelArgs 包含 Qwen 风格计算字段与缓存尺寸 | 保留 HF 配置并提取运行时信息 | 每模型强类型配置 + 公共运行时描述 |
 | 基础算子 | Qwen3 已使用共享 layers；第二模型验证待完成 | layers 共享算子，模型组合这些算子 | 提取共享 layers，保留模型数值差异 |
 | 状态缓存 | 已支持逐层声明与按几何分组的 full-history 分页 K/V | 不同 attention 与状态缓存实现 | 模型声明分层缓存需求，运行时管理资源 |
-| 模型执行 | 多个独立输入参数，返回 logits Tensor | ForwardBatch 与结构化执行输出 | 统一批次输入和输出语义 |
-| CUDA graph | decode 在通用 runner，prefill 直接访问 Qwen3 层 | runner 与 backend 分工，明确图内／图外操作 | graph 生命周期通用化，模型提供计算段 |
+| 模型执行 | 已实现带模式约束的 ForwardBatch／ForwardOutput | ForwardBatch 与结构化执行输出 | 统一批次输入和输出语义 |
+| CUDA graph | decode／分段 prefill 管理由 Runner 持有，模型提供计算段 | runner 与 backend 分工，明确图内／图外操作 | graph 生命周期通用化，模型提供计算段 |
 | 聊天格式 | Qwen3 使用固定自定义模板与输出 parser | 模板、reasoning parser、tool parser 分别配置 | 独立 ChatProfile |
 | 权重加载 | 全量收集 checkpoint，随后模型绑定与 packing | 迭代读取权重，模型负责名称映射 | 逐 shard／tensor 消费并最终校验 |
 | 输出处理 | 每步重新解码全部累计 tokens | 维护增量解码位置，并支持批量处理 | 增量解码与统一输出事件 |
@@ -96,11 +96,11 @@ Dense FFN 与 MoE FFN 可以在 decoder 组合处替换。MoE 的 routing、专�
 
 ### 3.4 执行与 CUDA graph
 
-建议模型计算以统一 ForwardBatch 接收输入，返回 ForwardOutput。保留 Scheduler 批次与模型执行批次的职责区分，在执行入口完成参数准备和校验。对 prefill／decode 使用有明确约束的输入，减少大量 Option 字段产生的非法组合和重复 phase 信息。
+已实现模型以统一 `ForwardBatch` 接收输入，返回 `ForwardOutput`（当前只有 logits），详见 [执行与 CUDA graph 设计](execution-cuda-graph-design-2026-10-10.md)。保留 Scheduler 批次与模型执行批次的职责区分，在执行入口完成参数准备和校验。对 prefill／decode 使用有明确约束的输入，减少大量 Option 字段产生的非法组合和重复 phase 信息。
 
 ForwardOutput 初期以生成所需 logits 为核心，后续按真实需求增加 hidden states、logprobs 等输出。embedding、多模态输入和 speculative decoding 暂不为占位而加入接口。
 
-graph 管理职责建议如下：
+已落实的 graph 管理职责如下：
 
 | 负责方 | 职责 |
 |---|---|
@@ -108,9 +108,9 @@ graph 管理职责建议如下：
 | 模型 | 定义计算结构，提供经过验证的可捕获计算段 |
 | Attention／状态 backend | 准备计划与元数据，声明图内和图外操作及 padding 约定 |
 
-当前 Qwen3 prefill graph 直接访问相邻 decoder 层，新增模型容易复制捕获代码。迁移时先支持现有 Qwen3 的计算段，再用实际目标模型验证分段接口；不要把 Qwen3 的层结构当成所有模型的约定。
+已将 prefill 的桶目录、固定缓冲区、捕获、回放与失效释放移到通用 `SegmentedGraphRunner`。Qwen3 通过 `PrefillGraphProgram` 提供计算段和图外 attention；通用管理器不访问 decoder layers。另一个三段算术测试程序验证接口不依赖 Transformer 层结构，第二个实际模型的验证仍待后续接入。
 
-graph 支持必须显式声明，默认不启用。声明需考虑模型、backend、dtype、状态类型、forward 模式及形状，而非单一布尔值。未验证的组合明确拒绝或回退 eager，并输出原因。
+graph 已使用按模式划分的 `GraphCapabilities` 显式声明，默认不启用；声明根据实际模型、backend、dtype 和 KV 绑定状态产生，并携带请求数／token／上下文与 padding 约束。未验证的组合回退 eager，启动日志说明能力拒绝原因，动态形状回退记录 debug 原因。
 
 原版 attention backend 将元数据处理区分为图外准备与图内静态形状操作，可以参考这一契约。保留已实现的启动时捕获策略和 graph 生命周期约定。
 
@@ -169,8 +169,8 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 | 0：目标模型确认 | 待实施 | 完整模型名／目录、配置和权重结构；功能与资源矩阵 | 明确 attention、状态、dense／MoE、量化、上下文、文本路径和硬件需求；列出支持／缺失／待验证项 |
 | 1：注册与配置 | 已实现；本地 CPU 与远端 Qwen3／CUDA 验证通过 | 模型定义注册、每模型配置、公共能力与运行时描述；统一启动流程 | Qwen3 保持可运行；未知 architecture 和不支持配置在加载前报错；模型模块不再组装 Scheduler 和服务对象 |
 | 2：共享算子与加载 | 部分实施：Qwen3 共享层提取完成；第二模型与逐步加载待办 | 共享 layers、逐步加载与权重映射接口 | Qwen3 数值与 API 回归通过；测试覆盖 packed／tied 权重和加载错误；记录启动时间与 CPU/GPU 内存峰值 |
-| 3：执行与状态缓存 | 分层 full-history 分页 KV 已实现；执行输入输出与其他状态待实施 | ForwardBatch／ForwardOutput、分层状态需求与生命周期 | 现有分页 KV 路径通过；按目标模型验证所需状态的取消、前缀复用和中间 chunk 行为；无资源泄漏或共享状态污染 |
-| 4：graph 接口整理 | 待实施 | 通用 graph 管理、模型计算段和 backend 元数据契约 | Qwen3 eager／decode graph／prefill graph 对照通过；不同桶、padding、前缀命中、失效与回退正常；未验证组合不启用 |
+| 3：执行与状态缓存 | 分层 full-history 分页 KV 与执行输入输出已实现；其他状态待实施 | ForwardBatch／ForwardOutput、分层状态需求与生命周期 | 现有分页 KV 路径通过；按目标模型验证所需状态的取消、前缀复用和中间 chunk 行为；无资源泄漏或共享状态污染 |
+| 4：graph 接口整理 | 已实现通用管理、能力和执行接口；第二实际模型验证待办 | 通用 graph 管理、模型计算段和 backend 元数据契约 | Qwen3 eager／decode graph／prefill graph 对照通过；不同桶、padding、前缀命中、失效与回退正常；未验证组合不启用 |
 | 5：目标模型接入 | 待实施 | 实际 dense／MoE／其他所需模块的模型实现与注册 | 对齐可信参考的模板、logits／数值容差、生成和用量语义；多批次与不同长度测试通过；记录支持限制与性能 |
 | 6：协议与运行时完善 | 待实施 | ChatProfile、统一事件、模型名／参数校验、readiness、容量控制和增量解码 | 普通／流式响应一致；思考与工具格式、UTF-8、断连、超时、过载和故障测试通过 |
 | 7：调度与性能 | 待实施 | token budget、chunked prefill、CPU offload／batching、overlap | 长 prompt 与 decode 混合场景正确；确认无状态／缓存发布竞态；按模型和 workload 报告可重复 A/B 结果 |
@@ -229,6 +229,24 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 远端 A100 GPU 1 使用完整 CUDA／FlashInfer 构建，release 全目标测试 131 项通过、1 项已有采样微基准忽略，release 服务二进制已更新。真实 Qwen3-0.6B／BF16／FlashInfer 下，eager 和 decode＋segmented prefill graph 各 12 项 HTTP 回归通过；8 组不同长度及重复前缀请求的 text／usage／finish_reason 在两种模式间、与既有重构前基线均完全一致。服务日志确认 graph 捕获，临时服务已退出，GPU 1 显存恢复到测试前的 7 MiB。
 
 远端验收记录为 `logs/layered-cache-tests-20261009.log`、`logs/layered-cache-build-20261009.log`、`logs/layered-cache-http-summary-20261009.log`、`logs/layered-cache-eager-graph-comparison-20261009.json` 及两种模式的服务／API 日志。本次没有性能测量，不作为推理提速证据。
+
+### 5.5 执行与 CUDA graph 实施记录（2026-10-10）
+
+完成 `ForwardBatch`／`ForwardMode`／`ForwardOutput` 模型接口，以及 graph 前的输入／元数据形状校验。Scheduler 批次仍独立持有数据，在 Runner 入口借用转换；Engine 在对接 Scheduler 时提取 logits。decode／prefill 的模式约束统一，backend 的既有 phase 字段由入口校验保持一致。
+
+完成通用 `SegmentedGraphRunner` 和模型 `PrefillGraphProgram`／`PrefillGraphReplay` 接口；Qwen3 不再持有 graph、桶目录和失败桶。Graph 能力默认禁用，按模式、实际运行组合、形状与 padding 声明；backend 的 decode 计划更新命名为图外 `prepare_replay`。权重／缓存／reserved-slot 变化前统一清理 graph，设备同步后释放 native 资源。有效批次与静态表宽不匹配时回退 eager，非法批次在复制前报错。
+
+随后统一两种 graph 回放接口：decode 执行器明确命名为 `DecodeGraphRunner`，与 `SegmentedGraphRunner` 均接收 `ForwardBatch`、返回 `Option<ForwardOutput>`；Scheduler 批次转换和输入校验由 `ModelRunner` 入口负责，图执行器只做各自的形状准入和回放编排。
+
+接口统一后重新验收：本地 125 项、远端 GPU 1 release 全目标 136 项 Rust 测试通过，1 项已有采样微基准忽略；eager／graph 各 12 项真实 Qwen3 HTTP 回归及 8 组输出基线对照通过。release 二进制已更新，临时服务退出后 GPU 1 显存为 4 MiB。此次追加回归记录使用 `logs/graph-interface-*-20261010.*`，与首轮执行接口重构日志分别保存。
+
+新增不同段输入形状的算术测试程序，验证通用接口及失败／缺失／超限桶、padding、保留输出和地址重绑定；没有新增生产模型。Qwen3 的分段 prefill 数值回归扩展至 BF16／FP16 与 `pt`／`fa`／FlashInfer，保留动态长度、前缀命中、clear／recapture 和既有 decode 数值测试。设计与接口约定见 [执行与 CUDA graph 设计](execution-cuda-graph-design-2026-10-10.md)。
+
+本地 macOS／CPU 全目标测试 125 项通过，`cargo fmt --all -- --check` 和 `git diff --check` 通过；本地无 CUDA，实际 GPU 数值验证在远端执行。本次变更及新增文件共 16 个同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust` 并通过 SHA-256 校验。两端 Git HEAD 不同，开发前已逐文件核对源码一致；远端已有脚本和日志保留。
+
+远端 A100 GPU 1 release 全目标测试 136 项通过、1 项已有采样微基准忽略。BF16／FP16 × `pt`／`fa`／FlashInfer 六种分段 prefill 对照通过；真实 Qwen3-0.6B／BF16／FlashInfer 的 eager 与 decode＋segmented prefill graph 各 12 项 HTTP 回归通过。8 组不同长度和重复前缀请求的 text／usage／finish_reason 在两种模式间、与已有重构前基线均完全一致。服务日志确认两种 graph 捕获，release 二进制已更新，临时服务退出后 GPU 1 显存恢复至 7 MiB。
+
+远端验收记录为 `logs/execution-graph-tests-20261010.log`、`logs/execution-graph-build-20261010.log`、`logs/execution-graph-http-summary-20261010.log`、`logs/execution-graph-eager-graph-comparison-20261010.json` 及各模式服务／API 日志。本次没有性能测量；第二个实际模型的执行与 graph 接入验证仍待后续完成。
 
 ## 6. 本阶段范围之外
 

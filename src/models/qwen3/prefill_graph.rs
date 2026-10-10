@@ -1,295 +1,127 @@
-//! Token-bucketed transformer segments separated by eager attention calls.
-use std::collections::{BTreeMap, HashSet};
-
+//! Qwen3 computation segments. Buckets, buffers and graph lifetime belong to Runner.
 use super::*;
-use crate::engine::NativeCudaGraph;
+use crate::engine::{
+    ForwardBatch, ForwardOutput, PrefillGraphInputs, PrefillGraphProgram, PrefillGraphReplay,
+};
 
-#[derive(Default)]
-pub(super) struct PrefillGraphCache {
-    limit: usize,
-    graphs: BTreeMap<usize, PrefillGraph>,
-    failed: HashSet<usize>,
-}
-
-impl PrefillGraphCache {
-    pub(super) fn clear(&mut self) {
-        self.graphs.clear();
-        self.failed.clear();
-    }
-
-    pub(super) fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            ..Self::default()
-        }
-    }
-}
-
-struct Segment {
-    native: NativeCudaGraph,
-    // Inputs and outputs must outlive the native graph.
-    attention_input: Option<Tensor>,
-    residual_input: Option<Tensor>,
-    outputs: Vec<Tensor>,
-}
-
-struct PrefillGraph {
-    segments: Vec<Segment>,
-    ids: Tensor,
-    positions: Tensor,
-}
-
-impl Drop for PrefillGraph {
-    fn drop(&mut self) {
-        // A returned LM-head tensor may still be consuming segment outputs.
-        // Finish queued work before releasing the graph's private allocation pools.
-        if let Device::Cuda(device) = self.ids.device() {
-            tch::Cuda::synchronize(device as i64);
-        }
-    }
-}
-
-fn bucket(tokens: usize, limit: usize) -> Option<usize> {
-    if tokens == 0 || tokens > limit {
-        return None;
-    }
-    // Small prompts are dominated by launch overhead. Larger buckets use
-    // finer steps to avoid doubling GEMM work immediately past a power of two.
-    let size = if tokens <= 128 {
-        tokens.checked_next_power_of_two()?
-    } else {
-        let step = if tokens <= 512 {
-            64
-        } else if tokens <= 1024 {
-            128
-        } else {
-            256
-        };
-        tokens.checked_add(step - 1)? / step * step
-    };
-    Some(size.min(limit))
-}
-
-/// Enumerate every shape reachable by bucket(), including a non-aligned limit.
-fn capture_sizes(limit: usize) -> Vec<usize> {
-    if limit == 0 {
-        return vec![];
-    }
-    let mut sizes: Vec<usize> = [1, 2, 4, 8, 16, 32, 64, 128]
-        .into_iter()
-        .filter(|&size| size <= limit)
-        .collect();
-    sizes.extend((192..=limit.min(512)).step_by(64));
-    sizes.extend((640..=limit.min(1024)).step_by(128));
-    sizes.extend((1280..=limit).step_by(256));
-    if sizes.last().copied() != Some(limit) {
-        sizes.push(limit);
-    }
-    sizes
-}
-
-impl Qwen3ForCausalLM {
-    pub(super) fn capture_prefill_buckets(&self) -> Result<()> {
-        let mut cache = self.prefill_graphs.borrow_mut();
-        let sizes = capture_sizes(cache.limit);
-        if sizes.is_empty() {
-            return Ok(());
-        }
-        tracing::info!(sizes = ?sizes, "capturing prefill segmented CUDA Graphs at startup");
-        // Match SGLang's largest-to-smallest capture order. All successful
-        // buckets remain resident; request processing never captures a graph.
-        for &size in sizes.iter().rev() {
-            if cache.graphs.contains_key(&size) || cache.failed.contains(&size) {
-                continue;
-            }
-            tracing::info!(tokens = size, "capturing prefill segmented CUDA Graph");
-            match self.capture_prefill_segments(size) {
-                Ok(graph) => {
-                    tracing::info!(
-                        tokens = size,
-                        segments = graph.segments.len(),
-                        "prefill segmented CUDA Graph capture complete"
-                    );
-                    cache.graphs.insert(size, graph);
-                }
-                Err(error) => {
-                    cache.failed.insert(size);
-                    tracing::warn!(tokens = size, %error, "prefill CUDA Graph capture failed; bucket uses eager");
-                }
-            }
-        }
-        tracing::info!(sizes = ?cache.graphs.keys().collect::<Vec<_>>(), failed = ?cache.failed,
-            "prefill CUDA Graph startup capture complete");
-        Ok(())
-    }
-
-    pub(super) fn forward_prefill_graph(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        metadata: Option<&AttentionMetadata>,
-        logits_indices: Option<&Tensor>,
-    ) -> Result<Option<Tensor>> {
-        if !NativeCudaGraph::available()
-            || !matches!(self.device, Device::Cuda(_))
-            || !matches!(self.kind, Kind::BFloat16 | Kind::Half)
-            || crate::logging::step_timing_enabled()
-        {
-            return Ok(None);
-        }
-        let tokens = input_ids.numel();
-        let cache = self.prefill_graphs.borrow();
-        let Some(size) = bucket(tokens, cache.limit) else {
-            return Ok(None);
-        };
-        let Some(graph) = cache.graphs.get(&size) else {
-            return Ok(None);
-        };
-        if positions.numel() != tokens {
-            return Err(model_error(
-                "input_ids and positions must have identical lengths",
-            ));
-        }
-        // Plan only on real request boundaries, outside captured segments.
-        let attention = self.attention.prepare(metadata, tokens)?;
-        let count = tokens as i64;
-        let _ = graph.ids.shallow_clone().fill_(1);
-        let _ = graph.positions.shallow_clone().zero_();
-        graph.ids.narrow(0, 0, count).copy_(&input_ids.view([-1]));
-        graph
-            .positions
-            .narrow(0, 0, count)
-            .copy_(&positions.view([-1]));
-        graph.segments[0].native.replay()?;
-        let mut profiler = ModelProfiler::new(self.device);
-        for (index, layer) in self.layers.iter().enumerate() {
-            let outputs = &graph.segments[index].outputs;
-            let q = outputs[0].narrow(0, 0, count);
-            let k = outputs[1].narrow(0, 0, count);
-            let v = outputs[2].narrow(0, 0, count);
-            let raw = layer.attend(&q, &k, &v, &attention, metadata, &mut profiler)?;
-            let next = &graph.segments[index + 1];
-            let mut slot = next.attention_input.as_ref().unwrap().shallow_clone();
-            let _ = slot.zero_();
-            slot.narrow(0, 0, count).copy_(&raw);
-            next.residual_input
-                .as_ref()
-                .unwrap()
-                .shallow_clone()
-                .copy_(&outputs[3]);
-            next.native.replay()?;
-        }
-        let hidden = graph.segments.last().unwrap().outputs[0].narrow(0, 0, count);
-        // Output row count depends on the live requests, not the token bucket.
-        Ok(Some(logits(&hidden, &self.lm_head, logits_indices)))
-    }
-
-    fn capture_prefill_segments(&self, tokens: usize) -> Result<PrefillGraph> {
-        let Device::Cuda(device) = self.device else {
-            unreachable!()
-        };
+impl PrefillGraphProgram for Qwen3ForCausalLM {
+    fn create_inputs(&self, tokens: usize) -> Result<PrefillGraphInputs> {
         let rows = tokens as i64;
-        let ids = Tensor::ones([rows], (Kind::Int64, self.device));
-        let positions = Tensor::zeros([rows], (Kind::Int64, self.device));
-        let eps = self.config.rms_norm_eps;
-        let layer = &self.layers[0];
-        let (native, outputs) = NativeCudaGraph::capture(device, || {
-            let hidden = embedding(&ids, &self.embed_tokens);
-            let (normalized, residual) = layer.input_norm(&hidden, None, eps);
-            let (q, k, v) = layer.project_qkv(
-                &normalized,
-                &positions,
-                eps,
-                &self.rope,
-                &mut ModelProfiler::new(self.device),
-            )?;
-            Ok(vec![q, k, v, residual])
-        })?;
-        let mut segments = vec![Segment {
-            native,
-            outputs,
-            attention_input: None,
-            residual_input: None,
-        }];
-        for (index, layer) in self.layers.iter().enumerate() {
-            let attention_input =
-                Tensor::zeros([rows, layer.qkv_proj.widths()[0]], (self.kind, self.device));
-            let residual_input = Tensor::zeros(
-                [rows, self.config.hidden_size as i64],
-                (self.kind, self.device),
-            );
-            let (native, outputs) = NativeCudaGraph::capture(device, || {
-                let mut profiler = ModelProfiler::new(self.device);
-                let (hidden, residual) = layer.output_mlp(
-                    &attention_input,
-                    residual_input.shallow_clone(),
-                    eps,
-                    &mut profiler,
-                );
-                if let Some(next) = self.layers.get(index + 1) {
-                    let (normalized, residual) = next.input_norm(&hidden, Some(residual), eps);
-                    let (q, k, v) =
-                        next.project_qkv(&normalized, &positions, eps, &self.rope, &mut profiler)?;
-                    Ok(vec![q, k, v, residual])
-                } else {
-                    Ok(vec![add_rms_norm(hidden, residual, &self.norm, eps).0])
-                }
-            })?;
-            segments.push(Segment {
-                native,
-                outputs,
-                attention_input: Some(attention_input),
-                residual_input: Some(residual_input),
-            });
+        let mut segments = vec![vec![]];
+        for layer in &self.layers {
+            segments.push(vec![
+                Tensor::zeros([rows, layer.qkv_proj.widths()[0]], (self.kind, self.device)),
+                Tensor::zeros(
+                    [rows, self.config.hidden_size as i64],
+                    (self.kind, self.device),
+                ),
+            ]);
         }
-        Ok(PrefillGraph {
+        Ok(PrefillGraphInputs {
+            ids: Tensor::ones([rows], (Kind::Int64, self.device)),
+            positions: Tensor::zeros([rows], (Kind::Int64, self.device)),
             segments,
-            ids,
-            positions,
         })
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn startup_catalog_covers_all_admitted_request_shapes() {
-        for limit in [0, 1, 3, 64, 150, 512, 777, 1000, 2048] {
-            let expected: std::collections::BTreeSet<_> = (1..=limit)
-                .filter_map(|tokens| bucket(tokens, limit))
-                .collect();
-            assert_eq!(
-                capture_sizes(limit),
-                expected.into_iter().collect::<Vec<_>>()
-            );
+    fn run_segment(&self, index: usize, inputs: &PrefillGraphInputs) -> Result<Vec<Tensor>> {
+        let eps = self.config.rms_norm_eps;
+        let mut profiler = ModelProfiler::new(self.device);
+        if index == 0 {
+            let hidden = embedding(&inputs.ids, &self.embed_tokens);
+            let (normalized, residual) = self.layers[0].input_norm(&hidden, None, eps);
+            let (q, k, v) = self.layers[0].project_qkv(
+                &normalized,
+                &inputs.positions,
+                eps,
+                &self.rope,
+                &mut profiler,
+            )?;
+            return Ok(vec![q, k, v, residual]);
+        }
+        let layer = &self.layers[index - 1];
+        let segment = &inputs.segments[index];
+        let (hidden, residual) =
+            layer.output_mlp(&segment[0], segment[1].shallow_clone(), eps, &mut profiler);
+        if let Some(next) = self.layers.get(index) {
+            let (normalized, residual) = next.input_norm(&hidden, Some(residual), eps);
+            let (q, k, v) = next.project_qkv(
+                &normalized,
+                &inputs.positions,
+                eps,
+                &self.rope,
+                &mut profiler,
+            )?;
+            Ok(vec![q, k, v, residual])
+        } else {
+            Ok(vec![add_rms_norm(hidden, residual, &self.norm, eps).0])
         }
     }
-
-    #[test]
-    fn token_bucket_limits_and_padding() {
-        assert_eq!(bucket(0, 2048), None);
-        assert_eq!(bucket(1, 2048), Some(1));
-        assert_eq!(bucket(17, 2048), Some(32));
-        assert_eq!(bucket(265, 2048), Some(320));
-        assert_eq!(bucket(516, 2048), Some(640));
-        assert_eq!(bucket(513, 1000), Some(640));
-        assert_eq!(bucket(950, 1000), Some(1000));
-        assert_eq!(bucket(1001, 1000), None);
-        assert_eq!(bucket(1, 0), None);
+    fn prepare_replay<'a>(
+        &'a self,
+        batch: ForwardBatch<'a>,
+    ) -> Result<Box<dyn PrefillGraphReplay + 'a>> {
+        // Real request boundaries and all planning stay outside GPU graph segments.
+        let attention = self.attention.prepare(batch.attention, batch.tokens())?;
+        Ok(Box::new(QwenPrefillReplay {
+            model: self,
+            attention,
+            batch,
+        }))
+    }
+}
+struct QwenPrefillReplay<'a> {
+    model: &'a Qwen3ForCausalLM,
+    attention: AttentionBatch<'a>,
+    batch: ForwardBatch<'a>,
+}
+impl PrefillGraphReplay for QwenPrefillReplay<'_> {
+    fn run_eager(&self, index: usize, outputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        let count = self.batch.tokens() as i64;
+        let raw = self.model.layers[index].attend(
+            &outputs[0].narrow(0, 0, count),
+            &outputs[1].narrow(0, 0, count),
+            &outputs[2].narrow(0, 0, count),
+            &self.attention,
+            self.batch.attention,
+            &mut ModelProfiler::new(self.model.device),
+        )?;
+        Ok(vec![raw, outputs[3].shallow_clone()])
+    }
+    fn finish(&self, outputs: &[Tensor]) -> Result<ForwardOutput> {
+        let hidden = outputs[0].narrow(0, 0, self.batch.tokens() as i64);
+        Ok(ForwardOutput::new(logits(
+            &hidden,
+            &self.model.lm_head,
+            self.batch.logits_indices(),
+        )))
     }
 }
 
 #[cfg(all(test, has_flashinfer, has_cuda_graph))]
 mod cuda_tests {
     use super::*;
+    use crate::engine::{Batch, ModelRunner, ServerArgs, segmented_graph::capture_sizes};
     use tch::no_grad;
+    fn capture(runner: &mut ModelRunner, limit: usize) {
+        use crate::engine::kvcache::{KVCacheLayout, KVCachePool};
+        use std::rc::Rc;
+        let mut args = ServerArgs::new("unused");
+        args.max_seq_len = 256;
+        args.max_running_req = 2;
+        args.cuda_graph_bs = Some(0);
+        args.prefill_cuda_graph_max_tokens = limit;
+        let pool = Rc::new(RefCell::new(KVCachePool::without_tensor(
+            KVCacheLayout::new(3, 32, 16, 1, 128).unwrap(),
+        )));
+        runner.capture_graphs(&args, pool).unwrap();
+    }
 
     fn pair(
         kind: Kind,
+        backend: &str,
     ) -> (
         Qwen3ForCausalLM,
-        Qwen3ForCausalLM,
+        ModelRunner,
         Tensor,
         Tensor,
         Tensor,
@@ -309,11 +141,9 @@ mod cuda_tests {
         };
         let device = Device::Cuda(0);
         let mut eager =
-            Qwen3ForCausalLM::new_with_attention_backend(config, kind, device, "flashinfer")
-                .unwrap();
+            Qwen3ForCausalLM::new_with_attention_backend(config, kind, device, backend).unwrap();
         let mut graph =
-            Qwen3ForCausalLM::new_with_attention_backend(config, kind, device, "flashinfer")
-                .unwrap();
+            Qwen3ForCausalLM::new_with_attention_backend(config, kind, device, backend).unwrap();
         for (a, b) in [
             (&mut eager.embed_tokens, &mut graph.embed_tokens),
             (&mut eager.norm, &mut graph.norm),
@@ -362,16 +192,14 @@ mod cuda_tests {
                 })
                 .unwrap();
         }
-        graph.configure_prefill_graph(64);
-        graph.capture_prefill_graphs().unwrap();
+        let mut graph = ModelRunner::new(Box::new(graph), device);
+        capture(&mut graph, 64);
         assert_eq!(
             graph
-                .prefill_graphs
-                .borrow()
-                .graphs
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
+                .prefill_graph_runner
+                .as_ref()
+                .unwrap()
+                .captured_sizes(),
             capture_sizes(64)
         );
         (eager, graph, ek, ev, gk, gv)
@@ -383,8 +211,15 @@ mod cuda_tests {
             return;
         }
         no_grad(|| {
-            for kind in [Kind::BFloat16, Kind::Half] {
-                let (eager, mut graph, ek, ev, gk, gv) = pair(kind);
+            for (kind, backend) in [
+                (Kind::BFloat16, "flashinfer"),
+                (Kind::Half, "flashinfer"),
+                (Kind::BFloat16, "fa"),
+                (Kind::Half, "fa"),
+                (Kind::BFloat16, "pt"),
+                (Kind::Half, "pt"),
+            ] {
+                let (eager, mut graph, ek, ev, gk, gv) = pair(kind, backend);
                 for (iteration, (lengths, prefixes)) in [
                     (vec![17, 6], vec![0, 0]),
                     (vec![3, 5], vec![17, 6]),
@@ -404,24 +239,25 @@ mod cuda_tests {
                 .enumerate()
                 {
                     if iteration == 4 {
-                        graph.configure_prefill_graph(0);
-                        assert!(graph.prefill_graphs.borrow().graphs.is_empty());
-                        graph.configure_prefill_graph(64);
-                        graph.capture_prefill_graphs().unwrap();
+                        graph.clear_graphs();
+                        assert!(graph.prefill_graph_runner.is_none());
+                        capture(&mut graph, 64);
                     }
                     if iteration == 6 {
-                        let cache = graph.prefill_graphs.borrow();
-                        assert!(cache.graphs.contains_key(&32));
+                        let cache = graph.prefill_graph_runner.as_ref().unwrap();
+                        assert!(cache.captured_sizes().contains(&32));
                         assert!(
-                            !cache.graphs.contains_key(&128),
+                            !cache.captured_sizes().contains(&128),
                             "over-limit prefill was captured"
                         );
-                        drop(cache);
-                        graph.configure_prefill_graph(512);
-                        graph.capture_prefill_graphs().unwrap();
+                        capture(&mut graph, 512);
                     }
                     if iteration == 2 {
-                        graph.prefill_graphs.borrow_mut().graphs.remove(&16);
+                        graph
+                            .prefill_graph_runner
+                            .as_mut()
+                            .unwrap()
+                            .remove_bucket(16);
                     }
                     let device = Device::Cuda(0);
                     let tokens: i64 = lengths.iter().sum();
@@ -445,24 +281,42 @@ mod cuda_tests {
                                 .to_device(device),
                         ),
                         block_table: Some(Tensor::arange(32, (Kind::Int, device)).view([2, 16])),
-                        req_to_token: None,
+                        req_to_token: Some(Tensor::arange(512, (Kind::Int, device)).view([2, 256])),
                         cache_seqlens: None,
-                        max_seqlen: Some(*lengths.iter().max().unwrap() as usize),
+                        max_seqlen: Some(
+                            lengths
+                                .iter()
+                                .zip(&prefixes)
+                                .map(|(len, prefix)| len + prefix)
+                                .max()
+                                .unwrap() as usize,
+                        ),
                     };
                     let ids = (Tensor::arange(tokens, (Kind::Int64, device)) + 3).remainder(32);
                     let pos = Tensor::from_slice(&positions).to_device(device);
                     let indices =
                         Tensor::from_slice(&[lengths[0] - 1, tokens - 1]).to_device(device);
                     let expected = eager
-                        .forward(&ids, &pos, Some(&metadata), Some(&indices))
+                        .forward_impl(&ids, &pos, Some(&metadata), Some(&indices))
                         .unwrap();
                     let actual = graph
-                        .forward(&ids, &pos, Some(&metadata), Some(&indices))
-                        .unwrap();
+                        .forward(&Batch::prefill(
+                            ids.shallow_clone(),
+                            pos.shallow_clone(),
+                            Some(metadata),
+                            indices,
+                        ))
+                        .unwrap()
+                        .logits;
                     assert_eq!(actual.size(), [2, 32]);
                     if iteration == 2 {
                         assert!(
-                            !graph.prefill_graphs.borrow().graphs.contains_key(&16),
+                            !graph
+                                .prefill_graph_runner
+                                .as_ref()
+                                .unwrap()
+                                .captured_sizes()
+                                .contains(&16),
                             "request lazily captured a missing bucket"
                         );
                     }
@@ -470,26 +324,29 @@ mod cuda_tests {
                         .abs()
                         .max()
                         .double_value(&[]);
-                    assert!(error < 0.005, "{kind:?}: logits error={error}");
+                    assert!(error < 0.005, "{kind:?}/{backend}: logits error={error}");
                     for (a, b) in [(&ek, &gk), (&ev, &gv)] {
                         let error = (a.to_kind(Kind::Float) - b.to_kind(Kind::Float))
                             .abs()
                             .max()
                             .double_value(&[]);
-                        assert!(error < 0.03125, "{kind:?}: KV error={error}");
+                        assert!(error < 0.03125, "{kind:?}/{backend}: KV error={error}");
                     }
                 }
-                let cache = graph.prefill_graphs.borrow();
+                let cache = graph.prefill_graph_runner.as_ref().unwrap();
+                assert_eq!(cache.captured_sizes(), capture_sizes(512));
+                assert!(cache.failed_sizes().is_empty());
+                graph.clear_graphs();
+                assert!(graph.prefill_graph_runner.is_none());
+                capture(&mut graph, 64);
                 assert_eq!(
-                    cache.graphs.keys().copied().collect::<Vec<_>>(),
-                    capture_sizes(512)
+                    graph
+                        .prefill_graph_runner
+                        .as_ref()
+                        .unwrap()
+                        .captured_sizes(),
+                    capture_sizes(64)
                 );
-                assert!(cache.failed.is_empty());
-                drop(cache);
-                graph.configure_prefill_graph(0);
-                assert!(graph.prefill_graphs.borrow().graphs.is_empty());
-                graph.configure_prefill_graph(64);
-                assert_eq!(graph.prefill_graphs.borrow().limit, 64);
             }
         });
     }

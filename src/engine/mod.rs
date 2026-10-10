@@ -1,10 +1,13 @@
 mod batch_context;
 mod engine;
+mod forward;
 mod graph;
+mod graph_support;
 pub mod kvcache;
 mod model_loader;
 mod model_runner;
 mod sampling;
+pub(crate) mod segmented_graph;
 
 pub use batch_context::{BatchContext, BatchContextError, BatchRequest};
 pub use engine::{
@@ -19,3 +22,7 @@ pub use model_runner::{
 pub use sampling::{Sampler, SamplingError, SamplingParams};
 
 pub(crate) use graph::NativeCudaGraph;
+
+pub use forward::{ForwardBatch, ForwardMode, ForwardOutput};
+pub use graph_support::{GraphCapabilities, GraphLimits, GraphPadding, GraphSupport};
+pub use segmented_graph::{PrefillGraphInputs, PrefillGraphProgram, PrefillGraphReplay};

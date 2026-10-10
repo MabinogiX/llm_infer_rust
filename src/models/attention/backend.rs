@@ -171,7 +171,7 @@ enum BackendPlan {
 /// Internal seam for the three existing attention implementations.
 trait AttentionBackend {
     fn supports_cuda_graph(&self) -> bool {
-        true
+        false
     }
 
     fn prepare_decode_graph(
@@ -392,7 +392,7 @@ struct FlashInferGraphState {
 
 #[cfg(has_flashinfer)]
 impl DecodeGraphState for FlashInferGraphState {
-    fn update(&self) -> Result<()> {
+    fn prepare_replay(&self) -> Result<()> {
         let metadata = AttentionMetadata {
             forward_mode: BatchPhase::Decode,
             write_loc: None,

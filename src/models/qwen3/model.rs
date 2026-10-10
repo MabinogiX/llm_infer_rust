@@ -21,7 +21,6 @@ use crate::profiling::{ModelProfiler, ModelStage};
 
 #[path = "prefill_graph.rs"]
 mod prefill_graph;
-use prefill_graph::PrefillGraphCache;
 
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
@@ -87,8 +86,6 @@ impl ModelFactory for Qwen3Factory {
 
 /// Dense Qwen3 decoder-only model with QK-RMSNorm, RoPE, GQA, and SwiGLU.
 pub struct Qwen3ForCausalLM {
-    // Drop captured segments before any parameters that their kernels reference.
-    prefill_graphs: RefCell<PrefillGraphCache>,
     config: Qwen3Config,
     device: Device,
     kind: Kind,
@@ -131,7 +128,6 @@ impl Qwen3ForCausalLM {
         )?;
 
         Ok(Self {
-            prefill_graphs: RefCell::new(PrefillGraphCache::default()),
             config,
             device,
             kind,
@@ -163,16 +159,6 @@ impl Qwen3ForCausalLM {
         attention_metadata: Option<&AttentionMetadata>,
         logits_indices: Option<&Tensor>,
     ) -> Result<Tensor> {
-        if attention_metadata.is_some_and(|meta| meta.forward_mode == BatchPhase::Prefill) {
-            if let Some(logits) = self.forward_prefill_graph(
-                input_ids,
-                positions,
-                attention_metadata,
-                logits_indices,
-            )? {
-                return Ok(logits);
-            }
-        }
         let mut profiler = ModelProfiler::new(self.device);
         let ids = input_ids.view([-1]);
         let positions = positions.view([-1]);
@@ -235,7 +221,6 @@ impl Qwen3ForCausalLM {
     }
 
     fn load_weights_impl(&mut self, weights: ModelWeights) -> Result<usize> {
-        self.prefill_graphs.get_mut().clear();
         let mut weights = weights
             .into_tensors()
             .into_iter()
@@ -281,31 +266,52 @@ impl Qwen3ForCausalLM {
 }
 
 impl ModelExecutor for Qwen3ForCausalLM {
-    fn configure_prefill_graph(&mut self, max_tokens: usize) {
-        let limit = if matches!(self.device, Device::Cuda(_))
-            && matches!(self.kind, Kind::BFloat16 | Kind::Half)
-            && crate::engine::NativeCudaGraph::available()
-            && !crate::logging::step_timing_enabled()
+    fn graph_capabilities(&self) -> crate::engine::GraphCapabilities {
+        use crate::engine::{GraphCapabilities, GraphLimits, GraphPadding, GraphSupport};
+        let reason = if !matches!(self.device, Device::Cuda(_)) {
+            Some("Qwen3 graphs require CUDA")
+        } else if !matches!(self.kind, Kind::BFloat16 | Kind::Half) {
+            Some("Qwen3 graphs require BF16 or FP16")
+        } else if !self
+            .layers
+            .iter()
+            .all(|layer| layer.base_attention.borrow().is_bound())
         {
-            max_tokens
+            Some("Qwen3 graphs require bound full-history KV")
         } else {
-            0
+            None
         };
-        *self.prefill_graphs.get_mut() = PrefillGraphCache::new(limit);
-        if limit > 0 {
-            tracing::info!(
-                max_tokens = limit,
-                "prefill segmented CUDA Graph configured for startup capture"
-            );
+        if let Some(reason) = reason {
+            return GraphCapabilities {
+                decode: GraphSupport::Unsupported(reason),
+                segmented_prefill: GraphSupport::Unsupported(reason),
+            };
+        }
+        let limit = |padding| GraphLimits {
+            max_batch_size: usize::MAX,
+            max_tokens: usize::MAX,
+            max_context_len: self.config.max_position_embeddings,
+            padding,
+        };
+        GraphCapabilities {
+            decode: if !self
+                .layers
+                .iter()
+                .all(|layer| layer.base_attention.borrow().reserved_write_slot() == 0)
+            {
+                GraphSupport::Unsupported("decode graph requires reserved KV slot zero")
+            } else if self.attention.supports_cuda_graph() {
+                GraphSupport::Supported(limit(GraphPadding::ReservedKvPageZero))
+            } else {
+                GraphSupport::Unsupported(
+                    "attention backend has no verified full decode graph path",
+                )
+            },
+            segmented_prefill: GraphSupport::Supported(limit(GraphPadding::InertTokenRows)),
         }
     }
-
-    fn capture_prefill_graphs(&self) -> Result<()> {
-        self.capture_prefill_buckets()
-    }
-
-    fn supports_cuda_graph(&self) -> bool {
-        self.attention.supports_cuda_graph()
+    fn prefill_graph_program(&self) -> Option<&dyn crate::engine::PrefillGraphProgram> {
+        Some(self)
     }
 
     fn prepare_decode_graph(
@@ -317,12 +323,15 @@ impl ModelExecutor for Qwen3ForCausalLM {
 
     fn forward(
         &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        attention_metadata: Option<&AttentionMetadata>,
-        logits_indices: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        self.forward_impl(input_ids, positions, attention_metadata, logits_indices)
+        batch: &crate::engine::ForwardBatch<'_>,
+    ) -> Result<crate::engine::ForwardOutput> {
+        self.forward_impl(
+            batch.input_ids,
+            batch.positions,
+            batch.attention,
+            batch.logits_indices(),
+        )
+        .map(crate::engine::ForwardOutput::new)
     }
 
     fn load_weights(&mut self, weights: ModelWeights) -> Result<usize> {
@@ -339,7 +348,6 @@ impl ModelExecutor for Qwen3ForCausalLM {
     }
 
     fn bind_state_cache(&mut self, cache: crate::engine::kvcache::ModelKvCache) -> Result<()> {
-        self.prefill_graphs.get_mut().clear();
         // Validate every view before mutating bindings, so a bad later layer
         // cannot leave the model half-bound to a new cache.
         if cache.layers.len() != self.layers.len() || cache.page_size == 0 {
@@ -660,7 +668,7 @@ mod tests {
     fn produces_prefill_logits_with_the_expected_shape() {
         let model = Qwen3ForCausalLM::new(config(), Kind::Float, Device::Cpu).unwrap();
         let logits = model
-            .forward(
+            .forward_impl(
                 &Tensor::from_slice(&[1i64, 2, 3]),
                 &Tensor::from_slice(&[0i64, 1, 2]),
                 None,
@@ -676,7 +684,7 @@ mod tests {
         config.head_dim = 4;
         let model = Qwen3ForCausalLM::new(config, Kind::Float, Device::Cpu).unwrap();
         let logits = model
-            .forward(
+            .forward_impl(
                 &Tensor::from_slice(&[1i64]),
                 &Tensor::from_slice(&[0i64]),
                 None,
@@ -692,7 +700,7 @@ mod tests {
             Qwen3ForCausalLM::new_with_attention_backend(config(), Kind::Float, Device::Cpu, "fa")
                 .unwrap();
         let logits = model
-            .forward(
+            .forward_impl(
                 &Tensor::from_slice(&[1i64]),
                 &Tensor::from_slice(&[0i64]),
                 None,
@@ -770,7 +778,7 @@ mod tests {
         };
         assert_eq!(
             model
-                .forward(
+                .forward_impl(
                     &Tensor::from_slice(&[1i64, 2]),
                     &Tensor::from_slice(&[0i64, 1]),
                     Some(&first_prefill),
@@ -793,7 +801,7 @@ mod tests {
         };
         assert_eq!(
             model
-                .forward(
+                .forward_impl(
                     &Tensor::from_slice(&[3i64]),
                     &Tensor::from_slice(&[2i64]),
                     Some(&decode),
@@ -816,7 +824,7 @@ mod tests {
         };
         assert_eq!(
             model
-                .forward(
+                .forward_impl(
                     &Tensor::from_slice(&[4i64]),
                     &Tensor::from_slice(&[3i64]),
                     Some(&cached_prefill),
