@@ -255,6 +255,19 @@ def run(args, mode, trial, workload):
         pynvml.nvmlShutdown()
 
 
+def binary_hashes(args):
+    """Only binaries actually executed by the selected modes are dependencies."""
+    binaries = {}
+    if set(args.modes) & {'rust', 'eager'}:
+        binaries['rust_binary'] = args.repo / 'target/release/sglang-rust'
+    if 'rust-stage2' in args.modes:
+        binaries['stage2_binary'] = args.stage2_binary
+    if 'rust-before-threads' in args.modes:
+        binaries['before_threads_binary'] = args.baseline_binary
+    return {label: hashlib.sha256(binary.read_bytes()).hexdigest()
+            for label, binary in binaries.items()}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', type=Path, default=Path('/sjtu/yaosikai/llm_infer_rust'))
@@ -273,40 +286,44 @@ def main():
     if args.rounds < 1:
         parser.error('--rounds must be positive')
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    metadata = dict(model=str(args.model), gpu=args.gpu, rounds=args.rounds,
+    configuration = dict(model=str(args.model), gpu=args.gpu, rounds=args.rounds,
         cases=CASES, buckets=BUCKETS, modes=args.modes)
-    for label, root in [('rust', args.repo), ('sglang', args.sglang_repo)]:
-        metadata[label] = dict(git_head=subprocess.check_output(
-            ['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip(),
-            versions=json.loads(subprocess.check_output([str(root / '.venv/bin/python'), '-c',
-                "import json,importlib.metadata as m; print(json.dumps({p:m.version(p) for p in ['torch','flashinfer-python']}))"], text=True)))
-    for label, binary in [('rust_binary', args.repo / 'target/release/sglang-rust'), ('stage2_binary', args.stage2_binary), ('before_threads_binary', args.baseline_binary)]:
-        metadata[label] = hashlib.sha256(binary.read_bytes()).hexdigest()
-    # NVML v1's used value on this driver includes driver-reserved framebuffer,
-    # while nvidia-smi memory.used excludes it. Save the distinction explicitly.
-    driver_reserved_mib = int(subprocess.check_output(['nvidia-smi', f'--id={args.gpu}',
-        '--query-gpu=memory.reserved', '--format=csv,noheader,nounits'], text=True).strip())
-    metadata['nvml_v1_includes_driver_reserved_mib'] = driver_reserved_mib
-    metadata['gpu_info'] = subprocess.check_output(['nvidia-smi', f'--id={args.gpu}',
-        '--query-gpu=name,driver_version,memory.total', '--format=csv,noheader'], text=True).strip()
     metadata_path = args.output_dir / 'metadata.json'
-    if args.resume and metadata_path.exists():
-        recorded = json.loads(metadata_path.read_text())
-        for key in ('model', 'gpu', 'rounds', 'cases', 'buckets', 'modes'):
-            # JSON round-trip normalizes tuples in CASES.
-            if recorded[key] != json.loads(json.dumps(metadata[key])):
+    recorded = json.loads(metadata_path.read_text()) if args.resume and metadata_path.exists() else None
+    if recorded:
+        for key, value in configuration.items():
+            if recorded[key] != json.loads(json.dumps(value)):
                 parser.error(f'--resume configuration differs: {key}')
-        incomplete = any(not (args.output_dir / f'{trial}-{mode}.json').exists()
-            for trial in range(args.rounds) for mode in args.modes)
-        if incomplete and any(recorded.get(key) != value for key, value in metadata.items()
-                if key.endswith('_binary')):
-            parser.error('--resume cannot mix different binaries in unfinished results')
-        # A completed dataset belongs to its recorded binaries, even when the
-        # current checkout has moved on. Never rewrite their provenance.
+    incomplete = any(not (args.output_dir / f'{trial}-{mode}.json').exists()
+        for trial in range(args.rounds) for mode in args.modes)
+    if recorded and not incomplete:
+        # Completed datasets need neither historical binaries nor live GPU/model
+        # dependencies. Keep their original provenance and exact input fixture.
+        metadata = recorded
+        workload = json.loads((args.output_dir / 'workload.json').read_text())
     else:
-        metadata_path.write_text(json.dumps(metadata, indent=2))
-    workload = make_workload(args)
-    (args.output_dir / 'workload.json').write_text(json.dumps(workload))
+        metadata = configuration.copy()
+        for label, root in [('rust', args.repo), ('sglang', args.sglang_repo)]:
+            metadata[label] = dict(git_head=subprocess.check_output(
+                ['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip(),
+                versions=json.loads(subprocess.check_output([str(root / '.venv/bin/python'), '-c',
+                    "import json,importlib.metadata as m; print(json.dumps({p:m.version(p) for p in ['torch','flashinfer-python']}))"], text=True)))
+        metadata.update(binary_hashes(args))
+        metadata['nvml_v1_includes_driver_reserved_mib'] = int(subprocess.check_output(
+            ['nvidia-smi', f'--id={args.gpu}', '--query-gpu=memory.reserved',
+             '--format=csv,noheader,nounits'], text=True).strip())
+        metadata['gpu_info'] = subprocess.check_output(['nvidia-smi', f'--id={args.gpu}',
+            '--query-gpu=name,driver_version,memory.total', '--format=csv,noheader'], text=True).strip()
+        if recorded:
+            if any(recorded.get(key) != value for key, value in metadata.items()
+                    if key.endswith('_binary')):
+                parser.error('--resume cannot mix different binaries in unfinished results')
+            workload = json.loads((args.output_dir / 'workload.json').read_text())
+        else:
+            metadata_path.write_text(json.dumps(metadata, indent=2))
+            workload = make_workload(args)
+            (args.output_dir / 'workload.json').write_text(json.dumps(workload))
+    driver_reserved_mib = metadata['nvml_v1_includes_driver_reserved_mib']
     results = []
     for trial in range(args.rounds):
         # Rotate order so implementation and trial order are not identical.

@@ -31,7 +31,15 @@ pub enum PrefillGraphOutputLifetime {
 }
 
 /// A model describes computation only; the runner owns native graphs and buckets.
-pub trait PrefillGraphProgram {
+/// # Safety
+/// Implementers must ensure non-owning outputs originate in the captured pool,
+/// retain their owning storage through all dependent captures, and obey the
+/// declared last-use boundaries. No callback may retain or expose a non-owning
+/// alias beyond that boundary (including through shallow clones or views).
+/// `prepare_replay` must return an implementation satisfying the replay contract.
+/// The default `Owned` policy avoids non-owning storage but does not waive the
+/// shared-buffer sequencing requirements.
+pub unsafe trait PrefillGraphProgram {
     /// Allocate model-defined shared storage once, outside capture. Sharing is
     /// valid only when every consumer finishes before the next writer on the
     /// execution stream. Bucket views must retain ownership of this storage.
@@ -59,7 +67,12 @@ pub trait PrefillGraphProgram {
     ) -> Result<Box<dyn PrefillGraphReplay + 'a>>;
 }
 
-pub trait PrefillGraphReplay {
+/// # Safety
+/// Captured outputs can be non-owning pool aliases. Implementers must consume
+/// them within the declared segment/finish boundary, never save their aliases
+/// for later use, and return independently owned logits from `finish`. A view or
+/// shallow clone of a non-owning output does not acquire allocation ownership.
+pub unsafe trait PrefillGraphReplay {
     /// Write the eager seam into the next segment's fixed inputs. Implementations
     /// must initialize padding without writing KV for padded tokens.
     fn run_eager(&self, index: usize, outputs: &[Tensor], inputs: &[Tensor]) -> Result<()>;
@@ -406,7 +419,8 @@ mod cuda_tests {
             Ok(1)
         }
     }
-    impl PrefillGraphProgram for ArithmeticProgram {
+    // SAFETY: all outputs use Owned; bridge buffers remain owned by the runner.
+    unsafe impl PrefillGraphProgram for ArithmeticProgram {
         fn create_inputs(&self, tokens: usize, _shared: &[Tensor]) -> Result<PrefillGraphInputs> {
             // Simulate a rejected bucket: other shapes must stay usable.
             if tokens == 8 {
@@ -454,7 +468,8 @@ mod cuda_tests {
     struct ArithmeticReplay<'a> {
         batch: ForwardBatch<'a>,
     }
-    impl PrefillGraphReplay for ArithmeticReplay<'_> {
+    // SAFETY: callbacks do not retain aliases; finish computes independent output.
+    unsafe impl PrefillGraphReplay for ArithmeticReplay<'_> {
         fn run_eager(&self, index: usize, outputs: &[Tensor], inputs: &[Tensor]) -> Result<()> {
             let live = outputs[0].narrow(0, 0, self.batch.tokens() as i64);
             let values = if index == 0 {

@@ -5,7 +5,10 @@ use crate::engine::{
     PrefillGraphProgram, PrefillGraphReplay,
 };
 
-impl PrefillGraphProgram for Qwen3ForCausalLM {
+// SAFETY: QKV/hidden are pool allocations consumed at the next seam/finish;
+// the root residual owner survives the entire bucket capture. Shared attention
+// storage has owning views and all consumers/writers run serially on one stream.
+unsafe impl PrefillGraphProgram for Qwen3ForCausalLM {
     fn create_shared_buffers(&self, max_tokens: usize) -> Result<Vec<Tensor>> {
         // Attention consumes QKV first, then writes this slot. The next graph
         // reads it before another layer or bucket can overwrite it. QKV and
@@ -106,7 +109,9 @@ struct QwenPrefillReplay<'a> {
     attention: AttentionBatch<'a>,
     batch: ForwardBatch<'a>,
 }
-impl PrefillGraphReplay for QwenPrefillReplay<'_> {
+// SAFETY: attention consumes QKV before the next graph, no output alias escapes,
+// and finish projects hidden states into independently allocated logits.
+unsafe impl PrefillGraphReplay for QwenPrefillReplay<'_> {
     fn run_eager(&self, index: usize, outputs: &[Tensor], inputs: &[Tensor]) -> Result<()> {
         let count = self.batch.tokens() as i64;
         let output = &inputs[0];
@@ -144,7 +149,8 @@ mod cuda_tests {
         model: &'a Qwen3ForCausalLM,
         calls: std::cell::Cell<usize>,
     }
-    impl PrefillGraphProgram for FailLaterSegment<'_> {
+    // SAFETY: delegates Qwen's storage/replay contract; injected errors do not retain aliases.
+    unsafe impl PrefillGraphProgram for FailLaterSegment<'_> {
         fn create_shared_buffers(&self, max: usize) -> Result<Vec<Tensor>> {
             self.model.create_shared_buffers(max)
         }
@@ -302,6 +308,160 @@ mod cuda_tests {
             "only attention outputs need bridge buffers; residuals are graph outputs",
         );
         (eager, graph, ek, ev, gk, gv)
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn shared_catalog_decode_prefill_prefill_decode_preserves_logits_and_kv() {
+        use crate::engine::kvcache::{KVCacheLayout, KVCachePool};
+        use std::rc::Rc;
+        assert!(tch::Cuda::is_available());
+        no_grad(|| {
+            for kind in [Kind::BFloat16, Kind::Half] {
+                let (mut eager, mut graph, ek, ev, gk, gv) = pair(kind, "flashinfer");
+                eager.set_kv_reserved_slot(0);
+                graph.set_kv_reserved_slot(0);
+                let mut args = ServerArgs::new("unused");
+                args.max_seq_len = 256;
+                args.max_running_req = 4;
+                args.cuda_graph_bs = Some(4);
+                args.prefill_cuda_graph_max_tokens = 64;
+                let pool = Rc::new(RefCell::new(KVCachePool::without_tensor(
+                    KVCacheLayout::new(3, 32, 16, 1, 128).unwrap(),
+                )));
+                graph.capture_graphs(&args, pool).unwrap();
+                assert!(
+                    graph
+                        .prefill_graph_runner
+                        .as_ref()
+                        .unwrap()
+                        .failed_sizes()
+                        .is_empty()
+                );
+                // Capture can touch the reserved padding slot. Both references
+                // begin with identical caches, including all unwritten storage.
+                for cache in [&ek, &ev, &gk, &gv] {
+                    let _ = cache.shallow_clone().zero_();
+                }
+                let device = Device::Cuda(0);
+                let mut retained: Vec<(Tensor, Tensor)> = vec![];
+                // Three live decode rows use the four-row graph (reserved-page
+                // padding); final decode uses the one-row bucket. Prefills
+                // extend the same three requests with uneven nonzero prefixes.
+                for (step, (phase, lengths, prefixes)) in [
+                    (BatchPhase::Decode, vec![1i64, 1, 1], vec![0i64, 0, 0]),
+                    (BatchPhase::Prefill, vec![17, 6], vec![1, 1]),
+                    (BatchPhase::Prefill, vec![3, 5, 9], vec![18, 7, 1]),
+                    (BatchPhase::Decode, vec![1], vec![21]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut cumulative = vec![0i32];
+                    let mut positions = vec![];
+                    let mut writes = vec![];
+                    let mut table = vec![];
+                    let mut totals = vec![];
+                    for (row, (&length, &prefix)) in lengths.iter().zip(&prefixes).enumerate() {
+                        // Each request owns nine distinct nonzero pages. Extra
+                        // table columns repeat the last page and are never read.
+                        let first_page = 1 + row as i64 * 9;
+                        table.extend((0..16).map(|i| (first_page + i.min(8)) as i32));
+                        cumulative.push(cumulative.last().unwrap() + length as i32);
+                        totals.push((prefix + length) as i32);
+                        for position in prefix..prefix + length {
+                            positions.push(position);
+                            writes.push((first_page * 16 + position) as i32);
+                        }
+                    }
+                    let tokens: i64 = lengths.iter().sum();
+                    let rows = lengths.len() as i64;
+                    let ids = (Tensor::arange(tokens, (Kind::Int64, device)) + step as i64 + 3)
+                        .remainder(32);
+                    let pos = Tensor::from_slice(&positions).to_device(device);
+                    let indices = Tensor::from_slice(
+                        &cumulative[1..]
+                            .iter()
+                            .map(|end| *end as i64 - 1)
+                            .collect::<Vec<_>>(),
+                    )
+                    .to_device(device);
+                    let metadata = AttentionMetadata {
+                        forward_mode: phase,
+                        write_loc: Some(Tensor::from_slice(&writes).to_device(device)),
+                        block_table: Some(
+                            Tensor::from_slice(&table)
+                                .to_device(device)
+                                .view([rows, 16]),
+                        ),
+                        req_to_token: None,
+                        cu_seqlens_q: (phase == BatchPhase::Prefill)
+                            .then(|| Tensor::from_slice(&cumulative).to_device(device)),
+                        prefix_lens: (phase == BatchPhase::Prefill).then(|| {
+                            Tensor::from_slice(&prefixes)
+                                .to_kind(Kind::Int)
+                                .to_device(device)
+                        }),
+                        cache_seqlens: (phase == BatchPhase::Decode)
+                            .then(|| Tensor::from_slice(&totals).to_device(device)),
+                        max_seqlen: Some(*totals.iter().max().unwrap() as usize),
+                    };
+                    let batch = if phase == BatchPhase::Decode {
+                        Batch::decode(ids.view([rows, 1]), pos.view([rows, 1]), Some(metadata))
+                    } else {
+                        Batch::prefill(ids, pos, Some(metadata), indices)
+                    };
+                    let expected = eager
+                        .forward_impl(
+                            &batch.input_ids,
+                            &batch.positions,
+                            batch.attention_metadata.as_ref(),
+                            batch.logits_indices.as_ref(),
+                        )
+                        .unwrap();
+                    let actual = graph.forward(&batch).unwrap().logits;
+                    // Prove this exact batch admits a captured path: an eager
+                    // fallback must not silently turn the regression green.
+                    let replayed = graph
+                        .replay_captured_for_test(&batch)
+                        .unwrap()
+                        .expect("mode-transition batch fell back to eager");
+                    assert!(
+                        replayed.logits.equal(&actual),
+                        "direct replay differs from runner output"
+                    );
+                    let error = (actual.to_kind(Kind::Float) - expected.to_kind(Kind::Float))
+                        .abs()
+                        .max()
+                        .double_value(&[]);
+                    assert!(error < 0.005, "{kind:?}/step {step}: logits error={error}");
+                    // Compare the entire cache after every mode transition,
+                    // including padding, old prefixes and untouched requests.
+                    for (a, b) in [(&ek, &gk), (&ev, &gv)] {
+                        let error = (a.to_kind(Kind::Float) - b.to_kind(Kind::Float))
+                            .abs()
+                            .max()
+                            .double_value(&[]);
+                        assert!(error < 0.03125, "{kind:?}/step {step}: KV error={error}");
+                    }
+                    for (previous, snapshot) in &retained {
+                        assert!(
+                            previous.equal(snapshot),
+                            "step {step} overwrote retained logits"
+                        );
+                    }
+                    retained.push((actual.shallow_clone(), actual.copy()));
+                }
+                graph.clear_graphs();
+                tch::Cuda::synchronize(0);
+                for (previous, snapshot) in retained {
+                    assert!(
+                        previous.equal(&snapshot),
+                        "catalog teardown invalidated logits"
+                    );
+                }
+            }
+        });
     }
 
     #[test]

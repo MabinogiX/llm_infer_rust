@@ -113,3 +113,10 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/benchmark-shared-graph-pool.py \
 overlap 必须保持共享 pool 在同一执行 stream 上串行 replay，并避免未消费的非 owning activation 被覆盖；前一轮 logits/采样结果、CPU 元数据与 GPU event 的所有权和完成边界需要单独设计。scheduler 选择 prefill 或 decode 的次序本身不是共享 pool 冲突；真实并行执行或跨轮保留非 owning 值才会改变当前安全前提。
 
 最终 CPU 124 项、CUDA 18 项、HTTP 12 项通过，固定 cold/cached 性能探针通过。源码、文档、脚本与原始基准本地/远端同步；临时服务退出后 GPU 0/1 各 4 MiB。allocator peak reset 仅在初始化 catalog 使用，device-wide 统计要求验收时没有其他 concurrent capture。该日志不提供运行时每个请求的独立峰值。
+
+
+## 2026-10-11：review 修复
+
+基准脚本已移除对未选择的阶段二/线程优化前 binary 的强制依赖。完整 `--resume` 直接复用原 metadata/workload 与逐轮结果，不再要求 binary、GPU 或 tokenizer 可用；未完整数据仍检查所需二进制 hash。此前记录的原始 hash 与性能数值保持原口径，本次接口安全契约和回归测试修改没有重新测量吞吐。
+
+非 owning 接口改为显式 unsafe trait，并补充同一 runner 的 decode→prefill→prefill→decode KV/logits/保留输出回归；接口约束和测试方法见[review 修复记录](execution-cuda-graph-design-2026-10-10.md)。

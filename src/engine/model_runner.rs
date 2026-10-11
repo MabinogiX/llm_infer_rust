@@ -192,6 +192,26 @@ impl ModelRunner {
         }
     }
 
+    #[cfg(all(test, has_flashinfer, has_cuda_graph))]
+    pub(crate) fn replay_captured_for_test(&self, batch: &Batch) -> Result<Option<ForwardOutput>> {
+        let forward = ForwardBatch::from_scheduler(batch)?;
+        forward.validate(self.device)?;
+        self.graph_capture_context
+            .as_ref()
+            .unwrap()
+            .check_execution_stream()?;
+        if forward.phase() == BatchPhase::Decode {
+            self.decode_graph_runner.as_ref().unwrap().replay(forward)
+        } else {
+            no_grad(|| {
+                self.prefill_graph_runner
+                    .as_ref()
+                    .unwrap()
+                    .replay(self.model.prefill_graph_program().unwrap(), forward)
+            })
+        }
+    }
+
     pub fn device(&self) -> Device {
         self.device
     }

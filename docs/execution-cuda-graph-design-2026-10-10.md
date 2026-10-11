@@ -103,3 +103,15 @@ Qwen3 的 Q/K/V 为 `EagerSeam`，attention 将它们消费并写入独立静态
 catalog 初始化在 decode 捕获之前 reset device allocator peak，decode+全部 prefill 桶完成后读取 absolute peak 及相对捕获前的增量。日志与最终 allocated/reserved 并列，不把结束时差值当作峰值；该计数不包含 allocator 之外的 CUDA 分配。三轮 peak allocated 增量 66.36 MiB、peak reserved 增量 126 MiB，allocated 净增量 19.12 MiB。
 
 CUDA serving 在未显式设置 `OMP_NUM_THREADS`/`MKL_NUM_THREADS` 时将 LibTorch intra-op 线程设为 1，与原版 GPU 路径一致；记录实际线程数，CPU serving 不变。相同二进制单变量探针定位了旧默认 64 线程的短请求延迟尖峰。最终三轮 A/B 的 512-token cold P95 TTFT 53.44→7.76 ms，408 个请求输出一致，显存计数不变。最终 CPU 124、CUDA 18、HTTP 12 项通过，详细数据、限制和后续 overlap 边界见[组合验收](shared-cuda-graph-pool-benchmark-2026-10-10.md)。
+
+
+## Review 修复与模式交替回归（2026-10-11）
+
+`PrefillGraphProgram` 与 `PrefillGraphReplay` 现为 `unsafe trait`。实现者必须显式审计 pool 来源、依赖 capture 完成前的 owning retention、共享缓冲串行使用、非 owning alias 不得跨消费边界保留或外泄，以及 finish 返回独立拥有存储的 logits。普通 `shallow_clone`/view 不会使非 owning alias 重新取得 allocation 所有权；仅在 finish copy 无法保护其他回调保存 alias。Qwen、算术测试和失败注入实现均以带有 safety 说明的 `unsafe impl` 接入，不改变既有 replay 算法或分配策略。此为扩展接口的源码兼容性变更，新增模型实现必须承担该显式契约。
+
+新增同一 `ModelRunner` 的 decode→prefill→prefill→decode 数值回归，BF16/FP16 × FlashInfer。decode/prefill catalog 同时捕获并共享 context；三请求 decode 使用四行 padded graph，最后一个请求使用单行 decode 桶；连续 prefill 使用不等 query 长度和非零 prefix。每步对照同权重 eager 的 logits 与整个 K/V cache，包括已缓存前缀、未写请求和保留零页；保留所有历史 logits 并在后续 replay 与 clear 后核对快照。额外直接 replay 断言返回 Some，避免目录缺桶或 metadata 不兼容导致隐式 eager 回退而误通过。
+
+基准脚本仅 hash 所选模式实际执行的二进制。已完成 `--resume` 使用保存的 metadata/workload，不要求历史 `/tmp` binary、GPU 或 tokenizer；未完成的数据继续校验所需 binary hash 并复用原输入，避免混合不同二进制或重建不同输入。CPU-only Python 回归覆盖上述两条依赖行为，运行 `python3 scripts/test-benchmark-shared-graph-pool.py`。
+
+
+本次验收：CPU 124 项、CUDA 19 项（18 个 lib CUDA 用例与 1 个异构缓存集成用例）、Python 2 项通过；`cargo fmt --check` 与 `git diff --check` 通过。原始完整阶段四数据在本地缺失历史 binary/GPU 依赖的条件下成功 resume。远端服务二进制重新构建成功；记录为 `logs/pool-review-fix-cuda-20261011.log`、`logs/pool-review-fix-build-20261011.log`，CPU 记录为 `logs/pool-review-fix-cpu-20261011.log`。本轮没有新增性能提速结论或 HTTP 验收计数。
