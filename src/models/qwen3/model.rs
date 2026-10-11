@@ -433,7 +433,15 @@ impl DecoderLayer {
         let (normalized, residual) = self.input_norm(hidden_states, residual, eps);
         profiler.finish(timer);
         let (q, k, v) = self.project_qkv(&normalized, positions, eps, rope, profiler)?;
-        let attention = self.attend(&q, &k, &v, attention_batch, attention_metadata, profiler)?;
+        let attention = self.attend(
+            &q,
+            &k,
+            &v,
+            attention_batch,
+            attention_metadata,
+            profiler,
+            None,
+        )?;
         Ok(self.output_mlp(&attention, residual, eps, profiler))
     }
 
@@ -479,6 +487,7 @@ impl DecoderLayer {
         attention_batch: &AttentionBatch<'_>,
         attention_metadata: Option<&AttentionMetadata>,
         profiler: &mut ModelProfiler,
+        output: Option<&Tensor>,
     ) -> Result<Tensor> {
         let timer = profiler.start(ModelStage::KvWrite);
         let write_result = self.base_attention.borrow_mut().write_kv(
@@ -491,9 +500,14 @@ impl DecoderLayer {
         write_result?;
 
         let timer = profiler.start(ModelStage::AttentionBackend);
-        let output = attention_batch.forward(q, k, v, &self.base_attention.borrow());
+        let result = match output {
+            Some(output) => attention_batch
+                .forward_into(q, k, v, &self.base_attention.borrow(), output)
+                .map(|()| output.shallow_clone()),
+            None => attention_batch.forward(q, k, v, &self.base_attention.borrow()),
+        };
         profiler.finish(timer);
-        output
+        result
     }
 
     fn output_mlp(

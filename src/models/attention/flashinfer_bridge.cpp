@@ -186,8 +186,8 @@ extern "C" const char* sglang_flashinfer_native_prefill_run(
 
 extern "C" void* sglang_flashinfer_prepare_prefill(
     void* existing, const at::Tensor* q_indptr, const at::Tensor* prefixes,
-    const at::Tensor* block_table, int64_t q_heads, int64_t kv_heads,
-    int64_t page_size, int64_t dtype) {
+    const at::Tensor* block_table, int32_t* qp, int32_t* pp,
+    int64_t q_heads, int64_t kv_heads, int64_t page_size, int64_t dtype) {
   try {
     if (!q_indptr->is_cuda() || q_indptr->scalar_type() != at::kInt ||
         q_indptr->dim() != 1 || !q_indptr->is_contiguous() ||
@@ -198,11 +198,8 @@ extern "C" void* sglang_flashinfer_prepare_prefill(
         block_table->dim() != 2 || block_table->size(0) != prefixes->size(0))
       throw std::runtime_error("invalid FlashInfer prefill metadata");
     c10::cuda::CUDAGuard guard(q_indptr->device());
-    auto q_host = q_indptr->to(at::kCPU);
-    auto prefix_host = prefixes->to(at::kCPU);
+    // Rust has already read and validated these host snapshots once per batch.
     const auto batch = prefixes->size(0);
-    auto* qp = q_host.data_ptr<int32_t>();
-    auto* pp = prefix_host.data_ptr<int32_t>();
     bool paged = false;
     for (int64_t i = 0; i < batch; ++i) {
       if (pp[i] < 0 || qp[i+1] <= qp[i] || qp[0] != 0)
@@ -219,6 +216,7 @@ extern "C" void* sglang_flashinfer_prepare_prefill(
       throw std::runtime_error("FlashInfer prefill geometry changed");
     plan->q_indptr = *q_indptr;
     at::Tensor kv_host;
+    int32_t* kv_ptr = qp;
     if (paged) {
       auto lengths = prefixes->contiguous() + q_indptr->slice(0,1) - q_indptr->slice(0,0,-1);
       auto pages = at::floor_divide(lengths + page_size - 1, page_size);
@@ -227,15 +225,16 @@ extern "C" void* sglang_flashinfer_prepare_prefill(
       plan->indices = block_table->masked_select(columns.unsqueeze(0) < pages.unsqueeze(1)).to(at::kInt).contiguous();
       plan->last_page_len = ((lengths - 1) % page_size + 1).contiguous();
       kv_host = plan->indptr.to(at::kCPU);
+      kv_ptr = kv_host.data_ptr<int32_t>();
     } else {
       plan->indptr = *q_indptr;
-      kv_host = q_host;
     }
-    // The blocking metadata read drains prior work before reusing pinned storage.
+    // Rust's blocking host snapshot read drains prior work before plan reuse;
+    // paged mode also drains the indptr construction above.
     const char* error = nullptr;
     auto stream = c10::cuda::getCurrentCUDAStream(q_indptr->get_device()).stream();
     auto native = sglang_flashinfer_native_prefill_plan(plan->native_plan,
-        qp, kv_host.data_ptr<int32_t>(), qp[batch], batch, q_heads, kv_heads,
+        qp, kv_ptr, qp[batch], batch, q_heads, kv_heads,
         paged ? page_size : 1, stream, &error);
     if (!native) throw std::runtime_error(error ? error : "FlashInfer prefill plan failed");
     plan->native_plan = native;
@@ -248,7 +247,8 @@ extern "C" void* sglang_flashinfer_prepare_prefill(
 }
 
 extern "C" at::Tensor* sglang_flashinfer_prefill(
-    const void* prepared, const at::Tensor* q, const at::Tensor* k, const at::Tensor* v) {
+    const void* prepared, const at::Tensor* q, const at::Tensor* k, const at::Tensor* v,
+    const at::Tensor* output) {
   try {
     const auto& plan = *static_cast<const FlashInferPlan*>(prepared);
     c10::cuda::CUDAGuard guard(plan.device_index);
@@ -265,7 +265,10 @@ extern "C" at::Tensor* sglang_flashinfer_prefill(
             k->size(1)!=plan.page_size || k->size(2)!=plan.num_kv_heads)
          : (k->dim()!=3 || k->size(0)!=q->size(0) || k->size(1)!=plan.num_kv_heads)))
       throw std::runtime_error("FlashInfer prefill shape mismatch");
-    auto out = at::empty(q->sizes(), q->options());
+    if (output && (output->sizes() != q->sizes() || output->device() != q->device() ||
+        output->scalar_type() != dtype || !output->is_contiguous()))
+      throw std::runtime_error("invalid FlashInfer static prefill output");
+    auto out = output ? *output : at::empty(q->sizes(), q->options());
     auto stream = c10::cuda::getCurrentCUDAStream(plan.device_index).stream();
     auto error = sglang_flashinfer_native_prefill_run(plan.native_plan,q->data_ptr(),
         k->data_ptr(),v->data_ptr(),plan.q_indptr.data_ptr<int32_t>(),

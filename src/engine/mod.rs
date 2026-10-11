@@ -22,7 +22,11 @@ pub use model_runner::{
 pub use sampling::{Sampler, SamplingError, SamplingParams};
 
 pub(crate) use graph::NativeCudaGraph;
+#[cfg(all(test, has_cuda_graph))]
+pub(crate) use graph::NativeGraphCaptureContext;
 
 pub use forward::{ForwardBatch, ForwardMode, ForwardOutput};
 pub use graph_support::{GraphCapabilities, GraphLimits, GraphPadding, GraphSupport};
-pub use segmented_graph::{PrefillGraphInputs, PrefillGraphProgram, PrefillGraphReplay};
+pub use segmented_graph::{
+    PrefillGraphInputs, PrefillGraphOutputLifetime, PrefillGraphProgram, PrefillGraphReplay,
+};

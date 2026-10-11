@@ -110,6 +110,8 @@ ForwardOutput 初期以生成所需 logits 为核心，后续按真实需求增�
 
 已将 prefill 的桶目录、固定缓冲区、捕获、回放与失效释放移到通用 `SegmentedGraphRunner`。Qwen3 通过 `PrefillGraphProgram` 提供计算段和图外 attention；通用管理器不访问 decoder layers。另一个三段算术测试程序验证接口不依赖 Transformer 层结构，第二个实际模型的验证仍待后续接入。
 
+已优化分段 prefill 的图外执行：attention 元数据、缓存索引与 mask 在每批次准备一次，各层复用；相邻 graph 直接沿用 residual 固定地址；attention 写入固定输出，FlashInfer 直接输出到该地址，SDPA／`pt` 按接口能力保留必要写回。分段仍以 attention 为断点。共享 graph 内存池按 [共享 pool 评估与分阶段方案](shared-cuda-graph-pool-assessment-2026-10-10.md) 推进：先共享实例内 pool/capture stream，再复用静态输出和移植原版非 owning 中间量，收益分别测量。
+
 graph 已使用按模式划分的 `GraphCapabilities` 显式声明，默认不启用；声明根据实际模型、backend、dtype 和 KV 绑定状态产生，并携带请求数／token／上下文与 padding 约束。未验证的组合回退 eager，启动日志说明能力拒绝原因，动态形状回退记录 debug 原因。
 
 原版 attention backend 将元数据处理区分为图外准备与图内静态形状操作，可以参考这一契约。保留已实现的启动时捕获策略和 graph 生命周期约定。
@@ -247,6 +249,48 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 远端 A100 GPU 1 release 全目标测试 136 项通过、1 项已有采样微基准忽略。BF16／FP16 × `pt`／`fa`／FlashInfer 六种分段 prefill 对照通过；真实 Qwen3-0.6B／BF16／FlashInfer 的 eager 与 decode＋segmented prefill graph 各 12 项 HTTP 回归通过。8 组不同长度和重复前缀请求的 text／usage／finish_reason 在两种模式间、与已有重构前基线均完全一致。服务日志确认两种 graph 捕获，release 二进制已更新，临时服务退出后 GPU 1 显存恢复至 7 MiB。
 
 远端验收记录为 `logs/execution-graph-tests-20261010.log`、`logs/execution-graph-build-20261010.log`、`logs/execution-graph-http-summary-20261010.log`、`logs/execution-graph-eager-graph-comparison-20261010.json` 及各模式服务／API 日志。本次没有性能测量；第二个实际模型的执行与 graph 接入验证仍待后续完成。
+
+### 5.6 分段 prefill 图外开销优化（2026-10-10）
+
+attention 元数据改为每个批次准备一次：`pt` 复用 query boundaries、prefix lengths、因果 mask 与缓存 gather 索引，`fa` 复用 padding／输出索引、缓存索引和 mask；各层只 gather 自己的 K/V 内容。FlashInfer planning 复用已读取的 host boundaries／prefixes，不再额外从 GPU 读取同一份元数据。
+
+分段接口允许后续 graph 直接消费上一段固定输出。Qwen3 移除每层独立 residual bridge 及其复制，attention 输出成为唯一的段间固定输入。图外 attention 通过 `forward_into` 写入固定输出：FlashInfer 直接传入已有 kernel 的输出指针，多请求 SDPA 用 `index_select_out` 写入解包结果；单请求 SDPA 与 `pt` 保留必要写回。只清零 attention 输出的 padding 行，真实 token 之外不发布 KV。没有改变 native kernel 算法，也没有引入共享 graph pool。
+
+本地 CPU 测试 124 项通过；远端 A100 GPU 1 的 15 项 CUDA 模块／集成测试通过，覆盖 BF16／FP16 × `pt`／`fa`／FlashInfer、缓存前缀、动态长度、padding、clear／recapture、跨段地址与权重／缓存重绑定。新增固定输出测试验证 native 返回值沿用调用方地址，且不覆盖真实 token 范围之外的存储。格式与 diff 检查通过。
+
+真实 Qwen3-0.6B／BF16／FlashInfer 下，优化版 eager／graph 各 12 项 HTTP 回归通过。另以改动前 `8e493744c995db99244038254e03a27384630b2b` 的原始实现构建基线，两种模式各 8 组贪心请求的 text／usage／finish_reason 在优化前后完全一致。额外发现其中一组共享前缀请求的 eager／graph 文本不一致：两请求最小复现及原始基线均出现相同差异，因此不是本次优化引入；本次不宣称两种模式任意输入都逐 token 一致，也不扩大为该既有差异的修复。
+
+五个源码文件同步并通过 SHA-256 核对；基线验证后远端源码与优化版 release 二进制均已恢复，临时服务退出后 GPU 1 显存恢复为 4 MiB。验收日志使用 `logs/prefill-output-opt-*-20261010.*`；旧版基线和最小复现分别使用 `logs/prefill-output-baseline*-20261010.*` 与 `logs/prefill-output-repro-*-20261010.*`。本次未做耗时／吞吐基准，不给出提速比例。
+
+### 5.7 共享 graph pool 阶段一（2026-10-10）
+
+共享方案与完整复刻的阶段边界见 [共享 pool 评估与实施记录](shared-cuda-graph-pool-assessment-2026-10-10.md)。同一模型实例的 decode/prefill 捕获目录共用 pool 与 capture stream，decode 改为大桶先捕获；保留现有固定张量强引用和 residual 原地复用。执行入口先校验 replay stream，允许完整批次连续 prefill 或任意切换两种模式，段内保持固定顺序。没有改 Scheduler 或增加批次间同步。
+
+Context 对 device/pinned-host allocator pool 显式保留引用，避免首次 graph 捕获失败或被丢弃后 pool handle 失效；native begin/end 失败立即终止该目录初始化，普通闭包失败可按桶回退。clear、权重／缓存重绑定与 teardown 按 graph/outputs/context 顺序释放，下一目录使用新 handle。
+
+本地 CPU 124 项、远端 A100 GPU 1 release CUDA 17 项回归通过。真实 Qwen3-0.6B／BF16／FlashInfer，max-running-req=4、max-seq-len=40960、decode bs=4、prefill limit=2048、memory-ratio=0.4：启动后 GPU 驻留显存从独立池的 35723 MiB 降至共享版本的 24293 MiB，减少 11430 MiB（约 11.16 GiB／32.0%）。此为整张 GPU 的驻留显存，不是仅 graph pool 或 capture 峰值。独立 graph、共享 graph、eager 各 12 项 HTTP 回归通过；8 组同模式改动前后输出完全一致。
+
+验收使用 `logs/shared-pool-stage1-*-20261010.*`，最终服务二进制已更新；临时服务退出后两张 GPU 各为 4 MiB。启动时间为单次观测，没有耗时／吞吐提速结论。阶段二的最大容量 attention 静态输出复用、阶段三的非 owning 中间量迁移和阶段四的组合性能基准仍按独立验收推进。
+
+### 5.8 共享 attention 静态输出：阶段二
+
+Qwen3 通过 `create_shared_buffers(max_tokens)` 在每次捕获目录分配一个最大容量 attention 输出，全部层与桶只保留其连续 owning view；通用 runner 不依赖 Transformer 宽度。每个 eager seam 写 live 行、清当前桶 padding，下一 graph 读取完才允许覆盖。QKV/residual/final hidden 仍保留 owning storage，非 owning 迁移留待阶段三。
+
+CPU 124 项、CUDA 17 项通过，新增共享地址、NaN 污染、大桶→小桶→大桶、保留 logits 检查，覆盖 BF16/FP16 与 FlashInfer/fa/pt。阶段一 graph、阶段二 graph、eager 各 12 项 HTTP 回归通过，8 组同模式输出一致。同配置真实 Qwen3 启动后 GPU 驻留 24293→23575 MiB，减少 718 MiB；allocator allocated 减少 1347.64 MiB、reserved 减少 716 MiB。逻辑静态 attention payload 约 1.319 GiB→8 MiB，不将逻辑节省与驻留降幅混用；没有吞吐/延迟结论。详见[阶段二实施与计量](shared-cuda-graph-pool-assessment-2026-10-10.md)。本地/远端源码与文档同步，临时服务已停止。
+
+### 5.9 非 owning 中间量：阶段三
+
+通用 runner 增加输出使用区间声明，默认 `Owned`；Qwen3 QKV/final hidden 在 capture 后转为非 owning view，residual 的 owner 保留到整个桶捕获完成。`at::from_blob` 保留 offset/stride，native graph/context 维持 pool 生命周期；replay 必须在值被覆盖前消费，各段按固定顺序执行。最大容量 attention 输入、权重/KV 与 decode 输出仍保持 owning。半成品桶失败退出先同步并释放已有图，再释放 residual owners，防止 capture 的 live range 与 replay 不一致。
+
+CPU 124 项、CUDA 18 项通过；新增实际 pool allocation 复用、非连续 view、保留副本，以及后继段 capture 错误后其他桶回放的数值检查。阶段二 graph、阶段三 graph、eager 各 12 项 HTTP 回归通过，8 组同模式输出一致。同配置真实模型启动后 GPU 驻留 23575→20821 MiB，减少 2754 MiB（约 2.69 GiB）；相对初始独立池累计减少约 41.7%。阶段三 capture 前后 allocated delta 约 19.12 MiB、reserved delta 126 MiB，不能当作 capture 峰值；没有吞吐/延迟提速结论。详情见[阶段三实施和验收](shared-cuda-graph-pool-assessment-2026-10-10.md)。源码/文档同步到远端，临时服务已停止。阶段三验收时，阶段四组合性能基准尚未开始。
+
+### 5.10 共享 pool 组合验收：阶段四
+
+相同 KV 容量、graph 桶和 workload 下完成三轮 Rust 阶段二/三/eager 与原版 overlap/serial 基准。阶段二/三 408 个请求输出一致，steady 驻留减少 2754 MiB，生成吞吐基本持平。完整 catalog peak allocated 增量 66.36 MiB、peak reserved 增量 126 MiB，不能将结束时 19.12 MiB 的 allocated 差值称为峰值。
+
+另定位并修复 CUDA serving 的 CPU 线程长尾：无显式 OMP/MKL 环境配置时将 LibTorch intra-op 设为 1，与原版一致。最终三轮旧新 graph 408 个请求输出一致，512-token cold P95 TTFT 53.44→7.76 ms，生成吞吐约 1% 变化，驻留/捕获峰值保持不变。CPU 124、CUDA 18、HTTP 12 项及 cold/cached 性能探针通过；源码/文档/基准已同步，临时 GPU 服务停止。完整结果见[组合验收](shared-cuda-graph-pool-benchmark-2026-10-10.md)。
+
+共享 pool 四阶段完成。后续值得独立推进 Engine CPU/GPU overlap，并重新验证 logits/采样/CPU 元数据的完成边界；共享 pool replay 仍须串行，未消费的非 owning 值不能被下一轮覆盖。
 
 ## 6. 本阶段范围之外
 

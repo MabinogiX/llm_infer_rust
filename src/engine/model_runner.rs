@@ -6,7 +6,7 @@ use tch::{Device, TchError, Tensor, no_grad};
 
 use super::{
     ModelWeights, ServerArgs,
-    graph::DecodeGraphRunner,
+    graph::{DecodeGraphRunner, NativeGraphCaptureContext},
     kvcache::{KVCachePool, ModelKvCache},
 };
 
@@ -176,6 +176,7 @@ pub struct ModelRunner {
     // Graphs must release their backend state before model/cache ownership.
     decode_graph_runner: Option<DecodeGraphRunner>,
     pub(crate) prefill_graph_runner: Option<SegmentedGraphRunner>,
+    graph_capture_context: Option<Rc<NativeGraphCaptureContext>>,
     model: Box<dyn ModelExecutor>,
     device: Device,
 }
@@ -187,6 +188,27 @@ impl ModelRunner {
             device,
             decode_graph_runner: None,
             prefill_graph_runner: None,
+            graph_capture_context: None,
+        }
+    }
+
+    #[cfg(all(test, has_flashinfer, has_cuda_graph))]
+    pub(crate) fn replay_captured_for_test(&self, batch: &Batch) -> Result<Option<ForwardOutput>> {
+        let forward = ForwardBatch::from_scheduler(batch)?;
+        forward.validate(self.device)?;
+        self.graph_capture_context
+            .as_ref()
+            .unwrap()
+            .check_execution_stream()?;
+        if forward.phase() == BatchPhase::Decode {
+            self.decode_graph_runner.as_ref().unwrap().replay(forward)
+        } else {
+            no_grad(|| {
+                self.prefill_graph_runner
+                    .as_ref()
+                    .unwrap()
+                    .replay(self.model.prefill_graph_program().unwrap(), forward)
+            })
         }
     }
 
@@ -220,7 +242,23 @@ impl ModelRunner {
         pool: Rc<RefCell<KVCachePool>>,
     ) -> Result<()> {
         self.clear_graphs();
-        let decode = DecodeGraphRunner::capture(self, args, pool)?;
+        let context = match self.device {
+            Device::Cuda(device)
+                if super::NativeCudaGraph::available()
+                    && !crate::logging::step_timing_enabled()
+                    && (args.cuda_graph_bs.unwrap_or(args.max_running_req) > 0
+                        || args.prefill_cuda_graph_max_tokens > 0) =>
+            {
+                Some(NativeGraphCaptureContext::new(device)?)
+            }
+            _ => None,
+        };
+        let capture_started = std::time::Instant::now();
+        let memory_before = context.as_ref().map(|c| c.memory_bytes()).transpose()?;
+        if let Some(context) = &context {
+            context.peak_memory_bytes(true)?;
+        }
+        let decode = DecodeGraphRunner::capture(self, args, pool, context.as_ref())?;
         let mut prefill = None;
         let capabilities = self.model.graph_capabilities();
         if args.prefill_cuda_graph_max_tokens > 0
@@ -248,12 +286,44 @@ impl ModelRunner {
                                 program,
                                 args.prefill_cuda_graph_max_tokens,
                                 limits,
+                                context.as_ref().ok_or_else(|| {
+                                    ModelRunnerError::Model(
+                                        "CUDA graph capture context is missing".into(),
+                                    )
+                                })?,
                             )
                         })?);
                     }
                 }
             }
         }
+        if let Some(context) = &context {
+            context.check_execution_stream()?;
+            let (allocated, reserved) = context.memory_bytes()?;
+            let (before_allocated, before_reserved) = memory_before.unwrap();
+            let (peak_allocated, peak_reserved) = context.peak_memory_bytes(false)?;
+            tracing::info!(
+                allocated_bytes = allocated,
+                reserved_bytes = reserved,
+                capture_peak_allocated_bytes = peak_allocated,
+                capture_peak_reserved_bytes = peak_reserved,
+                capture_peak_allocated_delta_bytes = peak_allocated - before_allocated,
+                capture_peak_reserved_delta_bytes = peak_reserved - before_reserved,
+                allocated_delta_bytes = allocated - before_allocated,
+                reserved_delta_bytes = reserved - before_reserved,
+                capture_ms = capture_started.elapsed().as_millis() as u64,
+                "shared CUDA graph catalog memory"
+            );
+        }
+        self.graph_capture_context = if decode.is_some()
+            || prefill
+                .as_ref()
+                .is_some_and(SegmentedGraphRunner::has_graphs)
+        {
+            context
+        } else {
+            None
+        };
         self.decode_graph_runner = decode;
         self.prefill_graph_runner = prefill;
         Ok(())
@@ -276,6 +346,9 @@ impl ModelRunner {
         let forward = ForwardBatch::from_scheduler(batch)?;
         // Validation precedes bucket lookup, buffer copies and backend planning.
         forward.validate(self.device)?;
+        if let Some(context) = &self.graph_capture_context {
+            context.check_execution_stream()?;
+        }
         if forward.phase() == BatchPhase::Decode {
             if let Some(graph) = &self.decode_graph_runner {
                 if let Some(output) = graph.replay(forward)? {
@@ -296,6 +369,7 @@ impl ModelRunner {
     pub fn clear_graphs(&mut self) {
         self.decode_graph_runner = None;
         self.prefill_graph_runner = None;
+        self.graph_capture_context = None;
     }
 }
 

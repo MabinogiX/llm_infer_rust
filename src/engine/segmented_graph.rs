@@ -1,8 +1,10 @@
 //! Model-independent startup capture and replay of GPU segments with eager seams.
+use super::graph::NativeGraphCaptureContext;
 use super::{
     ForwardBatch, ForwardOutput, GraphLimits, GraphPadding, ModelRunnerError, NativeCudaGraph,
 };
 use std::collections::{BTreeMap, HashSet};
+use std::rc::Rc;
 use tch::{Device, Kind, Tensor};
 type Result<T> = std::result::Result<T, ModelRunnerError>;
 
@@ -14,10 +16,50 @@ pub struct PrefillGraphInputs {
     pub segments: Vec<Vec<Tensor>>,
 }
 
+/// Storage retention during catalog capture. Non-owning outputs must be
+/// allocations from the captured graph, never model weights or external inputs.
+#[derive(Clone, Copy)]
+pub enum PrefillGraphOutputLifetime {
+    /// Conservative default: keep owning storage until bucket teardown.
+    Owned,
+    /// Used only by the eager seam (or final finish), never a later segment.
+    /// Release after capture; replay must consume before the next segment.
+    EagerSeam,
+    /// Later segments read/update this allocation. Retain during the entire
+    /// bucket capture; release only after all dependent graphs are recorded.
+    BucketCapture,
+}
+
 /// A model describes computation only; the runner owns native graphs and buckets.
-pub trait PrefillGraphProgram {
-    fn create_inputs(&self, tokens: usize) -> Result<PrefillGraphInputs>;
-    fn run_segment(&self, index: usize, inputs: &PrefillGraphInputs) -> Result<Vec<Tensor>>;
+/// # Safety
+/// Implementers must ensure non-owning outputs originate in the captured pool,
+/// retain their owning storage through all dependent captures, and obey the
+/// declared last-use boundaries. No callback may retain or expose a non-owning
+/// alias beyond that boundary (including through shallow clones or views).
+/// `prepare_replay` must return an implementation satisfying the replay contract.
+/// The default `Owned` policy avoids non-owning storage but does not waive the
+/// shared-buffer sequencing requirements.
+pub unsafe trait PrefillGraphProgram {
+    /// Allocate model-defined shared storage once, outside capture. Sharing is
+    /// valid only when every consumer finishes before the next writer on the
+    /// execution stream. Bucket views must retain ownership of this storage.
+    fn create_shared_buffers(&self, _max_tokens: usize) -> Result<Vec<Tensor>> {
+        Ok(vec![])
+    }
+    fn create_inputs(&self, tokens: usize, shared: &[Tensor]) -> Result<PrefillGraphInputs>;
+    /// Declare the capture/replay live range. Opting out of Owned requires that
+    /// every use obeys the retention contract above, including aliases.
+    fn output_lifetime(&self, _segment: usize, _output: usize) -> PrefillGraphOutputLifetime {
+        PrefillGraphOutputLifetime::Owned
+    }
+    /// Previous captured outputs have stable addresses protected by the runner.
+    /// A segment may consume them directly without a bridge copy.
+    fn run_segment(
+        &self,
+        index: usize,
+        inputs: &PrefillGraphInputs,
+        previous_outputs: &[Tensor],
+    ) -> Result<Vec<Tensor>>;
     /// Prepare backend plans outside graphs, once per live invocation.
     fn prepare_replay<'a>(
         &'a self,
@@ -25,9 +67,15 @@ pub trait PrefillGraphProgram {
     ) -> Result<Box<dyn PrefillGraphReplay + 'a>>;
 }
 
-pub trait PrefillGraphReplay {
-    /// Run the eager seam after segment `index`; return the next segment's inputs.
-    fn run_eager(&self, index: usize, outputs: &[Tensor]) -> Result<Vec<Tensor>>;
+/// # Safety
+/// Captured outputs can be non-owning pool aliases. Implementers must consume
+/// them within the declared segment/finish boundary, never save their aliases
+/// for later use, and return independently owned logits from `finish`. A view or
+/// shallow clone of a non-owning output does not acquire allocation ownership.
+pub unsafe trait PrefillGraphReplay {
+    /// Write the eager seam into the next segment's fixed inputs. Implementations
+    /// must initialize padding without writing KV for padded tokens.
+    fn run_eager(&self, index: usize, outputs: &[Tensor], inputs: &[Tensor]) -> Result<()>;
     /// Produce independently owned live-request logits, outside captured segments.
     fn finish(&self, outputs: &[Tensor]) -> Result<ForwardOutput>;
 }
@@ -55,10 +103,14 @@ pub(crate) struct SegmentedGraphRunner {
     admission: GraphLimits,
 }
 impl SegmentedGraphRunner {
+    pub(crate) fn has_graphs(&self) -> bool {
+        !self.graphs.is_empty()
+    }
     pub(crate) fn capture(
         program: &dyn PrefillGraphProgram,
         limit: usize,
         admission: GraphLimits,
+        context: &Rc<NativeGraphCaptureContext>,
     ) -> Result<Self> {
         if admission.padding != GraphPadding::InertTokenRows {
             return Err(error("segmented prefill requires inert token padding"));
@@ -75,8 +127,13 @@ impl SegmentedGraphRunner {
             max_tokens = limit,
             "prefill segmented CUDA Graph configured for startup capture"
         );
+        let shared = if sizes.is_empty() {
+            vec![]
+        } else {
+            program.create_shared_buffers(limit)?
+        };
         for &size in sizes.iter().rev() {
-            match Self::capture_one(program, size) {
+            match Self::capture_one(program, size, &shared, context) {
                 Ok(graph) => {
                     tracing::info!(
                         tokens = size,
@@ -86,6 +143,7 @@ impl SegmentedGraphRunner {
                     runner.graphs.insert(size, graph);
                 }
                 Err(err) => {
+                    context.check_execution_stream()?;
                     runner.failed.insert(size);
                     tracing::warn!(tokens = size, %err, "prefill CUDA Graph capture failed; bucket uses eager");
                 }
@@ -102,15 +160,39 @@ impl SegmentedGraphRunner {
         self.failed.iter().copied().collect()
     }
     #[cfg(all(test, has_cuda_graph))]
+    pub(crate) fn bridge_input_counts(&self, size: usize) -> Vec<usize> {
+        self.graphs[&size]
+            .inputs
+            .segments
+            .iter()
+            .map(Vec::len)
+            .collect()
+    }
+    #[cfg(all(test, has_cuda_graph))]
+    pub(crate) fn bridge_inputs(&self) -> Vec<&Tensor> {
+        self.graphs
+            .values()
+            .flat_map(|graph| graph.inputs.segments.iter().flatten())
+            .collect()
+    }
+    #[cfg(all(test, has_cuda_graph))]
     pub(crate) fn remove_bucket(&mut self, size: usize) {
         self.graphs.remove(&size);
     }
 
-    fn capture_one(program: &dyn PrefillGraphProgram, tokens: usize) -> Result<PrefillGraph> {
-        let inputs = program.create_inputs(tokens)?;
+    fn capture_one(
+        program: &dyn PrefillGraphProgram,
+        tokens: usize,
+        shared: &[Tensor],
+        context: &Rc<NativeGraphCaptureContext>,
+    ) -> Result<PrefillGraph> {
+        let inputs = program.create_inputs(tokens, shared)?;
         let Device::Cuda(device) = inputs.ids.device() else {
             return Err(error("segment inputs require CUDA"));
         };
+        if device != context.device_index() {
+            return Err(error("segment inputs differ from capture context device"));
+        }
         if inputs.segments.is_empty()
             || inputs.ids.size() != [tokens as i64]
             || inputs.positions.size() != [tokens as i64]
@@ -129,16 +211,48 @@ impl SegmentedGraphRunner {
                 ));
             }
         }
-        let mut segments = Vec::new();
-        for index in 0..inputs.segments.len() {
-            let (native, outputs) =
-                NativeCudaGraph::capture(device, || program.run_segment(index, &inputs))?;
+        // Declare owners before graph so error unwinding synchronizes/destroys
+        // partial graphs before releasing dependent residual allocations.
+        let mut bucket_owners = Vec::new();
+        let mut graph = PrefillGraph {
+            segments: vec![],
+            inputs,
+        };
+        for index in 0..graph.inputs.segments.len() {
+            let previous = graph
+                .segments
+                .last()
+                .map_or(&[][..], |segment| segment.outputs.as_slice());
+            let (native, outputs) = NativeCudaGraph::capture(context, || {
+                program.run_segment(index, &graph.inputs, previous)
+            })?;
             if outputs.is_empty() {
                 return Err(error("segment must return outputs"));
             }
-            segments.push(Segment { native, outputs });
+            let mut retained = Vec::with_capacity(outputs.len());
+            for (role, output) in outputs.into_iter().enumerate() {
+                match program.output_lifetime(index, role) {
+                    PrefillGraphOutputLifetime::Owned => retained.push(output),
+                    lifetime => {
+                        // Model declares pool ownership and the last-use boundary.
+                        // Native graph retains the pool; bucket_owners protects
+                        // allocations that subsequent captures must still read.
+                        retained.push(unsafe { native.non_owning_output(&output)? });
+                        if matches!(lifetime, PrefillGraphOutputLifetime::BucketCapture) {
+                            bucket_owners.push(output);
+                        }
+                    }
+                }
+            }
+            graph.segments.push(Segment {
+                native,
+                outputs: retained,
+            });
         }
-        Ok(PrefillGraph { segments, inputs })
+        // Capture warmups have completed and every residual consumer has been
+        // recorded. No later capture in this bucket can overwrite these values.
+        drop(bucket_owners);
+        Ok(graph)
     }
     /// Replay a batch already validated by ModelRunner, or request eager fallback.
     pub(crate) fn replay(
@@ -184,8 +298,11 @@ impl SegmentedGraphRunner {
             .copy_(&batch.positions.view([-1]));
         graph.segments[0].native.replay()?;
         for index in 0..graph.segments.len() - 1 {
-            let values = replay.run_eager(index, &graph.segments[index].outputs)?;
-            copy_segment_inputs(&graph.inputs.segments[index + 1], &values)?;
+            replay.run_eager(
+                index,
+                &graph.segments[index].outputs,
+                &graph.inputs.segments[index + 1],
+            )?;
             graph.segments[index + 1].native.replay()?;
         }
         replay
@@ -194,32 +311,6 @@ impl SegmentedGraphRunner {
     }
 }
 
-fn copy_segment_inputs(targets: &[Tensor], sources: &[Tensor]) -> Result<()> {
-    if targets.len() != sources.len() {
-        return Err(error("eager seam returned the wrong input count"));
-    }
-    for (target, source) in targets.iter().zip(sources) {
-        let a = target.size();
-        let b = source.size();
-        if a.is_empty()
-            || b.is_empty()
-            || a.len() != b.len()
-            || a[1..] != b[1..]
-            || b[0] > a[0]
-            || source.kind() != target.kind()
-            || source.device() != target.device()
-        {
-            return Err(error("eager seam returned incompatible segment inputs"));
-        }
-    }
-    for (target, source) in targets.iter().zip(sources) {
-        if source.size()[0] < target.size()[0] {
-            let _ = target.shallow_clone().zero_();
-        }
-        target.narrow(0, 0, source.size()[0]).copy_(source);
-    }
-    Ok(())
-}
 fn error(message: &str) -> ModelRunnerError {
     ModelRunnerError::Model(message.into())
 }
@@ -278,29 +369,6 @@ mod tests {
         assert_eq!(bucket(1001, 1000), None);
         assert_eq!(bucket(1, 0), None);
     }
-    #[test]
-    fn validates_all_segment_inputs_before_copying_and_zeroes_padding() {
-        let target = Tensor::ones([4, 2], (Kind::Float, Device::Cpu));
-        let other = Tensor::ones([4, 3], (Kind::Float, Device::Cpu));
-        let source = Tensor::full([2, 2], 7.0, (Kind::Float, Device::Cpu));
-        assert!(
-            copy_segment_inputs(
-                &[target.shallow_clone(), other],
-                &[source.shallow_clone(), source.shallow_clone()]
-            )
-            .is_err()
-        );
-        assert_eq!(target.sum(Kind::Float).double_value(&[]), 8.0);
-        copy_segment_inputs(&[target.shallow_clone()], &[source]).unwrap();
-        assert_eq!(
-            target.narrow(0, 0, 2).sum(Kind::Float).double_value(&[]),
-            28.0
-        );
-        assert_eq!(
-            target.narrow(0, 2, 2).sum(Kind::Float).double_value(&[]),
-            0.0
-        );
-    }
 }
 
 #[cfg(all(test, has_cuda_graph))]
@@ -336,7 +404,7 @@ mod cuda_tests {
             let x = (batch.input_ids.view([-1]).to_kind(Kind::Float) * &self.weight
                 + batch.positions.view([-1]).to_kind(Kind::Float)
                 + 1.)
-                * 6.;
+                * 8.;
             Ok(ForwardOutput::new(
                 x.view([-1, 1])
                     .index_select(0, batch.logits_indices().unwrap()),
@@ -351,8 +419,9 @@ mod cuda_tests {
             Ok(1)
         }
     }
-    impl PrefillGraphProgram for ArithmeticProgram {
-        fn create_inputs(&self, tokens: usize) -> Result<PrefillGraphInputs> {
+    // SAFETY: all outputs use Owned; bridge buffers remain owned by the runner.
+    unsafe impl PrefillGraphProgram for ArithmeticProgram {
+        fn create_inputs(&self, tokens: usize, _shared: &[Tensor]) -> Result<PrefillGraphInputs> {
             // Simulate a rejected bucket: other shapes must stay usable.
             if tokens == 8 {
                 return Err(error("test bucket unavailable"));
@@ -371,7 +440,12 @@ mod cuda_tests {
                 ],
             })
         }
-        fn run_segment(&self, index: usize, inputs: &PrefillGraphInputs) -> Result<Vec<Tensor>> {
+        fn run_segment(
+            &self,
+            index: usize,
+            inputs: &PrefillGraphInputs,
+            previous: &[Tensor],
+        ) -> Result<Vec<Tensor>> {
             Ok(vec![match index {
                 0 => (inputs.ids.to_kind(Kind::Float) * &self.weight
                     + inputs.positions.to_kind(Kind::Float))
@@ -380,6 +454,7 @@ mod cuda_tests {
                 _ => {
                     inputs.segments[2][0].sum_dim_intlist([1i64].as_slice(), true, Kind::Float)
                         + &inputs.segments[2][1]
+                        + &previous[0]
                 }
             }])
         }
@@ -393,14 +468,23 @@ mod cuda_tests {
     struct ArithmeticReplay<'a> {
         batch: ForwardBatch<'a>,
     }
-    impl PrefillGraphReplay for ArithmeticReplay<'_> {
-        fn run_eager(&self, index: usize, outputs: &[Tensor]) -> Result<Vec<Tensor>> {
+    // SAFETY: callbacks do not retain aliases; finish computes independent output.
+    unsafe impl PrefillGraphReplay for ArithmeticReplay<'_> {
+        fn run_eager(&self, index: usize, outputs: &[Tensor], inputs: &[Tensor]) -> Result<()> {
             let live = outputs[0].narrow(0, 0, self.batch.tokens() as i64);
-            Ok(if index == 0 {
+            let values = if index == 0 {
                 vec![live + 1.]
             } else {
                 vec![live.repeat([1, 2]), outputs[0].shallow_clone()]
-            })
+            };
+            for (target, value) in inputs.iter().zip(values) {
+                let rows = value.size()[0];
+                target.narrow(0, 0, rows).copy_(&value);
+                if rows < target.size()[0] {
+                    let _ = target.narrow(0, rows, target.size()[0] - rows).zero_();
+                }
+            }
+            Ok(())
         }
         fn finish(&self, outputs: &[Tensor]) -> Result<ForwardOutput> {
             Ok(ForwardOutput::new(
@@ -502,7 +586,7 @@ mod cuda_tests {
             );
             assert_eq!(
                 runner.forward(&batch).unwrap().logits.double_value(&[0, 0]),
-                30.
+                40.
             );
             let pool = KVCachePool::new(
                 KVCacheLayout::new(1, 4, 2, 1, 1).unwrap(),

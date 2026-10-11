@@ -191,6 +191,20 @@ impl Engine {
     ) -> Result<Self> {
         let (kind, device) =
             Self::validate_for_serving(&server_args, runtime_config, tp_rank, factory)?;
+        // GPU serving performs small CPU metadata operations. A large default
+        // intra-op pool causes contention/long tails without helping GPU kernels.
+        // Match upstream's CUDA policy, while honoring explicit thread settings.
+        if matches!(device, Device::Cuda(_))
+            && std::env::var_os("OMP_NUM_THREADS").is_none()
+            && std::env::var_os("MKL_NUM_THREADS").is_none()
+        {
+            tch::set_num_threads(1);
+        }
+        tracing::info!(
+            cpu_threads = tch::get_num_threads(),
+            ?device,
+            "LibTorch serving CPU threads"
+        );
         let model = factory.create(kind, device, &server_args.attention_backend)?;
         let mut runner = ModelRunner::new(model, device);
         let weights = load_hf_safetensors(&server_args.model_path).map_err(|error| {
