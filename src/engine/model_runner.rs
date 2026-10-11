@@ -235,6 +235,9 @@ impl ModelRunner {
         };
         let capture_started = std::time::Instant::now();
         let memory_before = context.as_ref().map(|c| c.memory_bytes()).transpose()?;
+        if let Some(context) = &context {
+            context.peak_memory_bytes(true)?;
+        }
         let decode = DecodeGraphRunner::capture(self, args, pool, context.as_ref())?;
         let mut prefill = None;
         let capabilities = self.model.graph_capabilities();
@@ -278,9 +281,14 @@ impl ModelRunner {
             context.check_execution_stream()?;
             let (allocated, reserved) = context.memory_bytes()?;
             let (before_allocated, before_reserved) = memory_before.unwrap();
+            let (peak_allocated, peak_reserved) = context.peak_memory_bytes(false)?;
             tracing::info!(
                 allocated_bytes = allocated,
                 reserved_bytes = reserved,
+                capture_peak_allocated_bytes = peak_allocated,
+                capture_peak_reserved_bytes = peak_reserved,
+                capture_peak_allocated_delta_bytes = peak_allocated - before_allocated,
+                capture_peak_reserved_delta_bytes = peak_reserved - before_reserved,
                 allocated_delta_bytes = allocated - before_allocated,
                 reserved_delta_bytes = reserved - before_reserved,
                 capture_ms = capture_started.elapsed().as_millis() as u64,

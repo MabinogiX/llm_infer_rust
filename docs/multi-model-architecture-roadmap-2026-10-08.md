@@ -282,7 +282,15 @@ CPU 124 项、CUDA 17 项通过，新增共享地址、NaN 污染、大桶→小
 
 通用 runner 增加输出使用区间声明，默认 `Owned`；Qwen3 QKV/final hidden 在 capture 后转为非 owning view，residual 的 owner 保留到整个桶捕获完成。`at::from_blob` 保留 offset/stride，native graph/context 维持 pool 生命周期；replay 必须在值被覆盖前消费，各段按固定顺序执行。最大容量 attention 输入、权重/KV 与 decode 输出仍保持 owning。半成品桶失败退出先同步并释放已有图，再释放 residual owners，防止 capture 的 live range 与 replay 不一致。
 
-CPU 124 项、CUDA 18 项通过；新增实际 pool allocation 复用、非连续 view、保留副本，以及后继段 capture 错误后其他桶回放的数值检查。阶段二 graph、阶段三 graph、eager 各 12 项 HTTP 回归通过，8 组同模式输出一致。同配置真实模型启动后 GPU 驻留 23575→20821 MiB，减少 2754 MiB（约 2.69 GiB）；相对初始独立池累计减少约 41.7%。阶段三 capture 前后 allocated delta 约 19.12 MiB、reserved delta 126 MiB，不能当作 capture 峰值；没有吞吐/延迟提速结论。详情见[阶段三实施和验收](shared-cuda-graph-pool-assessment-2026-10-10.md)。源码/文档同步到远端，临时服务已停止。阶段四组合性能基准尚未开始。
+CPU 124 项、CUDA 18 项通过；新增实际 pool allocation 复用、非连续 view、保留副本，以及后继段 capture 错误后其他桶回放的数值检查。阶段二 graph、阶段三 graph、eager 各 12 项 HTTP 回归通过，8 组同模式输出一致。同配置真实模型启动后 GPU 驻留 23575→20821 MiB，减少 2754 MiB（约 2.69 GiB）；相对初始独立池累计减少约 41.7%。阶段三 capture 前后 allocated delta 约 19.12 MiB、reserved delta 126 MiB，不能当作 capture 峰值；没有吞吐/延迟提速结论。详情见[阶段三实施和验收](shared-cuda-graph-pool-assessment-2026-10-10.md)。源码/文档同步到远端，临时服务已停止。阶段三验收时，阶段四组合性能基准尚未开始。
+
+### 5.10 共享 pool 组合验收：阶段四
+
+相同 KV 容量、graph 桶和 workload 下完成三轮 Rust 阶段二/三/eager 与原版 overlap/serial 基准。阶段二/三 408 个请求输出一致，steady 驻留减少 2754 MiB，生成吞吐基本持平。完整 catalog peak allocated 增量 66.36 MiB、peak reserved 增量 126 MiB，不能将结束时 19.12 MiB 的 allocated 差值称为峰值。
+
+另定位并修复 CUDA serving 的 CPU 线程长尾：无显式 OMP/MKL 环境配置时将 LibTorch intra-op 设为 1，与原版一致。最终三轮旧新 graph 408 个请求输出一致，512-token cold P95 TTFT 53.44→7.76 ms，生成吞吐约 1% 变化，驻留/捕获峰值保持不变。CPU 124、CUDA 18、HTTP 12 项及 cold/cached 性能探针通过；源码/文档/基准已同步，临时 GPU 服务停止。完整结果见[组合验收](shared-cuda-graph-pool-benchmark-2026-10-10.md)。
+
+共享 pool 四阶段完成。后续值得独立推进 Engine CPU/GPU overlap，并重新验证 logits/采样/CPU 元数据的完成边界；共享 pool replay 仍须串行，未消费的非 owning 值不能被下一轮覆盖。
 
 ## 6. 本阶段范围之外
 

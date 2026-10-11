@@ -354,6 +354,24 @@ impl NativeGraphCaptureContext {
         Ok(())
     }
 
+    pub(crate) fn peak_memory_bytes(&self, reset: bool) -> Result<(i64, i64)> {
+        #[cfg(has_cuda_graph)]
+        {
+            let (mut allocated, mut reserved) = (0, 0);
+            if !unsafe {
+                sglang_graph_peak_memory(self.device as i32, reset, &mut allocated, &mut reserved)
+            } {
+                return Err(native_error());
+            }
+            Ok((allocated, reserved))
+        }
+        #[cfg(not(has_cuda_graph))]
+        {
+            let _ = reset;
+            Ok((0, 0))
+        }
+    }
+
     pub(crate) fn memory_bytes(&self) -> Result<(i64, i64)> {
         #[cfg(has_cuda_graph)]
         {
@@ -507,6 +525,12 @@ fn native_error() -> ModelRunnerError {
 #[cfg(has_cuda_graph)]
 unsafe extern "C" {
     fn sglang_graph_non_owning_view(tensor: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn sglang_graph_peak_memory(
+        device: i32,
+        reset: bool,
+        allocated: *mut i64,
+        reserved: *mut i64,
+    ) -> bool;
     fn sglang_graph_memory(device: i32, allocated: *mut i64, reserved: *mut i64) -> bool;
     fn sglang_graph_context_create(device: i32) -> *mut std::ffi::c_void;
     fn sglang_graph_context_free(context: *mut std::ffi::c_void);

@@ -104,6 +104,22 @@ extern "C" bool sglang_graph_memory(int device, int64_t* allocated, int64_t* res
   }
 }
 
+// Reset peaks at the catalog boundary, not for every bucket/segment. These
+// counters cover the device allocator; direct CUDA allocations are excluded.
+extern "C" bool sglang_graph_peak_memory(int device, bool reset,
+                                        int64_t* allocated, int64_t* reserved) {
+  try {
+    if (reset) c10::cuda::CUDACachingAllocator::resetPeakStats(device);
+    auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
+    *allocated = stats.allocated_bytes[0].peak;
+    *reserved = stats.reserved_bytes[0].peak;
+    return true;
+  } catch (const std::exception& error) {
+    last_error = error.what();
+    return false;
+  }
+}
+
 extern "C" GraphBridge* sglang_graph_create(ContextHandle* handle) {
   try {
     if (!sglang_graph_context_check(handle)) return nullptr;

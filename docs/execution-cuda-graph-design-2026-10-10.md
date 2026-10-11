@@ -96,3 +96,10 @@ Qwen3 的 Q/K/V 为 `EagerSeam`，attention 将它们消费并写入独立静态
 捕获期间即创建 RAII 的半成品 `PrefillGraph`；发生后续段 warmup/capture 错误时，其 Drop 先同步并释放已捕获图，然后释放桶的 residual owners。普通闭包失败允许其他桶继续捕获，native invalid capture 仍使整个 context 失效并终止安装。
 
 阶段三 CPU 124 项、CUDA 18 项通过，后继段失败后其他桶可继续回放并与 eager 数值对齐。阶段二/三/eager 共 36 项 HTTP 回归通过，8 组同模式输出完全一致。真实 Qwen3 启动后 GPU 驻留 23575→20821 MiB，减少 2754 MiB；allocated 减少 2803.37 MiB、reserved 减少 2754 MiB。捕获前后 allocated delta 约 19.12 MiB、reserved delta 126 MiB。均非 capture 峰值，没有吞吐或延迟结论；详见[阶段三验收](shared-cuda-graph-pool-assessment-2026-10-10.md)。
+
+
+## 组合验收与运行线程：阶段四
+
+catalog 初始化在 decode 捕获之前 reset device allocator peak，decode+全部 prefill 桶完成后读取 absolute peak 及相对捕获前的增量。日志与最终 allocated/reserved 并列，不把结束时差值当作峰值；该计数不包含 allocator 之外的 CUDA 分配。三轮 peak allocated 增量 66.36 MiB、peak reserved 增量 126 MiB，allocated 净增量 19.12 MiB。
+
+CUDA serving 在未显式设置 `OMP_NUM_THREADS`/`MKL_NUM_THREADS` 时将 LibTorch intra-op 线程设为 1，与原版 GPU 路径一致；记录实际线程数，CPU serving 不变。相同二进制单变量探针定位了旧默认 64 线程的短请求延迟尖峰。最终三轮 A/B 的 512-token cold P95 TTFT 53.44→7.76 ms，408 个请求输出一致，显存计数不变。最终 CPU 124、CUDA 18、HTTP 12 项通过，详细数据、限制和后续 overlap 边界见[组合验收](shared-cuda-graph-pool-benchmark-2026-10-10.md)。
