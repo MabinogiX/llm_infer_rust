@@ -192,6 +192,34 @@ impl PrefillManager {
         false
     }
 
+    /// Detach logical request state while its handle still protects every page.
+    pub(crate) fn retire(&mut self, uid: RequestId) -> Option<Request> {
+        self.running
+            .iter()
+            .position(|request| request.uid == uid)
+            .map(|index| self.running.remove(index))
+    }
+
+    /// Called only after the last invocation using this handle completes.
+    /// Publish just the committed KV prefix, then release even if publish fails.
+    pub(crate) fn release_retired(
+        &mut self,
+        mut request: Request,
+        publish: bool,
+    ) -> crate::engine::kvcache::Result<()> {
+        let Some(handle) = request.cache_handle.as_mut() else {
+            return Ok(());
+        };
+        let result = if publish {
+            self.cache
+                .publish(handle, &request.input_ids[..handle.written_len])
+        } else {
+            Ok(())
+        };
+        self.cache.release(handle);
+        result
+    }
+
     pub fn remove_batch(&mut self, ids: &[RequestId]) {
         for uid in ids {
             if let Some(index) = self.running.iter().position(|request| request.uid == *uid) {
@@ -203,11 +231,9 @@ impl PrefillManager {
         }
     }
 
-    pub fn publish(
-        &mut self,
-        uid: RequestId,
-        written_ids: &[i64],
-    ) -> crate::engine::kvcache::Result<()> {
+    /// Publish the current sequence after its KV write completes and before
+    /// appending the sampled token, which has not yet entered KV.
+    pub fn publish(&mut self, uid: RequestId) -> crate::engine::kvcache::Result<()> {
         let request = self
             .running
             .iter_mut()
@@ -217,7 +243,7 @@ impl PrefillManager {
             .cache_handle
             .as_mut()
             .expect("running request has KV handle");
-        self.cache.publish(handle, written_ids)
+        self.cache.publish(handle, &request.input_ids)
     }
 
     pub fn mark_written(&mut self, uid: RequestId, written_len: usize) {
@@ -340,7 +366,7 @@ mod tests {
         let (_pool, mut manager) = manager(3, 1, 6);
         manager.add_request(request(0, vec![1, 2], 1));
         manager.schedule_prefill().unwrap().unwrap();
-        manager.publish(0, &[1, 2]).unwrap();
+        manager.publish(0).unwrap();
         manager.running_request_mut(0).unwrap().append_token(7);
         manager.remove_batch(&[0]);
 

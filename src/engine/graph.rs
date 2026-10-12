@@ -196,6 +196,21 @@ impl DecodeGraphRunner {
 
     /// Replay a batch already validated by ModelRunner, or request eager fallback.
     pub(crate) fn replay(&self, batch: ForwardBatch<'_>) -> Result<Option<ForwardOutput>> {
+        Ok(self.replay_impl(batch, false)?.map(|(output, _)| output))
+    }
+
+    pub(crate) fn replay_with_read_fence(
+        &self,
+        batch: ForwardBatch<'_>,
+    ) -> Result<Option<(ForwardOutput, Option<super::InputReadFence>)>> {
+        self.replay_impl(batch, true)
+    }
+
+    fn replay_impl(
+        &self,
+        batch: ForwardBatch<'_>,
+        track_reads: bool,
+    ) -> Result<Option<(ForwardOutput, Option<super::InputReadFence>)>> {
         if batch.phase() != BatchPhase::Decode {
             return Ok(None);
         }
@@ -249,6 +264,14 @@ impl DecodeGraphRunner {
         if graph.metadata.req_to_token.is_some() {
             copy_field(&graph.metadata.req_to_token, &source.req_to_token, rows)?;
         }
+        // Every model-facing input now belongs to the captured graph. Later
+        // prep/replay reads those private buffers, never scheduler source rows.
+        // This fence protects only scheduler-buffer reuse, not KV lifetimes.
+        let read_done = if track_reads {
+            Some(super::InputReadFence::record(batch.input_ids.device())?)
+        } else {
+            None
+        };
         if size < graph.input_ids.size()[0] as usize {
             let start = rows;
             let count = graph.input_ids.size()[0] - rows;
@@ -290,8 +313,9 @@ impl DecodeGraphRunner {
             backend.prepare_replay()?;
         }
         graph.native.replay()?;
-        Ok(Some(ForwardOutput::new(
-            graph.output.narrow(0, 0, rows).copy(),
+        Ok(Some((
+            ForwardOutput::new(graph.output.narrow(0, 0, rows).copy()),
+            read_done,
         )))
     }
 }
@@ -725,17 +749,60 @@ mod tests {
                 );
                 batch.attention_metadata.as_mut().unwrap().block_table = Some(table);
             }
-            let replay = graph
-                .replay(ForwardBatch::from_scheduler(&batch).unwrap())
-                .unwrap();
-            assert_eq!(replay.is_some(), rows <= 4);
-            let actual = replay
-                .unwrap_or_else(|| runner.forward(&batch).unwrap())
-                .logits;
             let expected = runner
                 .run_model(&ForwardBatch::from_scheduler(&batch).unwrap())
                 .unwrap()
                 .logits;
+            let expected_k = k.copy();
+            let expected_v = v.copy();
+            let replay = graph
+                .replay_with_read_fence(ForwardBatch::from_scheduler(&batch).unwrap())
+                .unwrap();
+            assert_eq!(replay.is_some(), rows <= 4);
+            let actual = if let Some((output, read_done)) = replay {
+                let read_done =
+                    read_done.expect("captured decode must expose its source-read fence");
+                let upload = crate::engine::metadata_transfer::MetadataUpload::new(device).unwrap();
+                let guard = upload.begin(Some(&read_done), None).unwrap();
+                // Poison every scheduler source while graph computation can
+                // still run. It must consume only its private snapshots.
+                guard
+                    .copy(
+                        &mut batch.input_ids,
+                        &Tensor::zeros([rows, 1], (Kind::Int64, Device::Cpu)),
+                    )
+                    .unwrap();
+                guard
+                    .copy(
+                        &mut batch.positions,
+                        &Tensor::zeros([rows, 1], (Kind::Int64, Device::Cpu)),
+                    )
+                    .unwrap();
+                let metadata = batch.attention_metadata.as_mut().unwrap();
+                for tensor in [
+                    metadata.write_loc.as_mut().unwrap(),
+                    metadata.cache_seqlens.as_mut().unwrap(),
+                    metadata.block_table.as_mut().unwrap(),
+                ] {
+                    let source =
+                        Tensor::zeros(tensor.size().as_slice(), (tensor.kind(), Device::Cpu));
+                    guard.copy(tensor, &source).unwrap();
+                }
+                guard.finish().unwrap();
+                output.logits
+            } else {
+                runner.forward(&batch).unwrap().logits
+            };
+            for (actual, expected) in [(&k, &expected_k), (&v, &expected_v)] {
+                let error = (actual.to_kind(Kind::Float) - expected.to_kind(Kind::Float))
+                    .abs()
+                    .max()
+                    .double_value(&[]);
+                assert!(
+                    error <= 0.03125,
+                    "scheduler metadata overwrite changed KV: {error}"
+                );
+            }
             let error = (&actual.to_kind(Kind::Float) - expected.to_kind(Kind::Float))
                 .abs()
                 .max()

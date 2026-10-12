@@ -4,6 +4,7 @@ mod forward;
 mod graph;
 mod graph_support;
 pub mod kvcache;
+pub(crate) mod metadata_transfer;
 mod model_loader;
 mod model_runner;
 mod sampling;
@@ -14,11 +15,13 @@ pub use engine::{
     Engine, EngineError, Result, RuntimeModelConfig, ServerArgs, validate_max_seq_len,
     validate_model_path,
 };
+pub(crate) use metadata_transfer::InputReadFence;
 pub use model_loader::{ModelFactory, ModelLoadError, ModelWeights, load_hf_safetensors};
 pub use model_runner::{
     AttentionMetadata, Batch, BatchPhase, DecodeGraphState, ModelExecutor, ModelRunner,
     ModelRunnerError,
 };
+pub(crate) use sampling::{CompletionFence, PendingSample};
 pub use sampling::{Sampler, SamplingError, SamplingParams};
 
 pub(crate) use graph::NativeCudaGraph;

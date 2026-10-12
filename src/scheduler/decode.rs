@@ -2,7 +2,10 @@
 
 use tch::{Device, Kind, Tensor};
 
-use crate::engine::{AttentionMetadata, Batch, BatchPhase, ServerArgs};
+use crate::engine::metadata_transfer::{MetadataUpload, UploadGuard};
+use crate::engine::{
+    AttentionMetadata, Batch, BatchPhase, CompletionFence, InputReadFence, ServerArgs,
+};
 
 use super::{Request, RequestId, Result, SchedulerError};
 
@@ -17,6 +20,11 @@ pub struct DecodeManager {
     page_size: usize,
     max_blocks: usize,
     device: Device,
+    allow_upload: bool,
+    upload: Option<MetadataUpload>,
+    read_done: Option<InputReadFence>,
+    full_done: Option<CompletionFence>,
+    relay_rows_buf: Tensor,
     input_ids_buf: Tensor,
     positions_buf: Tensor,
     write_loc_buf: Tensor,
@@ -51,6 +59,15 @@ impl DecodeManager {
             page_size: args.page_size,
             max_blocks: args.max_seq_len.div_ceil(args.page_size),
             device,
+            allow_upload: cfg!(has_cuda_graph)
+                && device.is_cuda()
+                && !args.disable_cpu_gpu_overlap
+                && !args.disable_async_metadata
+                && !crate::logging::step_timing_enabled(),
+            upload: None,
+            read_done: None,
+            full_done: None,
+            relay_rows_buf: Tensor::zeros([rows], (Kind::Int64, device)),
             input_ids_buf: Tensor::zeros([rows, 1], (Kind::Int64, device)),
             positions_buf: Tensor::zeros([rows, 1], (Kind::Int64, device)),
             write_loc_buf: Tensor::full([rows], -1, (Kind::Int, device)),
@@ -68,9 +85,49 @@ impl DecodeManager {
     /// Returned tensors view reusable buffers and must be consumed before the
     /// next call to `schedule_decode`.
     pub fn schedule_decode(&mut self, running: &[Request]) -> Result<Option<DecodeBatch>> {
+        // Public callers retain the original same-stream buffer-order contract.
+        self.build(running, None, false)
+    }
+
+    pub(crate) fn schedule_pipeline(&mut self, running: &[Request]) -> Result<Option<DecodeBatch>> {
+        self.build(running, None, true)
+    }
+
+    pub(crate) fn set_read_boundary(
+        &mut self,
+        early: Option<InputReadFence>,
+        full: CompletionFence,
+    ) {
+        self.full_done = early.is_none().then_some(full);
+        self.read_done = early;
+    }
+
+    /// Plan one future token per selected request without observing its value
+    /// on the CPU. Future lengths belong to the pending forward, not input_ids.
+    pub(crate) fn schedule_relay(
+        &mut self,
+        running: &[Request],
+        future: &[(RequestId, usize)],
+        ids: &Tensor,
+    ) -> Result<Option<DecodeBatch>> {
+        self.build(running, Some((future, ids)), true)
+    }
+
+    fn build(
+        &mut self,
+        running: &[Request],
+        future: Option<(&[(RequestId, usize)], &Tensor)>,
+        async_metadata: bool,
+    ) -> Result<Option<DecodeBatch>> {
         let active: Vec<_> = running
             .iter()
             .filter(|request| !request.is_finished())
+            .filter(|request| {
+                future.is_none_or(|(rows, _)| {
+                    rows.iter()
+                        .any(|(uid, len)| *uid == request.uid && *len > 0)
+                })
+            })
             .collect();
         if active.is_empty() {
             return Ok(None);
@@ -81,9 +138,31 @@ impl DecodeManager {
             ));
         }
 
+        if async_metadata && self.allow_upload && self.upload.is_none() {
+            // First use also fences buffer initialization or any public
+            // same-stream invocation preceding tracked pipeline execution.
+            if self.read_done.is_none() && self.full_done.is_none() {
+                self.read_done = Some(
+                    InputReadFence::record(self.device)
+                        .map_err(crate::engine::EngineError::from)?,
+                );
+            }
+            self.upload =
+                Some(MetadataUpload::new(self.device).map_err(crate::engine::EngineError::from)?);
+        }
+        let upload = if async_metadata {
+            self.upload
+                .as_ref()
+                .map(|upload| upload.begin(self.read_done.as_ref(), self.full_done.as_ref()))
+                .transpose()
+                .map_err(crate::engine::EngineError::from)?
+        } else {
+            None
+        };
         let rows = active.len();
         let mut request_ids = Vec::with_capacity(rows);
         let mut input_ids = Vec::with_capacity(rows);
+        let mut relay_rows = Vec::with_capacity(rows);
         let mut positions = Vec::with_capacity(rows);
         let mut write_loc = Vec::with_capacity(rows);
         let mut cache_seqlens = Vec::with_capacity(rows);
@@ -91,7 +170,17 @@ impl DecodeManager {
         let rows_i64 = to_i64(rows, "request count")?;
 
         for (row, request) in active.into_iter().enumerate() {
-            let len = request.input_ids.len();
+            let len = if let Some((future, _)) = future {
+                let (index, (_, len)) = future
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (uid, _))| *uid == request.uid)
+                    .expect("filtered relay request");
+                relay_rows.push(index as i64);
+                *len
+            } else {
+                request.input_ids.len()
+            };
             if len == 0 || len > self.max_seq_len {
                 return Err(SchedulerError::InvalidDecode(format!(
                     "request {} length {len} is outside 1..={}",
@@ -100,7 +189,9 @@ impl DecodeManager {
             }
             max_seqlen = max_seqlen.max(len);
             request_ids.push(request.uid);
-            input_ids.push(request.input_ids[len - 1]);
+            if future.is_none() {
+                input_ids.push(request.input_ids[len - 1]);
+            }
             positions.push(to_i64(len - 1, "position")?);
             cache_seqlens.push(to_i32(len, "cache sequence length")?);
 
@@ -173,16 +264,26 @@ impl DecodeManager {
                     }
                 }
                 if !page_values.is_empty() {
-                    self.block_table_buf
-                        .get(row as i64)
-                        .narrow(0, changed_page as i64, page_values.len() as i64)
-                        .copy_(&Tensor::from_slice(&page_values).to_device(self.device));
+                    copy_host(
+                        &mut self.block_table_buf.get(row as i64).narrow(
+                            0,
+                            changed_page as i64,
+                            page_values.len() as i64,
+                        ),
+                        &Tensor::from_slice(&page_values),
+                        upload.as_ref(),
+                    )?;
                 }
                 if !locations.is_empty() {
-                    self.req_to_token_buf
-                        .get(row as i64)
-                        .narrow(0, start as i64, locations.len() as i64)
-                        .copy_(&Tensor::from_slice(&locations).to_device(self.device));
+                    copy_host(
+                        &mut self.req_to_token_buf.get(row as i64).narrow(
+                            0,
+                            start as i64,
+                            locations.len() as i64,
+                        ),
+                        &Tensor::from_slice(&locations),
+                        upload.as_ref(),
+                    )?;
                 }
                 #[cfg(test)]
                 {
@@ -198,22 +299,45 @@ impl DecodeManager {
             }
         }
 
-        self.input_ids_buf.narrow(0, 0, rows_i64).copy_(
-            &Tensor::from_slice(&input_ids)
-                .view([rows_i64, 1])
-                .to_device(self.device),
-        );
-        self.positions_buf.narrow(0, 0, rows_i64).copy_(
-            &Tensor::from_slice(&positions)
-                .view([rows_i64, 1])
-                .to_device(self.device),
-        );
-        self.write_loc_buf
-            .narrow(0, 0, rows_i64)
-            .copy_(&Tensor::from_slice(&write_loc).to_device(self.device));
-        self.cache_seqlens_buf
-            .narrow(0, 0, rows_i64)
-            .copy_(&Tensor::from_slice(&cache_seqlens).to_device(self.device));
+        if future.is_some() {
+            copy_host(
+                &mut self.relay_rows_buf.narrow(0, 0, rows_i64),
+                &Tensor::from_slice(&relay_rows),
+                upload.as_ref(),
+            )?;
+        } else {
+            copy_host(
+                &mut self.input_ids_buf.narrow(0, 0, rows_i64),
+                &Tensor::from_slice(&input_ids).view([rows_i64, 1]),
+                upload.as_ref(),
+            )?;
+        }
+        copy_host(
+            &mut self.positions_buf.narrow(0, 0, rows_i64),
+            &Tensor::from_slice(&positions).view([rows_i64, 1]),
+            upload.as_ref(),
+        )?;
+        copy_host(
+            &mut self.write_loc_buf.narrow(0, 0, rows_i64),
+            &Tensor::from_slice(&write_loc),
+            upload.as_ref(),
+        )?;
+        copy_host(
+            &mut self.cache_seqlens_buf.narrow(0, 0, rows_i64),
+            &Tensor::from_slice(&cache_seqlens),
+            upload.as_ref(),
+        )?;
+        if let Some(upload) = upload {
+            upload.finish().map_err(crate::engine::EngineError::from)?;
+        }
+        // Future IDs are produced on the execution stream after sampling.
+        // Never gather them on the upload stream at the earlier read boundary.
+        if let Some((_, ids)) = future {
+            let input = ids
+                .index_select(0, &self.relay_rows_buf.narrow(0, 0, rows_i64))
+                .view([rows_i64, 1]);
+            self.input_ids_buf.narrow(0, 0, rows_i64).copy_(&input);
+        }
         let model_batch = Batch::decode(
             self.input_ids_buf.narrow(0, 0, rows_i64),
             self.positions_buf.narrow(0, 0, rows_i64),
@@ -241,6 +365,17 @@ impl DecodeManager {
             .ok_or_else(|| SchedulerError::InvalidDecode("KV slot overflow".to_owned()))?;
         to_i32(slot, "KV slot")
     }
+}
+
+fn copy_host(target: &mut Tensor, source: &Tensor, upload: Option<&UploadGuard<'_>>) -> Result<()> {
+    if let Some(upload) = upload {
+        upload
+            .copy(target, source)
+            .map_err(crate::engine::EngineError::from)?;
+    } else {
+        target.copy_(&source.to_device(target.device()));
+    }
+    Ok(())
 }
 
 fn to_i32(value: usize, field: &str) -> Result<i32> {

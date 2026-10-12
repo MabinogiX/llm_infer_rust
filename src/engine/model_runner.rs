@@ -343,6 +343,21 @@ impl ModelRunner {
     }
 
     pub fn forward(&self, batch: &Batch) -> Result<ForwardOutput> {
+        Ok(self.forward_impl(batch, false)?.0)
+    }
+
+    pub(crate) fn forward_with_read_fence(
+        &self,
+        batch: &Batch,
+    ) -> Result<(ForwardOutput, Option<super::InputReadFence>)> {
+        self.forward_impl(batch, true)
+    }
+
+    fn forward_impl(
+        &self,
+        batch: &Batch,
+        track_reads: bool,
+    ) -> Result<(ForwardOutput, Option<super::InputReadFence>)> {
         let forward = ForwardBatch::from_scheduler(batch)?;
         // Validation precedes bucket lookup, buffer copies and backend planning.
         forward.validate(self.device)?;
@@ -351,8 +366,12 @@ impl ModelRunner {
         }
         if forward.phase() == BatchPhase::Decode {
             if let Some(graph) = &self.decode_graph_runner {
-                if let Some(output) = graph.replay(forward)? {
-                    return Ok(output);
+                if track_reads {
+                    if let Some(output) = graph.replay_with_read_fence(forward)? {
+                        return Ok(output);
+                    }
+                } else if let Some(output) = graph.replay(forward)? {
+                    return Ok((output, None));
                 }
             }
         } else if let Some(graph) = &self.prefill_graph_runner {
@@ -360,10 +379,10 @@ impl ModelRunner {
                 ModelRunnerError::Model("prefill graph program disappeared after capture".into())
             })?;
             if let Some(output) = no_grad(|| graph.replay(program, forward))? {
-                return Ok(output);
+                return Ok((output, None));
             }
         }
-        no_grad(|| self.model.forward(&forward))
+        no_grad(|| self.model.forward(&forward)).map(|output| (output, None))
     }
 
     pub fn clear_graphs(&mut self) {

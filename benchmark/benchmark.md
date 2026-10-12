@@ -1,5 +1,9 @@
 # Benchmark优化记录
 
+## 2026.10.12
+增加了graph中内存共享优化，显存占用大幅下降（超过50%），优化了一些多余的数据拷贝逻辑；
+优化cpu/gpu的overlap，实现跨批次的overlap计算，benchmark中Time per Output Token首次降低到2ms以内；
+
 ## 2026.10.07
 添加cuda graph，在max-running-req=1时跟sglang在benchmark上打平，本项目首token延迟少10-30ms不等，但吞吐仍低于sglang
 

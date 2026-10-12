@@ -115,3 +115,22 @@ CUDA serving 在未显式设置 `OMP_NUM_THREADS`/`MKL_NUM_THREADS` 时将 LibTo
 
 
 本次验收：CPU 124 项、CUDA 19 项（18 个 lib CUDA 用例与 1 个异构缓存集成用例）、Python 2 项通过；`cargo fmt --check` 与 `git diff --check` 通过。原始完整阶段四数据在本地缺失历史 binary/GPU 依赖的条件下成功 resume。远端服务二进制重新构建成功；记录为 `logs/pool-review-fix-cuda-20261011.log`、`logs/pool-review-fix-build-20261011.log`，CPU 记录为 `logs/pool-review-fix-cpu-20261011.log`。本轮没有新增性能提速结论或 HTTP 验收计数。
+
+
+## CPU/GPU overlap：第一阶段（已撤销，2026-10-12）
+
+CUDA serving 将采样发射与 CPU readback 分开，期间准备纯 CPU 的结果发布快照；取回结果后才发布 KV、追加 token、结束请求和回收页。`PendingSample` 内部保活 logits/IDs 并禁止跨线程，GPU 工作继续在既定 execution stream 串行执行。提供 `--disable-cpu-gpu-overlap`，CPU/profiling 路径保持串行。
+
+CPU 125、CUDA 21、Python 2 项通过。三轮开启/关闭基准的 408 对输出一致，生成吞吐约增加 0.9%–2.0%，显存不变；短请求正负波动，未证明显著提速。此为批内 overlap，原版 future token 跨批流水线尚未实现。完整执行契约、数字及后续阶段见[第一阶段验收](cpu-gpu-overlap-stage1-2026-10-12.md)。
+
+## CPU/GPU overlap：一批待完成 decode 结果
+
+已撤销批内提前准备快照的执行路径，改用一批 outstanding 结果与 device token relay。在当前 decode 已发射后提交上一批 token/长度；EOS、错误、取消及 prefill 切换先排空 GPU 工作，之后才发布 radix 或回收页。共享 pool 的 GPU forward 仍在同一 execution stream 串行执行。实现范围和验收见[跨批流水线](cpu-gpu-overlap-pipeline-2026-10-12.md)。
+
+## CPU/GPU overlap：请求结束与资源回收分离
+
+EOS/取消请求立即移出 running，终止结果不再等待整个下一批；原序列和 KV handle 由 retirement 队列保活，按最后使用 UID 的 completion event 延迟发布/释放。存活请求保持 outstanding decode。Incoming prefill 可先发射再提交上一批 decode；prefill 自身发布导致页表变化时，仍在为同一请求准备 decode 前完成发布。详见[设计与验收](cpu-gpu-overlap-retirement-2026-10-12.md)。
+
+## CPU/GPU overlap：输入读取边界与 metadata 上传
+
+成功命中的 decode graph 在复制完调度输入到 private buffers 后记录 InputReadFence。独立 upload stream 等待该边界，再用 pinned/non-blocking H2D 更新 DecodeManager buffers；execution stream 等上传完成后消费新 metadata，GPU token relay 仍在 execution stream。Eager/缺桶使用完整完成 fence，KV 回收继续使用 CompletionFence。提供 `--disable-async-metadata` 独立对照。设计、回归和三轮 A/B 见[读取边界记录](cpu-gpu-overlap-input-read-boundary-2026-10-12.md)。
