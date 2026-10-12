@@ -292,6 +292,24 @@ CPU 124 项、CUDA 18 项通过；新增实际 pool allocation 复用、非连�
 
 共享 pool 四阶段完成。后续值得独立推进 Engine CPU/GPU overlap，并重新验证 logits/采样/CPU 元数据的完成边界；共享 pool replay 仍须串行，未消费的非 owning 值不能被下一轮覆盖。
 
+### 5.11 CPU/GPU overlap 第一阶段（已撤销）
+
+已拆分 GPU 采样发射与 CPU 结果取回，让结果发布快照准备在等待 GPU 完成前执行。共享 pool 的 execution stream 与非 owning live range 不变；KV 发布、请求结束和页释放仍在 readback 成功后执行。CUDA 默认开启，提供 `--disable-cpu-gpu-overlap`；CPU/profiling 使用串行路径。
+
+CPU 125、CUDA 21、Python 2 项通过；三轮开启/关闭的 408 对输出一致，三个生成场景吞吐约增加 0.9%–2.0%，显存不变，未证明显著提速。第一阶段仅批内 overlap；跨批 future token IDs、host metadata shadow 与异步完成队列仍待下一阶段。详见[实现和验收](cpu-gpu-overlap-stage1-2026-10-12.md)。
+
+### 5.12 CPU/GPU overlap：decode 跨批流水线
+
+批内快照路径已撤销，保留序列借用发布优化。连续 decode 改用 GPU sampled-token relay 和一批 outstanding 结果；下一轮发射后提交上一轮 CPU 结果。EOS、错误、取消、prefill 和可变 Engine 访问都建立完成边界，完成前不发布或释放受影响的 KV 页。详见[跨批流水线设计与验收](cpu-gpu-overlap-pipeline-2026-10-12.md)。
+
+### 5.13 CPU/GPU overlap：按事件延迟回收
+
+EOS 和取消立即逻辑结束；KV handle、共享前缀 pin 和私有页保留至最后使用该 UID 的 GPU 事件完成。存活请求保持流水线，incoming prefill 可先发射再提交旧 decode。Prefill 发布可能改变自身页表，仍在同一请求下一轮 decode 前建立依赖屏障。设计和验收见[延迟回收记录](cpu-gpu-overlap-retirement-2026-10-12.md)。
+
+### 5.14 CPU/GPU overlap：更早的输入读取边界
+
+Captured decode graph 完成 private input/metadata snapshot 后允许复用 scheduler staging buffers；新增 upload stream 和 pinned/non-blocking H2D，execution stream 用上传完成事件保护消费。KV retirement 和共享 pool GPU forward 串行契约不变。CPU 130、CUDA 24、Python 2 项通过；三模式三轮的 816 对输出一致，三个生成场景相对仅关闭 metadata 优化提升约 8.3%～13.2%。详见[设计和验收](cpu-gpu-overlap-input-read-boundary-2026-10-12.md)。
+
 ## 6. 本阶段范围之外
 
 当前未决定实现同进程多模型驻留、多模态请求、跨进程 worker、Tensor／Expert Parallel、speculative decoding 或所有量化格式。若目标模型的体积或结构要求其中某项，应在阶段 0 明确列为必要前置条件，再安排对应阶段，不能因本文未展开就视为已支持。

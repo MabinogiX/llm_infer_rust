@@ -19,6 +19,8 @@ Options:\n\
   --max-running-req N       Maximum active requests (default 256)\n\
   --cuda-graph-bs N         Maximum CUDA decode graph batch (0 disables)\n\
   --prefill-cuda-graph-max-tokens N  Maximum prefill graph tokens (default 2048; 0 disables)\n\
+  --disable-cpu-gpu-overlap  Disable the one-batch CUDA decode pipeline\n\
+  --disable-async-metadata  Keep metadata uploads on the execution stream\n\
   --max-seq-len N           Maximum sequence length (default 8192; must not exceed model config)\n\
   --page-size N             KV cache page size (default 16)\n\
   --attention-backend NAME  Attention backend: fa, pt, or flashinfer\n\
@@ -49,6 +51,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--tp-size" => engine.tp_size = parse_value(&value()?, &flag)?,
             "--memory-ratio" => engine.memory_ratio = parse_value(&value()?, &flag)?,
             "--max-running-req" => engine.max_running_req = parse_value(&value()?, &flag)?,
+            "--disable-cpu-gpu-overlap" => engine.disable_cpu_gpu_overlap = true,
+            "--disable-async-metadata" => engine.disable_async_metadata = true,
             "--cuda-graph-bs" => engine.cuda_graph_bs = Some(parse_value(&value()?, &flag)?),
             "--prefill-cuda-graph-max-tokens" => {
                 engine.prefill_cuda_graph_max_tokens = parse_value(&value()?, &flag)?
@@ -130,6 +134,24 @@ mod tests {
             parse_args(["--model-path", "/tmp/model", "--cuda-graph-bs", "4"].map(str::to_owned))
                 .unwrap();
         assert_eq!(graph_args.engine.cuda_graph_bs, Some(4));
+        assert!(!args.engine.disable_cpu_gpu_overlap);
+        assert!(!args.engine.disable_async_metadata);
+        assert!(
+            parse_args(
+                ["--model-path", "/tmp/model", "--disable-async-metadata"].map(str::to_owned)
+            )
+            .unwrap()
+            .engine
+            .disable_async_metadata
+        );
+        assert!(
+            parse_args(
+                ["--model-path", "/tmp/model", "--disable-cpu-gpu-overlap"].map(str::to_owned)
+            )
+            .unwrap()
+            .engine
+            .disable_cpu_gpu_overlap
+        );
         let prefill_args = parse_args(
             [
                 "--model-path",

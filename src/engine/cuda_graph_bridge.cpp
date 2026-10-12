@@ -200,3 +200,142 @@ extern "C" at::Tensor* sglang_graph_non_owning_view(const at::Tensor* tensor) {
     return nullptr;
   }
 }
+
+// Own the source and pinned destination until the completion event. Waiting
+// here fences this readback, rather than later forwards on the same stream.
+#include <ATen/cuda/CUDAEvent.h>
+struct SampleReadback {
+  at::Tensor source;
+  at::Tensor host;
+  at::cuda::CUDAEvent done;
+  bool completed = false;
+  explicit SampleReadback(const at::Tensor& ids) : source(ids) {
+    c10::cuda::CUDAGuard guard(ids.device());
+    host = at::empty(ids.sizes(), ids.options().device(at::kCPU).pinned_memory(true));
+    host.copy_(ids, true);
+    done.record(c10::cuda::getCurrentCUDAStream(ids.get_device()));
+  }
+  void wait() {
+    if (!completed) {
+      done.synchronize();
+      completed = true;
+    }
+  }
+  ~SampleReadback() { wait(); }
+};
+extern "C" SampleReadback* sglang_sample_readback_create(const at::Tensor* ids) {
+  try { return new SampleReadback(*ids); }
+  catch (const std::exception& error) { last_error = error.what(); return nullptr; }
+}
+extern "C" at::Tensor* sglang_sample_readback_finish(SampleReadback* pending) {
+  try { pending->wait(); return new at::Tensor(pending->host); }
+  catch (const std::exception& error) { last_error = error.what(); return nullptr; }
+}
+extern "C" int sglang_sample_readback_ready(SampleReadback* pending) {
+  try {
+    if (pending->completed || pending->done.query()) {
+      pending->completed = true;
+      return 1;
+    }
+    return 0;
+  } catch (const std::exception& error) { last_error = error.what(); return -1; }
+}
+extern "C" void sglang_sample_readback_free(SampleReadback* pending) { delete pending; }
+
+// An audited scheduler-input read boundary. This event protects only the
+// source metadata buffers; it never authorizes KV-page reclamation.
+struct InputReadEvent { at::cuda::CUDAEvent done; };
+extern "C" InputReadEvent* sglang_input_read_record(int device) {
+  try {
+    c10::cuda::CUDAGuard guard(device);
+    auto event = std::make_unique<InputReadEvent>();
+    event->done.record(c10::cuda::getCurrentCUDAStream(device));
+    return event.release();
+  } catch (const std::exception& error) { last_error = error.what(); return nullptr; }
+}
+extern "C" bool sglang_input_read_wait(InputReadEvent* event, int device) {
+  try {
+    c10::cuda::CUDAGuard guard(device);
+    event->done.block(c10::cuda::getCurrentCUDAStream(device));
+    return true;
+  } catch (const std::exception& error) { last_error = error.what(); return false; }
+}
+extern "C" void sglang_input_read_free(InputReadEvent* event) { delete event; }
+extern "C" bool sglang_sample_readback_wait_stream(SampleReadback* pending) {
+  try {
+    pending->done.block(c10::cuda::getCurrentCUDAStream(pending->source.get_device()));
+    return true;
+  } catch (const std::exception& error) { last_error = error.what(); return false; }
+}
+
+#include <deque>
+#include <vector>
+struct MetadataUploadJob {
+  std::vector<at::Tensor> sources;
+  at::cuda::CUDAEvent done;
+};
+struct MetadataUpload {
+  int device;
+  c10::cuda::CUDAStream stream;
+  std::unique_ptr<c10::cuda::CUDAStreamGuard> guard;
+  std::vector<at::Tensor> sources;
+  std::deque<std::unique_ptr<MetadataUploadJob>> pending;
+  explicit MetadataUpload(int index)
+      : device(index), stream(c10::cuda::getStreamFromPool(false, index)) {
+    while (stream == c10::cuda::getCurrentCUDAStream(index)) {
+      stream = c10::cuda::getStreamFromPool(false, index);
+    }
+  }
+};
+extern "C" MetadataUpload* sglang_metadata_upload_create(int device) {
+  try { return new MetadataUpload(device); }
+  catch (const std::exception& error) { last_error = error.what(); return nullptr; }
+}
+extern "C" bool sglang_metadata_upload_begin(MetadataUpload* upload) {
+  try {
+    TORCH_CHECK(!upload->guard, "metadata upload is already active");
+    upload->guard = std::make_unique<c10::cuda::CUDAStreamGuard>(upload->stream);
+    while (!upload->pending.empty() && upload->pending.front()->done.query()) {
+      upload->pending.pop_front();
+    }
+    return true;
+  } catch (const std::exception& error) { last_error = error.what(); upload->guard.reset(); return false; }
+}
+extern "C" bool sglang_metadata_upload_copy(MetadataUpload* upload,
+                                            at::Tensor* target, const at::Tensor* source) {
+  try {
+    TORCH_CHECK(upload->guard, "metadata upload has no active stream guard");
+    TORCH_CHECK(source->device().is_cpu() && target->is_cuda() &&
+                target->get_device() == upload->device, "metadata upload device mismatch");
+    auto pinned = at::empty(source->sizes(), source->options().pinned_memory(true));
+    pinned.copy_(*source);
+    // Retain before enqueue: an exception must not free a source still in flight.
+    upload->sources.push_back(pinned);
+    target->copy_(pinned, true);
+    return true;
+  } catch (const std::exception& error) { last_error = error.what(); return false; }
+}
+extern "C" bool sglang_metadata_upload_end(MetadataUpload* upload) {
+  try {
+    TORCH_CHECK(upload->guard, "metadata upload has no active stream guard");
+    auto job = std::make_unique<MetadataUploadJob>();
+    job->sources = std::move(upload->sources);
+    upload->pending.push_back(std::move(job));
+    auto& pending = *upload->pending.back();
+    pending.done.record(upload->stream);
+    upload->guard.reset();
+    // Only GPU work waits; CPU preparation can proceed immediately.
+    pending.done.block(c10::cuda::getCurrentCUDAStream(upload->device));
+    return true;
+  } catch (const std::exception& error) {
+    last_error = error.what();
+    upload->guard.reset();
+    upload->stream.synchronize();
+    return false;
+  }
+}
+extern "C" void sglang_metadata_upload_free(MetadataUpload* upload) {
+  upload->guard.reset();
+  upload->stream.synchronize();
+  delete upload;
+}

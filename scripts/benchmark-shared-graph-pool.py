@@ -184,6 +184,10 @@ def run(args, mode, trial, workload):
             '--max-running-req', '4', '--max-seq-len', '40960', '--page-size', '16',
             '--memory-ratio', '0.4', '--cuda-graph-bs', '4' if enabled else '0',
             '--prefill-cuda-graph-max-tokens', '2048' if enabled else '0']
+        if mode == 'rust-serial':
+            command.append('--disable-cpu-gpu-overlap')
+        if mode == 'rust-no-metadata':
+            command.append('--disable-async-metadata')
         env['LD_PRELOAD'] = str(root / '.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so')
     samples, done = [], threading.Event()
     def sample():
@@ -237,7 +241,7 @@ def run(args, mode, trial, workload):
                 contents = (args.output_dir / f'{name}-server.log').read_text()
                 result['capture_log'] = [line for line in contents.splitlines()
                     if 'shared CUDA graph catalog memory' in line or 'SHARED_POOL_BENCH_CAPTURE ' in line]
-                if mode in ('rust', 'sglang', 'sglang-serial') and not result['capture_log']:
+                if mode in ('rust', 'rust-serial', 'rust-no-metadata', 'sglang', 'sglang-serial') and not result['capture_log']:
                     raise RuntimeError('capture instrumentation missing')
                 path.write_text(json.dumps(result, indent=2))
                 return result
@@ -258,7 +262,7 @@ def run(args, mode, trial, workload):
 def binary_hashes(args):
     """Only binaries actually executed by the selected modes are dependencies."""
     binaries = {}
-    if set(args.modes) & {'rust', 'eager'}:
+    if set(args.modes) & {'rust', 'rust-serial', 'rust-no-metadata', 'eager'}:
         binaries['rust_binary'] = args.repo / 'target/release/sglang-rust'
     if 'rust-stage2' in args.modes:
         binaries['stage2_binary'] = args.stage2_binary
@@ -279,8 +283,8 @@ def main():
     parser.add_argument('--gpu', type=int, default=1)
     parser.add_argument('--port', type=int, default=18114)
     parser.add_argument('--rounds', type=int, default=3)
-    parser.add_argument('--modes', nargs='+', choices=['rust-stage2', 'rust-before-threads', 'rust', 'eager', 'sglang', 'sglang-serial'],
-        default=['rust-stage2', 'rust-before-threads', 'rust', 'eager', 'sglang', 'sglang-serial'])
+    parser.add_argument('--modes', nargs='+', choices=['rust-stage2', 'rust-before-threads', 'rust', 'rust-serial', 'rust-no-metadata', 'eager', 'sglang', 'sglang-serial'],
+        default=['rust-stage2', 'rust-before-threads', 'rust', 'rust-serial', 'rust-no-metadata', 'eager', 'sglang', 'sglang-serial'])
     parser.add_argument('--resume', action='store_true')
     args = parser.parse_args()
     if args.rounds < 1:
@@ -368,16 +372,21 @@ def main():
     comparisons = []
     for trial in range(args.rounds):
         by_mode = {row['mode']: row for row in results if row['trial'] == trial}
-        baseline = 'rust-before-threads' if 'rust-before-threads' in by_mode else 'rust-stage2'
-        if baseline not in by_mode or 'rust' not in by_mode:
+        baselines = [name for name in ('rust-no-metadata', 'rust-serial') if name in by_mode]
+        if not baselines:
+            baselines = ['rust-before-threads' if 'rust-before-threads' in by_mode else 'rust-stage2']
+        if 'rust' not in by_mode:
             continue
-        for case, _, _, concurrency, _ in CASES:
-            old = by_mode[baseline]['cases'][case]['samples']
-            new = by_mode['rust']['cases'][case]['samples']
-            assert [x['key'] for x in old] == [x['key'] for x in new]
-            comparisons.append(dict(trial=trial, baseline=baseline, case=case, concurrency=concurrency,
-                total=len(old), equal=sum(a['output_sha256'] == b['output_sha256'] for a, b in zip(old, new)),
-                differing_keys=[a['key'] for a, b in zip(old, new) if a['output_sha256'] != b['output_sha256']]))
+        for baseline in baselines:
+            if baseline not in by_mode:
+                continue
+            for case, _, _, concurrency, _ in CASES:
+                old = by_mode[baseline]['cases'][case]['samples']
+                new = by_mode['rust']['cases'][case]['samples']
+                assert [x['key'] for x in old] == [x['key'] for x in new]
+                comparisons.append(dict(trial=trial, baseline=baseline, case=case, concurrency=concurrency,
+                    total=len(old), equal=sum(a['output_sha256'] == b['output_sha256'] for a, b in zip(old, new)),
+                    differing_keys=[a['key'] for a, b in zip(old, new) if a['output_sha256'] != b['output_sha256']]))
     (args.output_dir / 'output-comparisons.json').write_text(json.dumps(comparisons, indent=2))
     (args.output_dir / 'summary.json').write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2), flush=True)

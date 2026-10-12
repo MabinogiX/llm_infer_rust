@@ -33,6 +33,10 @@ pub struct ServerArgs {
     pub cuda_graph_bs: Option<usize>,
     /// Maximum aggregate token bucket for segmented prefill graphs; zero disables.
     pub prefill_cuda_graph_max_tokens: usize,
+    /// Disable the one-batch decode pipeline and use blocking execution.
+    pub disable_cpu_gpu_overlap: bool,
+    /// Keep the decode pipeline but stage metadata on the execution stream.
+    pub disable_async_metadata: bool,
     pub max_seq_len: usize,
     pub page_size: usize,
     pub dtype: String,
@@ -50,6 +54,8 @@ impl ServerArgs {
             max_running_req: 256,
             cuda_graph_bs: None,
             prefill_cuda_graph_max_tokens: 2048,
+            disable_cpu_gpu_overlap: false,
+            disable_async_metadata: false,
             max_seq_len: 8192,
             page_size: 16,
             dtype: "auto".to_owned(),
@@ -425,10 +431,36 @@ impl Engine {
             .logits)
     }
 
+    pub(crate) fn forward_with_read_fence(
+        &self,
+        batch: &Batch,
+    ) -> Result<(Tensor, Option<super::InputReadFence>)> {
+        self.ensure_live()?;
+        let runner = self
+            .model_runner
+            .as_ref()
+            .ok_or(EngineError::ModelRunnerNotAttached)?;
+        let (output, fence) = if self.server_args.disable_async_metadata {
+            (runner.forward(batch)?, None)
+        } else {
+            runner.forward_with_read_fence(batch)?
+        };
+        Ok((output.logits, fence))
+    }
+
     /// Samples one token per logits row using request-aligned parameters.
     pub fn sample(&self, logits: &Tensor, params: &[SamplingParams]) -> Result<Vec<i64>> {
         self.ensure_live()?;
         Ok(self.sampler.sample_batch(logits, params)?)
+    }
+
+    pub(crate) fn defer_sample(
+        &self,
+        logits: Tensor,
+        params: &[SamplingParams],
+    ) -> Result<super::sampling::PendingSample> {
+        self.ensure_live()?;
+        Ok(self.sampler.defer_batch(logits, params)?)
     }
 
     fn ensure_live(&self) -> Result<()> {

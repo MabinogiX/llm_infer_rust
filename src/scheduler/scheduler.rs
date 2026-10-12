@@ -19,6 +19,31 @@ pub enum CacheStrategy {
     Naive,
 }
 
+/// Completion boundary for an outstanding forward; the CPU sequence may lag
+/// its device-side token relay by one invocation.
+#[derive(Clone, Copy)]
+struct CompletionInput {
+    written_len: usize,
+    length_finished: bool,
+    ignore_eos: bool,
+}
+
+struct PendingBatch {
+    fence: crate::engine::CompletionFence,
+    phase: BatchPhase,
+    request_ids: Vec<RequestId>,
+    inputs: Vec<CompletionInput>,
+    sample: crate::engine::PendingSample,
+}
+
+/// Own the detached sequence/handle until the last GPU invocation using it
+/// finishes. Logical completion has already been delivered to the caller.
+struct RetiredRequest {
+    request: Request,
+    publish: bool,
+    fence: crate::engine::CompletionFence,
+}
+
 pub struct Scheduler {
     engine: Engine,
     args: ServerArgs,
@@ -29,6 +54,8 @@ pub struct Scheduler {
     decode: DecodeManager,
     aborted: VecDeque<OutputToken>,
     last_step_error: Option<EngineError>,
+    outstanding: Option<PendingBatch>,
+    retired: VecDeque<RetiredRequest>,
 }
 
 impl Scheduler {
@@ -65,6 +92,8 @@ impl Scheduler {
             decode,
             aborted: VecDeque::new(),
             last_step_error: None,
+            outstanding: None,
+            retired: VecDeque::new(),
         })
     }
 
@@ -73,6 +102,11 @@ impl Scheduler {
     }
 
     pub fn engine_mut(&mut self) -> &mut Engine {
+        // Model/graph/KV replacement must not race an outstanding forward.
+        let mut outputs = Vec::new();
+        self.drain_outstanding(&mut outputs);
+        self.reap_retired(true);
+        self.aborted.extend(outputs);
         &mut self.engine
     }
 
@@ -124,13 +158,21 @@ impl Scheduler {
         Ok(uid)
     }
 
-    /// Removes a waiting or running request and releases its cache references.
+    /// Cancel logically now; a handle still used by the outstanding invocation
+    /// is detached and released only after its completion event.
     pub fn abort_request(&mut self, uid: RequestId) -> bool {
-        self.prefill.abort(uid)
+        if self.prefill.running_request(uid).is_some() {
+            self.retire_request(uid, false);
+            true
+        } else {
+            self.prefill.abort(uid)
+        }
     }
 
     pub fn is_idle(&self) -> bool {
-        self.prefill.pending_len() == 0
+        self.outstanding.is_none()
+            && self.retired.is_empty()
+            && self.prefill.pending_len() == 0
             && self.prefill.running_len() == 0
             && !self.prefill.has_aborted()
             && self.aborted.is_empty()
@@ -138,6 +180,21 @@ impl Scheduler {
 
     /// Runs prefill followed by decode for every request still running.
     pub fn step(&mut self) -> Result<Vec<OutputToken>> {
+        if cfg!(has_cuda_graph)
+            && self.engine.device().is_cuda()
+            && !self.args.disable_cpu_gpu_overlap
+            && !crate::logging::step_timing_enabled()
+        {
+            return self.step_overlap();
+        }
+        let mut outputs = Vec::new();
+        self.drain_outstanding(&mut outputs);
+        self.reap_retired(true);
+        outputs.extend(self.step_serial()?);
+        Ok(outputs)
+    }
+
+    fn step_serial(&mut self) -> Result<Vec<OutputToken>> {
         self.last_step_error = None;
         let (batch, schedule_us) =
             time_schedule(self.engine.device(), || self.prefill.schedule_prefill());
@@ -224,44 +281,64 @@ impl Scheduler {
                 })
         });
         let success = sampled.is_ok();
-        profiler.measure(StepStage::Publish, || match sampled {
+        if !success {
+            self.synchronize();
+        }
+        profiler.measure(StepStage::Publish, || {
+            self.complete(request_ids, None, phase, sampled, results);
+        });
+        profiler.log(phase, profile_requests.as_deref().unwrap_or(&[]), success);
+        Ok(())
+    }
+
+    fn complete(
+        &mut self,
+        request_ids: Vec<RequestId>,
+        inputs: Option<Vec<CompletionInput>>,
+        phase: BatchPhase,
+        sampled: std::result::Result<Vec<i64>, EngineError>,
+        results: &mut Vec<OutputToken>,
+    ) {
+        match sampled {
             Ok(tokens) => {
                 let mut finished = Vec::new();
-                for (uid, token_id) in request_ids.into_iter().zip(tokens) {
-                    // The current sequence is exactly what this forward wrote.
-                    // The newly sampled token has not entered KV yet.
-                    let (written_ids, reason) = {
-                        let request = self
-                            .prefill
-                            .running_request(uid)
-                            .expect("scheduled request is running");
-                        let reason = if self.eos_token_ids.contains(&token_id)
-                            && !request.sampling_params.ignore_eos
-                        {
-                            Some(FinishReason::Stop)
-                        } else if request.output_len + 1 >= request.sampling_params.max_tokens
-                            || request.input_ids.len() + 1 >= self.args.max_seq_len
-                        {
-                            Some(FinishReason::Length)
-                        } else {
-                            None
-                        };
-                        (request.input_ids.clone(), reason)
-                    };
+                for (row, (uid, token_id)) in request_ids.into_iter().zip(tokens).enumerate() {
+                    // Aborted rows, including their speculative sampled tokens,
+                    // are ignored after the outstanding invocation is fenced.
+                    if self.prefill.running_request(uid).is_none() {
+                        continue;
+                    }
+                    let input = inputs
+                        .as_ref()
+                        .map(|inputs| inputs[row])
+                        .unwrap_or_else(|| self.completion_input(uid));
+                    let reason = self.finish_reason(input, token_id);
+                    if reason.is_some() && self.resource_fence(uid).is_some() {
+                        self.prefill.mark_written(uid, input.written_len);
+                        self.prefill
+                            .running_request_mut(uid)
+                            .unwrap()
+                            .append_token(token_id);
+                        self.retire_request(uid, true);
+                        results.push(OutputToken {
+                            uid,
+                            token_id,
+                            finished: true,
+                            finish_reason: reason,
+                        });
+                        continue;
+                    }
                     if phase == BatchPhase::Prefill || reason.is_some() {
-                        if let Err(error) = self.prefill.publish(uid, &written_ids) {
+                        if let Err(error) = self.prefill.publish(uid) {
                             tracing::error!(uid, error = %error, "KV cache publish failed");
                             self.prefill.remove_batch(&[uid]);
                             results.push(self.terminal_result(uid, FinishReason::Error));
                             continue;
                         }
                     } else {
-                        self.prefill.mark_written(uid, written_ids.len());
+                        self.prefill.mark_written(uid, input.written_len);
                     }
-                    let request = self
-                        .prefill
-                        .running_request_mut(uid)
-                        .expect("scheduled request is running");
+                    let request = self.prefill.running_request_mut(uid).unwrap();
                     request.append_token(token_id);
                     if reason.is_some() {
                         request.status = SequenceStatus::Finished;
@@ -278,16 +355,330 @@ impl Scheduler {
             }
             Err(error) => {
                 self.last_step_error = Some(error);
-                self.prefill.remove_batch(&request_ids);
-                results.extend(
-                    request_ids
-                        .into_iter()
-                        .map(|uid| self.terminal_result(uid, FinishReason::Error)),
-                );
+                for uid in request_ids {
+                    if self.prefill.running_request(uid).is_some() {
+                        self.retire_request(uid, false);
+                        results.push(self.terminal_result(uid, FinishReason::Error));
+                    }
+                }
             }
-        });
-        profiler.log(phase, profile_requests.as_deref().unwrap_or(&[]), success);
-        Ok(())
+        }
+    }
+
+    fn resource_fence(&self, uid: RequestId) -> Option<crate::engine::CompletionFence> {
+        self.outstanding
+            .as_ref()
+            .filter(|batch| batch.request_ids.contains(&uid))
+            .map(|batch| batch.fence.clone())
+    }
+
+    fn retire_request(&mut self, uid: RequestId, publish: bool) {
+        let fence = self.resource_fence(uid);
+        let mut request = self
+            .prefill
+            .retire(uid)
+            .expect("retired request is running");
+        request.status = SequenceStatus::Finished;
+        if let Some(fence) = fence {
+            self.retired.push_back(RetiredRequest {
+                request,
+                publish,
+                fence,
+            });
+        } else {
+            self.release_retired(request, publish);
+        }
+    }
+
+    fn release_retired(&mut self, request: Request, publish: bool) {
+        let uid = request.uid;
+        if let Err(error) = self.prefill.release_retired(request, publish) {
+            // Logical terminal output was already emitted. Cache maintenance
+            // failure is reported here, without emitting a second terminal.
+            tracing::error!(uid, error = %error, "deferred KV cache publish failed");
+            self.last_step_error = Some(EngineError::KVCache(error));
+        }
+    }
+
+    fn reap_retired(&mut self, wait: bool) {
+        let count = self.retired.len();
+        for _ in 0..count {
+            let retired = self.retired.pop_front().unwrap();
+            let ready = if wait {
+                retired.fence.wait().map(|()| true)
+            } else {
+                retired.fence.ready()
+            };
+            match ready {
+                Ok(true) => self.release_retired(retired.request, retired.publish),
+                Ok(false) => self.retired.push_back(retired),
+                Err(error) => {
+                    // A failed event query/readback is exceptional. Fence all
+                    // device access before the error cleanup can release pages.
+                    self.synchronize();
+                    self.last_step_error = Some(EngineError::Sampling(error));
+                    self.release_retired(retired.request, retired.publish);
+                }
+            }
+        }
+    }
+
+    fn finish_reason(&self, input: CompletionInput, token_id: i64) -> Option<FinishReason> {
+        if self.eos_token_ids.contains(&token_id) && !input.ignore_eos {
+            Some(FinishReason::Stop)
+        } else if input.length_finished {
+            Some(FinishReason::Length)
+        } else {
+            None
+        }
+    }
+
+    fn synchronize(&self) {
+        if let tch::Device::Cuda(device) = self.engine.device() {
+            tch::Cuda::synchronize(device as i64);
+        }
+    }
+
+    fn launch_decode(
+        &mut self,
+        batch: super::decode::DecodeBatch,
+        future: Option<&[(RequestId, usize)]>,
+    ) -> std::result::Result<PendingBatch, EngineError> {
+        self.launch_batch(batch.request_ids, batch.model_batch, future)
+    }
+
+    fn launch_batch(
+        &mut self,
+        request_ids: Vec<RequestId>,
+        model_batch: Batch,
+        future: Option<&[(RequestId, usize)]>,
+    ) -> std::result::Result<PendingBatch, EngineError> {
+        let params = request_ids
+            .iter()
+            .map(|uid| self.prefill.running_request(*uid).unwrap().sampling_params)
+            .collect::<Vec<_>>();
+        let inputs = request_ids
+            .iter()
+            .map(|uid| {
+                let request = self.prefill.running_request(*uid).unwrap();
+                let written_len = future
+                    .and_then(|rows| rows.iter().find(|(id, _)| id == uid))
+                    .map(|(_, len)| *len)
+                    .unwrap_or(request.input_ids.len());
+                let output_len = request.output_len + 1 + written_len - request.input_ids.len();
+                CompletionInput {
+                    written_len,
+                    length_finished: output_len >= request.sampling_params.max_tokens
+                        || written_len + 1 >= self.args.max_seq_len,
+                    ignore_eos: request.sampling_params.ignore_eos,
+                }
+            })
+            .collect();
+        let sample =
+            self.engine
+                .forward_with_read_fence(&model_batch)
+                .and_then(|(logits, read_done)| {
+                    let sample = self.engine.defer_sample(logits, &params)?;
+                    if model_batch.phase == BatchPhase::Decode {
+                        self.decode.set_read_boundary(read_done, sample.fence());
+                    }
+                    Ok(sample)
+                });
+        match sample {
+            Ok(sample) => Ok(PendingBatch {
+                fence: sample.fence(),
+                phase: model_batch.phase,
+                request_ids: request_ids,
+                inputs,
+                sample,
+            }),
+            Err(error) => {
+                self.synchronize();
+                Err(error)
+            }
+        }
+    }
+
+    fn read_pending(
+        pending: PendingBatch,
+    ) -> (
+        BatchPhase,
+        Vec<RequestId>,
+        Vec<CompletionInput>,
+        std::result::Result<Vec<i64>, EngineError>,
+    ) {
+        let PendingBatch {
+            fence: _,
+            phase,
+            request_ids,
+            inputs,
+            sample,
+        } = pending;
+        let tokens = sample
+            .finish()
+            .map_err(EngineError::from)
+            .and_then(|tokens| {
+                if tokens.len() == request_ids.len() {
+                    Ok(tokens)
+                } else {
+                    Err(EngineError::InvalidArgument(
+                        "sampled token count differs from batch size".into(),
+                    ))
+                }
+            });
+        (phase, request_ids, inputs, tokens)
+    }
+
+    fn drain_outstanding(&mut self, results: &mut Vec<OutputToken>) {
+        if let Some(pending) = self.outstanding.take() {
+            let (phase, ids, inputs, tokens) = Self::read_pending(pending);
+            self.complete(ids, Some(inputs), phase, tokens, results);
+        }
+        self.reap_retired(false);
+    }
+
+    fn step_overlap(&mut self) -> Result<Vec<OutputToken>> {
+        self.last_step_error = None;
+        let mut results: Vec<_> = self.aborted.drain(..).collect();
+        self.reap_retired(false);
+        // A prefill's publish may canonicalize its pages. Wait for that
+        // invocation and publish before planning decode for those same rows.
+        // Incoming prefill alone does not require draining an old decode.
+        if self
+            .outstanding
+            .as_ref()
+            .is_some_and(|batch| batch.phase == BatchPhase::Prefill)
+        {
+            self.drain_outstanding(&mut results);
+        }
+        if let Some(previous) = self.outstanding.take() {
+            let prefill = match self.prefill.schedule_prefill() {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.outstanding = Some(previous);
+                    self.drain_outstanding(&mut results);
+                    self.aborted.extend(results);
+                    return Err(error);
+                }
+            };
+            let (next_ids, next_phase, next) = if let Some(batch) = prefill {
+                let ids = batch.request_ids.clone();
+                (
+                    ids,
+                    BatchPhase::Prefill,
+                    self.launch_batch(batch.request_ids, batch.model_batch, None)
+                        .map(Some),
+                )
+            } else {
+                let future = previous
+                    .request_ids
+                    .iter()
+                    .zip(&previous.inputs)
+                    .map(|(uid, input)| {
+                        (
+                            *uid,
+                            if input.length_finished {
+                                0
+                            } else {
+                                input.written_len + 1
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let relay = previous.sample.relay();
+                let batch = match self.decode.schedule_relay(
+                    self.prefill.running_requests(),
+                    &future,
+                    &relay,
+                ) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        self.outstanding = Some(previous);
+                        self.drain_outstanding(&mut results);
+                        self.aborted.extend(results);
+                        return Err(error);
+                    }
+                };
+                let ids = batch
+                    .as_ref()
+                    .map(|batch| batch.request_ids.clone())
+                    .unwrap_or_default();
+                (
+                    ids,
+                    BatchPhase::Decode,
+                    batch
+                        .map(|batch| self.launch_decode(batch, Some(&future)))
+                        .transpose(),
+                )
+            };
+            let (phase, ids, inputs, tokens) = Self::read_pending(previous);
+            match next {
+                Err(error) => {
+                    // Launch errors already fence queued GPU operations.
+                    self.complete(ids, Some(inputs), phase, tokens, &mut results);
+                    self.complete(next_ids, None, next_phase, Err(error), &mut results);
+                }
+                Ok(next) => {
+                    // Install the last-use fence before logical completion can
+                    // detach EOS/error rows. Survivor commits never wait on it.
+                    self.outstanding = next;
+                    self.complete(ids, Some(inputs), phase, tokens, &mut results);
+                }
+            }
+            self.reap_retired(false);
+            results.extend(
+                self.prefill
+                    .drain_aborted()
+                    .into_iter()
+                    .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
+            );
+            return Ok(results);
+        }
+        // No GPU invocation remains; any detached handle can now be reclaimed.
+        self.reap_retired(true);
+        let (batch, schedule_us) =
+            time_schedule(self.engine.device(), || self.prefill.schedule_prefill());
+        if let Some(batch) = batch? {
+            self.run_phase(
+                batch.request_ids,
+                batch.model_batch,
+                BatchPhase::Prefill,
+                schedule_us,
+                &mut results,
+            )?;
+        }
+        results.extend(
+            self.prefill
+                .drain_aborted()
+                .into_iter()
+                .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
+        );
+        if let Some(batch) = self
+            .decode
+            .schedule_pipeline(self.prefill.running_requests())?
+        {
+            let ids = batch.request_ids.clone();
+            match self.launch_decode(batch, None) {
+                Ok(pending) => self.outstanding = Some(pending),
+                Err(error) => {
+                    self.complete(ids, None, BatchPhase::Decode, Err(error), &mut results)
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn completion_input(&self, uid: RequestId) -> CompletionInput {
+        let request = self
+            .prefill
+            .running_request(uid)
+            .expect("scheduled request is running");
+        CompletionInput {
+            written_len: request.input_ids.len(),
+            length_finished: request.output_len + 1 >= request.sampling_params.max_tokens
+                || request.input_ids.len() + 1 >= self.args.max_seq_len,
+            ignore_eos: request.sampling_params.ignore_eos,
+        }
     }
 
     // Abort/error events carry a placeholder token when the model has no EOS.
@@ -299,6 +690,19 @@ impl Scheduler {
             finished: true,
             finish_reason: Some(reason),
         }
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        // Fence before engine, graph catalog, and cache managers are dropped.
+        if let Some(batch) = &self.outstanding {
+            if batch.fence.wait().is_err() {
+                self.synchronize();
+            }
+        }
+        drop(self.outstanding.take());
+        self.reap_retired(true);
     }
 }
 
@@ -341,6 +745,16 @@ mod tests {
         max_running_req: usize,
         max_seq_len: usize,
     ) -> (Scheduler, PathBuf) {
+        scheduler_with_execution(strategy, max_running_req, max_seq_len, Device::Cpu, false)
+    }
+
+    fn scheduler_with_execution(
+        strategy: CacheStrategy,
+        max_running_req: usize,
+        max_seq_len: usize,
+        device: Device,
+        disable_overlap: bool,
+    ) -> (Scheduler, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -355,7 +769,8 @@ mod tests {
         args.max_running_req = max_running_req;
         args.max_seq_len = max_seq_len;
         args.page_size = 2;
-        let engine = Engine::new(
+        args.disable_cpu_gpu_overlap = disable_overlap;
+        let engine = Engine::with_runtime(
             args,
             RuntimeModelConfig {
                 num_layers: 1,
@@ -365,6 +780,8 @@ mod tests {
                 ..Default::default()
             },
             0,
+            tch::Kind::Float,
+            device,
         )
         .unwrap();
         (
@@ -444,7 +861,9 @@ mod tests {
                 for row in 0..rows as usize {
                     logits[row * 9 + self.0 as usize] = 1.0;
                 }
-                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+                Ok(Tensor::from_slice(&logits)
+                    .view([rows, 9])
+                    .to_device(batch.input_ids.device()))
             })()
             .map(crate::engine::ForwardOutput::new)
         }
@@ -509,7 +928,9 @@ mod tests {
                 for row in 0..rows as usize {
                     logits[row * 9 + 3] = 1.0;
                 }
-                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+                Ok(Tensor::from_slice(&logits)
+                    .view([rows, 9])
+                    .to_device(batch.input_ids.device()))
             })()
             .map(crate::engine::ForwardOutput::new)
         }
@@ -545,10 +966,745 @@ mod tests {
                 for row in 0..rows as usize {
                     logits[row * 9 + 3] = 1.0;
                 }
-                Ok(Tensor::from_slice(&logits).view([rows, 9]))
+                Ok(Tensor::from_slice(&logits)
+                    .view([rows, 9])
+                    .to_device(batch.input_ids.device()))
             })()
             .map(crate::engine::ForwardOutput::new)
         }
+    }
+
+    #[cfg(all(has_flashinfer, has_cuda_graph))]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_completion_overlap_matches_serial_lifecycle_and_errors() {
+        let device = Device::Cuda(0);
+        for strategy in [CacheStrategy::Radix, CacheStrategy::Naive] {
+            let mut pair = [
+                scheduler_with_execution(strategy, 4, 16, device, false),
+                scheduler_with_execution(strategy, 4, 16, device, true),
+            ];
+            for (scheduler, _) in &mut pair {
+                scheduler
+                    .engine_mut()
+                    .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), device))
+                    .unwrap();
+                for (ids, max, temperature) in [
+                    (vec![1, 2], 3, 0.),
+                    (vec![1, 2], 1, 1.),
+                    (vec![5, 6], 5, 0.),
+                ] {
+                    scheduler
+                        .add_request(
+                            ids,
+                            SamplingParams {
+                                max_tokens: max,
+                                temperature,
+                                top_k: 1,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+            let mut traces = vec![];
+            for (scheduler, _) in &mut pair {
+                let mut trace = vec![scheduler.step().unwrap()];
+                scheduler.drain_outstanding(&mut trace[0]);
+                assert!(scheduler.abort_request(2));
+                scheduler
+                    .add_request(
+                        vec![1, 2, 3],
+                        SamplingParams {
+                            max_tokens: 1,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                let mut outputs = scheduler.step().unwrap();
+                scheduler.drain_outstanding(&mut outputs);
+                trace.push(outputs);
+                assert!(scheduler.is_idle());
+                // EOS, including the distinct stop-vs-length precedence.
+                scheduler
+                    .engine_mut()
+                    .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(7)), device))
+                    .unwrap();
+                scheduler
+                    .add_request(
+                        vec![4],
+                        SamplingParams {
+                            max_tokens: 1,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                trace.push(scheduler.step().unwrap());
+                assert_eq!(
+                    trace.last().unwrap()[0].finish_reason,
+                    Some(FinishReason::Stop)
+                );
+                // A failed decode preserves the preceding prefill token and
+                // releases the failing request only after forward completes.
+                scheduler
+                    .engine_mut()
+                    .attach_model_runner(ModelRunner::new(Box::new(DecodeFailModel), device))
+                    .unwrap();
+                scheduler
+                    .add_request(
+                        vec![6],
+                        SamplingParams {
+                            max_tokens: 5,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                trace.push(scheduler.step().unwrap());
+                assert_eq!(
+                    trace.last().unwrap().last().unwrap().finish_reason,
+                    Some(FinishReason::Error)
+                );
+                assert!(scheduler.is_idle());
+                traces.push((
+                    trace,
+                    scheduler.engine().kv_cache_pool().unwrap().free_count(),
+                ));
+            }
+            assert_eq!(traces[0], traces[1]);
+            for (_, path) in pair {
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+        // Publish can fail after installing a valid radix prefix. Both modes
+        // must isolate that request without freeing the newly shared page.
+        let mut outcomes = vec![];
+        for disable in [false, true] {
+            let (mut scheduler, path) =
+                scheduler_with_execution(CacheStrategy::Radix, 2, 4, device, disable);
+            scheduler
+                .engine_mut()
+                .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), device))
+                .unwrap();
+            let pool = scheduler.engine.shared_kv_cache_pool().unwrap();
+            let cache = Box::new(FailSecondPublish {
+                inner: RadixCacheManager::new(pool, 2).unwrap(),
+                calls: 0,
+            });
+            scheduler.prefill = PrefillManager::new(
+                &scheduler.args,
+                cache,
+                BatchContext::new(2, 4, 2, device).unwrap(),
+            );
+            for ids in [vec![1, 2], vec![3, 4]] {
+                scheduler
+                    .add_request(
+                        ids,
+                        SamplingParams {
+                            max_tokens: 1,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            let results = scheduler.step().unwrap();
+            assert_eq!(results[1].finish_reason, Some(FinishReason::Error));
+            assert!(scheduler.is_idle());
+            outcomes.push((
+                results,
+                scheduler.engine().kv_cache_pool().unwrap().free_count(),
+            ));
+            fs::remove_dir_all(path).unwrap();
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    #[derive(Default)]
+    struct RelayTokenModel {
+        cache: Option<crate::engine::kvcache::ModelKvCache>,
+    }
+
+    impl ModelExecutor for RelayTokenModel {
+        fn bind_state_cache(
+            &mut self,
+            cache: crate::engine::kvcache::ModelKvCache,
+        ) -> std::result::Result<(), ModelRunnerError> {
+            self.cache = Some(cache);
+            Ok(())
+        }
+
+        fn forward(
+            &self,
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let ids = batch.input_ids.view([-1]);
+            if let Some(cache) = &self.cache {
+                let slots = batch
+                    .attention
+                    .unwrap()
+                    .write_loc
+                    .as_ref()
+                    .unwrap()
+                    .to_kind(tch::Kind::Int64);
+                for layer in &cache.layers {
+                    let shape = layer.k.size();
+                    let values = ids
+                        .to_kind(layer.k.kind())
+                        .view([-1, 1, 1])
+                        .expand([-1, shape[2], shape[3]], true);
+                    let v_values = (&ids + batch.positions.view([-1]) * 10)
+                        .to_kind(layer.v.kind())
+                        .view([-1, 1, 1])
+                        .expand([-1, shape[2], shape[3]], true);
+                    let _ = layer
+                        .k
+                        .view([-1, shape[2], shape[3]])
+                        .index_copy_(0, &slots, &values);
+                    let _ = layer
+                        .v
+                        .view([-1, shape[2], shape[3]])
+                        .index_copy_(0, &slots, &v_values);
+                }
+            }
+            let ids = match batch.logits_indices() {
+                Some(indices) => ids.index_select(0, indices),
+                None => ids,
+            };
+            // Next token depends on the actual device input; a stale CPU token
+            // or wrong relay row changes the entire generated sequence.
+            let next = (ids + 1).remainder(9).unsqueeze(1);
+            let logits = Tensor::zeros(
+                [next.size()[0], 9],
+                (tch::Kind::Float, batch.input_ids.device()),
+            )
+            .scatter_value(1, &next, 10.);
+            Ok(crate::engine::ForwardOutput::new(logits))
+        }
+    }
+
+    fn exercise_pipeline(device: Device) {
+        for strategy in [CacheStrategy::Radix, CacheStrategy::Naive] {
+            let mut outcomes = Vec::new();
+            for pipeline in [false, true] {
+                let (mut scheduler, path) =
+                    scheduler_with_execution(strategy, 4, 32, device, !pipeline);
+                scheduler
+                    .engine_mut()
+                    .attach_model_runner(ModelRunner::new(
+                        Box::new(RelayTokenModel::default()),
+                        device,
+                    ))
+                    .unwrap();
+                for (ids, max_tokens, ignore_eos) in [
+                    (vec![1, 2], 8, false),
+                    (vec![5], 8, false),
+                    (vec![0, 1], 8, true),
+                ] {
+                    scheduler
+                        .add_request(
+                            ids,
+                            SamplingParams {
+                                max_tokens,
+                                ignore_eos,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                }
+                let mut outputs = if pipeline {
+                    scheduler.step_overlap().unwrap()
+                } else {
+                    scheduler.step_serial().unwrap()
+                };
+                if pipeline {
+                    assert!(scheduler.outstanding.is_some());
+                }
+                let mut iterations = 0;
+                while !scheduler.is_idle() {
+                    outputs.extend(if pipeline {
+                        scheduler.step_overlap().unwrap()
+                    } else {
+                        scheduler.step_serial().unwrap()
+                    });
+                    iterations += 1;
+                    assert!(iterations < 32);
+                }
+                let mut rows = std::collections::BTreeMap::<_, Vec<_>>::new();
+                for output in outputs {
+                    rows.entry(output.uid)
+                        .or_default()
+                        .push((output.token_id, output.finish_reason));
+                }
+                assert_eq!(
+                    rows[&0].iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    vec![3, 4, 5, 6, 7]
+                );
+                assert_eq!(rows[&1], vec![(6, None), (7, Some(FinishReason::Stop))]);
+                assert_eq!(rows[&2].len(), 8);
+                assert_eq!(rows[&2].last().unwrap().1, Some(FinishReason::Length));
+                // The cached prefix excludes the EOS token, despite the extra
+                // speculative forward having consumed it before CPU EOS handling.
+                scheduler
+                    .add_request(
+                        vec![1, 2, 3, 4, 5, 6, 7, 8],
+                        SamplingParams {
+                            max_tokens: 1,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                let batch = scheduler.prefill.schedule_prefill().unwrap().unwrap();
+                assert_eq!(batch.request_ids, vec![3]);
+                if strategy == CacheStrategy::Radix {
+                    assert_eq!(scheduler.prefill.running_request(3).unwrap().cached_len, 6);
+                    let request = scheduler.prefill.running_request(3).unwrap();
+                    let handle = request.cache_handle.as_ref().unwrap();
+                    let cache = scheduler
+                        .engine()
+                        .kv_cache_pool()
+                        .unwrap()
+                        .get_layer_kv_cache(0)
+                        .unwrap();
+                    for position in 0..request.cached_len {
+                        let page = handle.page_ids[position / 2] as i64;
+                        let offset = (position % 2) as i64;
+                        assert_eq!(
+                            cache.k.get(page).get(offset).double_value(&[0, 0]),
+                            request.input_ids[position] as f64
+                        );
+                        assert_eq!(
+                            cache.v.get(page).get(offset).double_value(&[0, 0]),
+                            (request.input_ids[position] + position as i64 * 10) as f64
+                        );
+                    }
+                }
+                scheduler.abort_request(3);
+                outcomes.push((
+                    rows,
+                    scheduler.engine().kv_cache_pool().unwrap().free_count(),
+                ));
+                fs::remove_dir_all(path).unwrap();
+            }
+            assert_eq!(outcomes[0], outcomes[1]);
+        }
+        // Cancellation detaches pending rows; new prefill overlaps prior commit.
+        let (mut scheduler, path) =
+            scheduler_with_execution(CacheStrategy::Radix, 2, 16, device, false);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(
+                Box::new(RelayTokenModel::default()),
+                device,
+            ))
+            .unwrap();
+        scheduler
+            .add_request(
+                vec![1, 2],
+                SamplingParams {
+                    max_tokens: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler
+            .add_request(
+                vec![0, 1],
+                SamplingParams {
+                    max_tokens: 5,
+                    ignore_eos: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut survivor = scheduler
+            .step_overlap()
+            .unwrap()
+            .into_iter()
+            .filter(|output| output.uid == 1)
+            .collect::<Vec<_>>();
+        assert!(scheduler.outstanding.is_some());
+        assert!(scheduler.abort_request(0));
+        while !scheduler.is_idle() {
+            let outputs = scheduler.step_overlap().unwrap();
+            assert!(outputs.iter().all(|output| output.uid != 0));
+            survivor.extend(outputs);
+        }
+        assert_eq!(
+            survivor
+                .iter()
+                .map(|output| output.token_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 5, 6]
+        );
+        // Re-enter the pipeline and interrupt it with an incoming prefill.
+        scheduler
+            .add_request(
+                vec![0, 1],
+                SamplingParams {
+                    max_tokens: 4,
+                    ignore_eos: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler.step_overlap().unwrap();
+        assert!(scheduler.outstanding.is_some());
+        scheduler
+            .add_request(
+                vec![4],
+                SamplingParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let outputs = scheduler.step_overlap().unwrap();
+        assert!(outputs.iter().all(|output| output.uid != 0));
+        while !scheduler.is_idle() {
+            scheduler.step_overlap().unwrap();
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn terminal_output_and_cancel_hold_pages_until_their_fence() {
+        for cancel in [false, true] {
+            let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 1, 16);
+            scheduler
+                .engine_mut()
+                .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), Device::Cpu))
+                .unwrap();
+            scheduler
+                .add_request(
+                    vec![1, 2],
+                    SamplingParams {
+                        max_tokens: 8,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            scheduler.step_overlap().unwrap();
+            let (fence, ready) = crate::engine::CompletionFence::controlled();
+            scheduler.outstanding.as_mut().unwrap().fence = fence;
+            let free = scheduler.engine().kv_cache_pool().unwrap().free_count();
+            let private_pages = scheduler
+                .prefill
+                .running_request(0)
+                .unwrap()
+                .cache_handle
+                .as_ref()
+                .unwrap()
+                .num_pages()
+                - 1;
+            let mut outputs = Vec::new();
+            if cancel {
+                assert!(scheduler.abort_request(0));
+            } else {
+                let input = scheduler.completion_input(0);
+                scheduler.complete(
+                    vec![0],
+                    Some(vec![input]),
+                    BatchPhase::Decode,
+                    Ok(vec![7]),
+                    &mut outputs,
+                );
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].finish_reason, Some(FinishReason::Stop));
+            }
+            assert!(scheduler.prefill.running_request(0).is_none());
+            assert_eq!(scheduler.retired.len(), 1);
+            assert!(!ready.get()); // No blocking wait happened at logical finish.
+            scheduler.reap_retired(false);
+            assert_eq!(
+                scheduler.engine().kv_cache_pool().unwrap().free_count(),
+                free
+            );
+            assert_eq!(scheduler.retired.len(), 1);
+            assert!(!scheduler.is_idle());
+            // Detachment opens a request slot, but the old pages remain owned.
+            scheduler
+                .add_request(
+                    vec![1, 2, 4],
+                    SamplingParams {
+                        max_tokens: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let batch = scheduler.prefill.schedule_prefill().unwrap().unwrap();
+            assert_eq!(batch.request_ids, vec![1]);
+            assert_eq!(scheduler.prefill.running_request(1).unwrap().cached_len, 2);
+            drop(batch);
+            let free = scheduler.engine().kv_cache_pool().unwrap().free_count();
+            ready.set(true);
+            scheduler.reap_retired(false);
+            assert!(scheduler.retired.is_empty());
+            assert_eq!(
+                scheduler.engine().kv_cache_pool().unwrap().free_count(),
+                free + private_pages
+            );
+            assert!(scheduler.abort_request(1));
+            let mut discarded = Vec::new();
+            scheduler.drain_outstanding(&mut discarded);
+            assert!(discarded.is_empty());
+            assert!(scheduler.is_idle());
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn deferred_publish_failure_releases_private_pages_without_second_terminal() {
+        let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 1, 16);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), Device::Cpu))
+            .unwrap();
+        let pool = scheduler.engine.shared_kv_cache_pool().unwrap();
+        scheduler.prefill = PrefillManager::new(
+            &scheduler.args,
+            Box::new(FailSecondPublish {
+                inner: RadixCacheManager::new(pool, 2).unwrap(),
+                calls: 0,
+            }),
+            BatchContext::new(1, 16, 2, Device::Cpu).unwrap(),
+        );
+        scheduler
+            .add_request(
+                vec![1, 2],
+                SamplingParams {
+                    max_tokens: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler.step_serial().unwrap();
+        let batch = scheduler
+            .decode
+            .schedule_decode(scheduler.prefill.running_requests())
+            .unwrap()
+            .unwrap();
+        let mut pending = scheduler.launch_decode(batch, None).unwrap();
+        let (fence, ready) = crate::engine::CompletionFence::controlled();
+        pending.fence = fence;
+        scheduler.outstanding = Some(pending);
+        let free = scheduler.engine().kv_cache_pool().unwrap().free_count();
+        let input = scheduler.completion_input(0);
+        let mut outputs = Vec::new();
+        scheduler.complete(
+            vec![0],
+            Some(vec![input]),
+            BatchPhase::Decode,
+            Ok(vec![7]),
+            &mut outputs,
+        );
+        assert_eq!(outputs[0].finish_reason, Some(FinishReason::Stop));
+        assert!(scheduler.last_step_error().is_none());
+        ready.set(true);
+        scheduler.reap_retired(false);
+        assert!(matches!(
+            scheduler.last_step_error(),
+            Some(EngineError::KVCache(_))
+        ));
+        // Deferred publish installed a second canonical page before failing.
+        // Release returns the three remaining private pages exactly once.
+        assert_eq!(
+            scheduler.engine().kv_cache_pool().unwrap().free_count(),
+            free + 3
+        );
+        scheduler.drain_outstanding(&mut outputs);
+        assert_eq!(outputs.len(), 1);
+        assert!(scheduler.is_idle());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_eos_and_prefill_switch(device: Device) {
+        for cancel_prefill in [false, true] {
+            let (mut scheduler, path) =
+                scheduler_with_execution(CacheStrategy::Radix, 4, 32, device, false);
+            scheduler
+                .engine_mut()
+                .attach_model_runner(ModelRunner::new(
+                    Box::new(RelayTokenModel::default()),
+                    device,
+                ))
+                .unwrap();
+            scheduler
+                .add_request(
+                    vec![5],
+                    SamplingParams {
+                        max_tokens: 8,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            scheduler
+                .add_request(
+                    vec![0, 1],
+                    SamplingParams {
+                        max_tokens: 6,
+                        ignore_eos: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let mut outputs = scheduler.step_overlap().unwrap();
+            let eos = scheduler.step_overlap().unwrap();
+            assert_eq!(
+                eos.iter()
+                    .map(|row| (row.uid, row.token_id))
+                    .collect::<Vec<_>>(),
+                vec![(0, 7), (1, 3)]
+            );
+            assert_eq!(eos[0].finish_reason, Some(FinishReason::Stop));
+            // EOS does not drain the next decode or commit its survivor early.
+            assert_eq!(
+                scheduler.outstanding.as_ref().unwrap().phase,
+                BatchPhase::Decode
+            );
+            assert!(scheduler.prefill.running_request(0).is_none());
+            assert_eq!(
+                *scheduler
+                    .prefill
+                    .running_request(1)
+                    .unwrap()
+                    .input_ids
+                    .last()
+                    .unwrap(),
+                3
+            );
+            outputs.extend(eos);
+            scheduler
+                .add_request(
+                    vec![4],
+                    SamplingParams {
+                        max_tokens: 2,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let switching = scheduler.step_overlap().unwrap();
+            // New prefill is in flight, while the old decode result is returned.
+            assert_eq!(
+                switching
+                    .iter()
+                    .map(|row| (row.uid, row.token_id))
+                    .collect::<Vec<_>>(),
+                vec![(1, 4)]
+            );
+            let pending = scheduler.outstanding.as_ref().unwrap();
+            assert_eq!(pending.phase, BatchPhase::Prefill);
+            assert_eq!(pending.request_ids, vec![2]);
+            assert_eq!(scheduler.prefill.running_request(2).unwrap().output_len, 0);
+            outputs.extend(switching);
+            if cancel_prefill {
+                assert!(scheduler.abort_request(2));
+            }
+            while !scheduler.is_idle() {
+                outputs.extend(scheduler.step_overlap().unwrap());
+            }
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|row| row.uid == 0)
+                    .map(|row| row.token_id)
+                    .collect::<Vec<_>>(),
+                vec![6, 7]
+            );
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|row| row.uid == 1)
+                    .map(|row| row.token_id)
+                    .collect::<Vec<_>>(),
+                vec![2, 3, 4, 5, 6, 7]
+            );
+            let new = outputs
+                .iter()
+                .filter(|row| row.uid == 2)
+                .map(|row| row.token_id)
+                .collect::<Vec<_>>();
+            assert_eq!(new, if cancel_prefill { vec![] } else { vec![5, 6] });
+            assert!(scheduler.retired.is_empty());
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn eos_survivors_and_incoming_prefill_keep_the_pipeline() {
+        exercise_eos_and_prefill_switch(Device::Cpu);
+    }
+
+    #[cfg(has_cuda_graph)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_eos_survivors_and_incoming_prefill_keep_the_pipeline() {
+        exercise_eos_and_prefill_switch(Device::Cuda(0));
+    }
+
+    struct FailLaterDecode {
+        calls: Cell<usize>,
+    }
+    impl ModelExecutor for FailLaterDecode {
+        fn forward(
+            &self,
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            if batch.phase() == BatchPhase::Decode {
+                self.calls.set(self.calls.get() + 1);
+                if self.calls.get() == 2 {
+                    return Err(ModelRunnerError::Model("second decode failed".into()));
+                }
+            }
+            RelayTokenModel::default().forward(batch)
+        }
+    }
+
+    #[test]
+    fn pipeline_next_forward_error_preserves_completed_output() {
+        let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 1, 16);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(
+                Box::new(FailLaterDecode {
+                    calls: Cell::new(0),
+                }),
+                Device::Cpu,
+            ))
+            .unwrap();
+        scheduler
+            .add_request(
+                vec![1, 2],
+                SamplingParams {
+                    max_tokens: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first = scheduler.step_overlap().unwrap();
+        assert_eq!(first[0].token_id, 3);
+        assert!(scheduler.outstanding.is_some());
+        let outputs = scheduler.step_overlap().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].token_id, 4);
+        assert_eq!(outputs[0].finish_reason, None);
+        assert_eq!(outputs[1].finish_reason, Some(FinishReason::Error));
+        assert!(scheduler.is_idle());
+        assert!(matches!(
+            scheduler.last_step_error(),
+            Some(EngineError::ModelRunner(_))
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn one_batch_pipeline_relays_tokens_and_fences_lifecycle() {
+        exercise_pipeline(Device::Cpu);
+    }
+
+    #[cfg(has_cuda_graph)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_one_batch_pipeline_relays_tokens_and_fences_lifecycle() {
+        exercise_pipeline(Device::Cuda(0));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Token sampling strategies backed by libtorch.
 
-use std::fmt;
+use std::{fmt, marker::PhantomData, rc::Rc};
 
 use tch::{Kind, TchError, Tensor};
 
@@ -91,6 +91,151 @@ pub type Result<T> = std::result::Result<T, SamplingError>;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Sampler;
 
+/// One in-flight sampling invocation on the caller's execution stream.
+/// Owns both tensors until the blocking readback; cannot move to another thread.
+/// It is private to the engine/scheduler and never exposes device IDs to users.
+pub(crate) struct PendingSample {
+    #[cfg(has_cuda_graph)]
+    readback: Option<Rc<Readback>>,
+    ids: Tensor,
+    _logits: Tensor,
+    _same_thread: PhantomData<Rc<()>>,
+}
+
+impl PendingSample {
+    pub(crate) fn fence(&self) -> CompletionFence {
+        CompletionFence {
+            #[cfg(has_cuda_graph)]
+            readback: self.readback.clone(),
+            #[cfg(test)]
+            manual: None,
+        }
+    }
+
+    /// Device-side relay; invalid-distribution sentinels must not become
+    /// speculative embedding indices before finish() reports the error.
+    pub(crate) fn relay(&self) -> Tensor {
+        self.ids.clamp_min(0)
+    }
+
+    pub(crate) fn finish(self) -> Result<Vec<i64>> {
+        #[cfg(has_cuda_graph)]
+        if let Some(readback) = &self.readback {
+            return sampled_ids(&readback.finish()?);
+        }
+        sampled_ids(&self.ids)
+    }
+}
+
+/// Shared completion of one forward/sampling/readback invocation. Request
+/// resources may outlive logical completion without blocking the CPU.
+#[derive(Clone, Default)]
+pub(crate) struct CompletionFence {
+    #[cfg(has_cuda_graph)]
+    readback: Option<Rc<Readback>>,
+    #[cfg(test)]
+    manual: Option<Rc<std::cell::Cell<bool>>>,
+}
+
+impl CompletionFence {
+    pub(crate) fn ready(&self) -> Result<bool> {
+        #[cfg(test)]
+        if let Some(ready) = &self.manual {
+            return Ok(ready.get());
+        }
+        #[cfg(has_cuda_graph)]
+        if let Some(readback) = &self.readback {
+            return readback.ready();
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn wait_current(&self) -> Result<()> {
+        #[cfg(has_cuda_graph)]
+        if let Some(readback) = &self.readback {
+            if !unsafe { sglang_sample_readback_wait_stream(readback.0.as_ptr()) } {
+                return Err(Readback::error());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wait(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(ready) = &self.manual {
+            ready.set(true);
+            return Ok(());
+        }
+        #[cfg(has_cuda_graph)]
+        if let Some(readback) = &self.readback {
+            drop(readback.finish()?);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controlled() -> (Self, Rc<std::cell::Cell<bool>>) {
+        let ready = Rc::new(std::cell::Cell::new(false));
+        (
+            Self {
+                #[cfg(has_cuda_graph)]
+                readback: None,
+                manual: Some(ready.clone()),
+            },
+            ready,
+        )
+    }
+}
+
+#[cfg(has_cuda_graph)]
+struct Readback(std::ptr::NonNull<std::ffi::c_void>);
+
+#[cfg(has_cuda_graph)]
+unsafe extern "C" {
+    fn sglang_sample_readback_create(ids: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn sglang_sample_readback_finish(pending: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn sglang_sample_readback_wait_stream(pending: *mut std::ffi::c_void) -> bool;
+    fn sglang_sample_readback_ready(pending: *mut std::ffi::c_void) -> i32;
+    fn sglang_sample_readback_free(pending: *mut std::ffi::c_void);
+    fn sglang_graph_error() -> *const std::ffi::c_char;
+}
+#[cfg(has_cuda_graph)]
+impl Readback {
+    fn error() -> SamplingError {
+        SamplingError::Native(
+            unsafe { std::ffi::CStr::from_ptr(sglang_graph_error()) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+    fn new(ids: &Tensor) -> Result<Self> {
+        std::ptr::NonNull::new(unsafe { sglang_sample_readback_create(ids.as_ptr().cast()) })
+            .map(Self)
+            .ok_or_else(Self::error)
+    }
+    fn ready(&self) -> Result<bool> {
+        match unsafe { sglang_sample_readback_ready(self.0.as_ptr()) } {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Self::error()),
+        }
+    }
+    fn finish(&self) -> Result<Tensor> {
+        let tensor = unsafe { sglang_sample_readback_finish(self.0.as_ptr()) };
+        if tensor.is_null() {
+            return Err(Self::error());
+        }
+        Ok(unsafe { Tensor::from_ptr(tensor.cast()) })
+    }
+}
+#[cfg(has_cuda_graph)]
+impl Drop for Readback {
+    fn drop(&mut self) {
+        // Native destruction waits before releasing pinned/source storage.
+        unsafe { sglang_sample_readback_free(self.0.as_ptr()) };
+    }
+}
+
 impl Sampler {
     /// Samples rows that all share one set of sampling parameters.
     pub fn sample(&self, logits: &Tensor, params: SamplingParams) -> Result<Tensor> {
@@ -132,6 +277,54 @@ impl Sampler {
         logits: &Tensor,
         params_list: &[SamplingParams],
     ) -> Result<Vec<i64>> {
+        sampled_ids(&self.sample_batch_device(logits, params_list)?)
+    }
+
+    pub(crate) fn defer_batch(
+        &self,
+        logits: Tensor,
+        params: &[SamplingParams],
+    ) -> Result<PendingSample> {
+        match self.sample_batch_device(&logits, params) {
+            Ok(ids) => {
+                #[cfg(has_cuda_graph)]
+                let readback = if ids.device().is_cuda() {
+                    match Readback::new(&ids) {
+                        Ok(readback) => Some(Rc::new(readback)),
+                        Err(error) => {
+                            if let tch::Device::Cuda(device) = logits.device() {
+                                tch::Cuda::synchronize(device as i64);
+                            }
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(PendingSample {
+                    #[cfg(has_cuda_graph)]
+                    readback,
+                    ids,
+                    _logits: logits,
+                    _same_thread: PhantomData,
+                })
+            }
+            Err(error) => {
+                // Forward may already be queued. Do not let error handling free
+                // or publish request pages while its writes are still in flight.
+                if let tch::Device::Cuda(device) = logits.device() {
+                    tch::Cuda::synchronize(device as i64);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn sample_batch_device(
+        &self,
+        logits: &Tensor,
+        params_list: &[SamplingParams],
+    ) -> Result<Tensor> {
         validate_logits(logits)?;
         let num_rows = usize::try_from(logits.size()[0]).expect("validated non-negative shape");
         if num_rows != params_list.len() {
@@ -141,11 +334,11 @@ impl Sampler {
             });
         }
         if num_rows == 0 {
-            return Ok(Vec::new());
+            return Ok(Tensor::zeros([0], (Kind::Int64, logits.device())));
         }
 
         if params_list.iter().all(|params| params.temperature <= 0.0) {
-            return Vec::<i64>::try_from(&logits.argmax(-1, false)).map_err(Into::into);
+            return Ok(logits.argmax(-1, false));
         }
 
         let mut groups: Vec<(SamplingParams, Vec<i64>)> = Vec::new();
@@ -163,7 +356,7 @@ impl Sampler {
 
         if groups.len() == 1 {
             let output = self.sample(logits, groups[0].0)?;
-            return sampled_ids(&output);
+            return Ok(output);
         }
         let mut output = Tensor::zeros([num_rows as i64], (Kind::Int64, logits.device()));
         for (params, rows) in groups {
@@ -171,7 +364,7 @@ impl Sampler {
             let sampled = self.sample(&logits.index_select(0, &row_indices), params)?;
             output = output.index_copy(0, &row_indices, &sampled);
         }
-        sampled_ids(&output)
+        Ok(output)
     }
 }
 
@@ -261,6 +454,68 @@ mod tests {
 
     fn logits() -> Tensor {
         Tensor::from_slice(&[0.1f32, 2.0, 0.2, 3.0, 1.0, 0.5]).view([2, 3])
+    }
+
+    #[test]
+    fn deferred_sampling_preserves_rows_validation_and_empty_batches() {
+        let params = [
+            SamplingParams::default(),
+            SamplingParams {
+                temperature: 1.,
+                top_k: 1,
+                ..Default::default()
+            },
+        ];
+        let pending = Sampler.defer_batch(logits(), &params).unwrap();
+        let relay = pending.relay();
+        assert_eq!(Vec::<i64>::try_from(&relay).unwrap(), vec![1, 0]);
+        assert_eq!(pending.finish().unwrap(), vec![1, 0]);
+        assert!(matches!(
+            Sampler.defer_batch(logits(), &params[..1]),
+            Err(SamplingError::ParamsLengthMismatch { .. })
+        ));
+        let empty = Tensor::zeros([0, 3], (Kind::Float, tch::Device::Cpu));
+        assert!(
+            Sampler
+                .defer_batch(empty, &[])
+                .unwrap()
+                .finish()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(has_flashinfer)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn deferred_cuda_sampling_preserves_rng_rows_and_owned_results() {
+        let device = tch::Device::Cuda(0);
+        let input = logits().to_device(device).repeat([8, 1]);
+        let params: Vec<_> = (0..16)
+            .map(|row| {
+                if row % 2 == 0 {
+                    SamplingParams::default()
+                } else {
+                    SamplingParams {
+                        temperature: 1.,
+                        top_k: 2,
+                        top_p: 0.9,
+                        ..Default::default()
+                    }
+                }
+            })
+            .collect();
+        tch::Cuda::manual_seed(321);
+        let expected = Sampler.sample_batch(&input, &params).unwrap();
+        tch::Cuda::manual_seed(321);
+        let pending = Sampler.defer_batch(input.copy(), &params).unwrap();
+        let fence = pending.fence();
+        // Other owning device allocations/work must not invalidate pending IDs.
+        let _other = input.argmax(-1, false);
+        drop(input);
+        assert_eq!(pending.finish().unwrap(), expected);
+        assert!(fence.ready().unwrap());
+        fence.wait().unwrap();
     }
 
     #[test]
