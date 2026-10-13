@@ -12,6 +12,7 @@ use super::{
     DecodeManager, FinishReason, OutputToken, PrefillManager, Request, RequestId, Result,
     SchedulerError, SequenceStatus,
     future_map::{CompletionInput, FutureMap, RelayPlan},
+    schedule_plan::SchedulePlan,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,6 +448,40 @@ impl Scheduler {
         self.launch_batch(batch.request_ids, batch.model_batch, future)
     }
 
+    fn launch_plan(
+        &mut self,
+        plan: SchedulePlan,
+    ) -> std::result::Result<PendingBatch, EngineError> {
+        self.launch_batch(plan.request_ids, plan.model_batch, plan.relay.as_ref())
+    }
+
+    /// Select the next batch after an outstanding invocation. This method
+    /// only builds a plan; it does not launch GPU work or consume the previous
+    /// result.
+    fn plan_after(&mut self, previous: &PendingBatch) -> Result<Option<SchedulePlan>> {
+        if let Some(batch) = self.prefill.schedule_prefill()? {
+            return Ok(Some(SchedulePlan::prefill(
+                batch.request_ids,
+                batch.model_batch,
+            )));
+        }
+
+        let relay = self.future_map.plan(
+            &previous.request_ids,
+            &previous.inputs,
+            self.prefill.running_requests(),
+        )?;
+        let Some(batch) = self.decode.schedule_relay(
+            self.prefill.running_requests(),
+            &relay,
+            self.future_map.output_tokens(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SchedulePlan::decode(batch, Some(relay))))
+    }
+
     fn launch_batch(
         &mut self,
         request_ids: Vec<RequestId>,
@@ -559,8 +594,8 @@ impl Scheduler {
             self.drain_outstanding(&mut results);
         }
         if let Some(previous) = self.outstanding.take() {
-            let prefill = match self.prefill.schedule_prefill() {
-                Ok(batch) => batch,
+            let plan = match self.plan_after(&previous) {
+                Ok(plan) => plan,
                 Err(error) => {
                     self.outstanding = Some(previous);
                     self.drain_outstanding(&mut results);
@@ -568,44 +603,12 @@ impl Scheduler {
                     return Err(error);
                 }
             };
-            let (next_ids, next_phase, next) = if let Some(batch) = prefill {
-                let ids = batch.request_ids.clone();
-                (
-                    ids,
-                    BatchPhase::Prefill,
-                    self.launch_batch(batch.request_ids, batch.model_batch, None)
-                        .map(Some),
-                )
+            let (next_ids, next_phase, next) = if let Some(plan) = plan {
+                let ids = plan.request_ids.clone();
+                let phase = plan.phase;
+                (ids, phase, self.launch_plan(plan).map(Some))
             } else {
-                let future = self.future_map.plan(
-                    &previous.request_ids,
-                    &previous.inputs,
-                    self.prefill.running_requests(),
-                )?;
-                let batch = match self.decode.schedule_relay(
-                    self.prefill.running_requests(),
-                    &future,
-                    self.future_map.output_tokens(),
-                ) {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        self.outstanding = Some(previous);
-                        self.drain_outstanding(&mut results);
-                        self.aborted.extend(results);
-                        return Err(error);
-                    }
-                };
-                let ids = batch
-                    .as_ref()
-                    .map(|batch| batch.request_ids.clone())
-                    .unwrap_or_default();
-                (
-                    ids,
-                    BatchPhase::Decode,
-                    batch
-                        .map(|batch| self.launch_decode(batch, Some(&future)))
-                        .transpose(),
-                )
+                (Vec::new(), BatchPhase::Decode, Ok(None))
             };
             let (phase, ids, inputs, tokens) = Self::read_pending(previous);
             match next {

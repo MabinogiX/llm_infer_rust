@@ -5,6 +5,7 @@ mod error;
 mod future_map;
 mod prefill;
 mod request;
+mod schedule_plan;
 mod scheduler;
 
 pub use decode::{DecodeBatch, DecodeManager};
