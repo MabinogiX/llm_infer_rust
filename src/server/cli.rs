@@ -17,6 +17,8 @@ Options:\n\
   --tp-size N               Tensor parallel size (only 1 is supported)\n\
   --memory-ratio R          KV cache memory ratio (default 0.9)\n\
   --max-running-req N       Maximum active requests (default 256)\n\
+  --max-prefill-tokens-per-batch N  Maximum uncached prefill tokens per batch (0 disables)\n\
+  --enable-consecutive-prefill-overlap  Prefer throughput over consecutive-prefill TTFT\n\
   --cuda-graph-bs N         Maximum CUDA decode graph batch (0 disables)\n\
   --prefill-cuda-graph-max-tokens N  Maximum prefill graph tokens (default 2048; 0 disables)\n\
   --disable-cpu-gpu-overlap  Disable the one-batch CUDA decode pipeline\n\
@@ -51,6 +53,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--tp-size" => engine.tp_size = parse_value(&value()?, &flag)?,
             "--memory-ratio" => engine.memory_ratio = parse_value(&value()?, &flag)?,
             "--max-running-req" => engine.max_running_req = parse_value(&value()?, &flag)?,
+            "--max-prefill-tokens-per-batch" => {
+                engine.max_prefill_tokens_per_batch = parse_value(&value()?, &flag)?
+            }
+            "--enable-consecutive-prefill-overlap" => {
+                engine.disable_consecutive_prefill_overlap = false
+            }
             "--disable-cpu-gpu-overlap" => engine.disable_cpu_gpu_overlap = true,
             "--disable-async-metadata" => engine.disable_async_metadata = true,
             "--cuda-graph-bs" => engine.cuda_graph_bs = Some(parse_value(&value()?, &flag)?),
@@ -134,6 +142,26 @@ mod tests {
             parse_args(["--model-path", "/tmp/model", "--cuda-graph-bs", "4"].map(str::to_owned))
                 .unwrap();
         assert_eq!(graph_args.engine.cuda_graph_bs, Some(4));
+        let prefill_policy_args = parse_args(
+            [
+                "--model-path",
+                "/tmp/model",
+                "--max-prefill-tokens-per-batch",
+                "3072",
+                "--enable-consecutive-prefill-overlap",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            prefill_policy_args.engine.max_prefill_tokens_per_batch,
+            3072
+        );
+        assert!(
+            !prefill_policy_args
+                .engine
+                .disable_consecutive_prefill_overlap
+        );
         assert!(!args.engine.disable_cpu_gpu_overlap);
         assert!(!args.engine.disable_async_metadata);
         assert!(

@@ -26,10 +26,19 @@ pub(crate) struct RelayRow {
 }
 
 pub(crate) struct RelayPlan {
+    rows: Vec<RelayRow>,
     by_uid: HashMap<RequestId, RelayRow>,
 }
 
 impl RelayPlan {
+    pub(crate) fn rows(&self) -> impl Iterator<Item = RelayRow> + '_ {
+        self.rows.iter().copied()
+    }
+
+    pub(crate) fn slots(&self) -> Vec<usize> {
+        self.rows.iter().map(|row| row.slot).collect()
+    }
+
     pub(crate) fn input(&self, uid: RequestId) -> Option<CompletionInput> {
         self.by_uid.get(&uid).map(|row| row.input)
     }
@@ -124,8 +133,8 @@ impl FutureMap {
                 },
             });
         }
-        let by_uid = rows.into_iter().map(|row| (row.uid, row)).collect();
-        Ok(RelayPlan { by_uid })
+        let by_uid = rows.iter().copied().map(|row| (row.uid, row)).collect();
+        Ok(RelayPlan { rows, by_uid })
     }
 
     /// Release slots whose requests are no longer running.  This is called

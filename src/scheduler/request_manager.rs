@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use crate::engine::BatchRequest;
 use crate::engine::kvcache::{AcquireOutcome, CacheManager};
 
 use super::{Request, RequestId, Result, SequenceStatus};
@@ -53,6 +54,15 @@ impl RequestManager {
 
     pub(crate) fn running_request_mut(&mut self, uid: RequestId) -> Option<&mut Request> {
         self.running.iter_mut().find(|request| request.uid == uid)
+    }
+
+    pub(crate) fn batch_request(&self, uid: RequestId) -> Option<BatchRequest> {
+        let request = self.running_request(uid)?;
+        Some(BatchRequest {
+            input_ids: request.input_ids.clone(),
+            cached_len: request.cached_len,
+            page_ids: request.cache_handle.as_ref()?.page_ids.clone(),
+        })
     }
 
     pub(crate) fn pop_pending(&mut self) -> Option<Request> {

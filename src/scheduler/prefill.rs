@@ -1,7 +1,7 @@
 //! Pending queue, KV allocation, and prefill batch selection.
 
 use crate::engine::kvcache::AcquireOutcome;
-use crate::engine::{Batch, BatchContext, BatchRequest, ServerArgs};
+use crate::engine::{Batch, BatchContext, BatchRequest, MixedDecodeRequest, ServerArgs};
 
 use super::{RequestId, Result, SequenceStatus, request_manager::RequestManager};
 
@@ -14,6 +14,7 @@ pub struct PrefillManager {
     batch_context: BatchContext,
     max_running_req: usize,
     max_seq_len: usize,
+    max_prefill_tokens_per_batch: usize,
 }
 
 impl PrefillManager {
@@ -22,6 +23,7 @@ impl PrefillManager {
             batch_context,
             max_running_req: args.max_running_req,
             max_seq_len: args.max_seq_len,
+            max_prefill_tokens_per_batch: args.max_prefill_tokens_per_batch,
         }
     }
 
@@ -48,6 +50,25 @@ impl PrefillManager {
         result
     }
 
+    pub(crate) fn prepare_mixed_prefill(
+        &self,
+        requests: &RequestManager,
+        prefill_ids: &[RequestId],
+        decode_rows: &[MixedDecodeRequest],
+    ) -> Result<Batch> {
+        let prefills = prefill_ids
+            .iter()
+            .map(|&uid| {
+                requests
+                    .batch_request(uid)
+                    .expect("scheduled prefill request is running")
+            })
+            .collect::<Vec<_>>();
+        Ok(self
+            .batch_context
+            .prepare_mixed_prefill(&prefills, decode_rows)?)
+    }
+
     fn select_and_build(
         &mut self,
         requests: &mut RequestManager,
@@ -70,7 +91,14 @@ impl PrefillManager {
                 .saturating_add(request.sampling_params.max_tokens.saturating_sub(1))
                 .min(self.max_seq_len);
             let prompt_len = request.input_ids.len();
-            let budget = (!selected.is_empty()).then_some(self.max_seq_len - total_tokens);
+            let budget = if selected.is_empty() || self.max_prefill_tokens_per_batch == 0 {
+                None
+            } else {
+                Some(
+                    self.max_prefill_tokens_per_batch
+                        .saturating_sub(total_tokens),
+                )
+            };
             let handle = match requests.acquire_pending(capacity_tokens, budget)? {
                 AcquireOutcome::Ready(handle) => handle,
                 AcquireOutcome::Impossible => {
@@ -204,6 +232,7 @@ mod tests {
         let mut args = ServerArgs::new("unused-model-path");
         args.max_running_req = max_running_req;
         args.max_seq_len = max_seq_len;
+        args.max_prefill_tokens_per_batch = max_seq_len;
         args.page_size = page_size;
         let context =
             BatchContext::new(max_running_req, max_seq_len, page_size, Device::Cpu).unwrap();
@@ -249,6 +278,19 @@ mod tests {
     #[test]
     fn respects_prefill_token_budget() {
         let (_pool, mut manager) = manager(8, 2, 4);
+        manager.add_request(request(0, vec![1, 2, 3], 1));
+        manager.add_request(request(1, vec![4, 5, 6], 1));
+        assert_eq!(
+            manager.schedule_prefill().unwrap().unwrap().request_ids,
+            vec![0]
+        );
+        assert_eq!(manager.pending_len(), 1);
+    }
+
+    #[test]
+    fn uses_independent_prefill_token_budget() {
+        let (_pool, mut manager) = manager(8, 2, 8);
+        manager.prefill.max_prefill_tokens_per_batch = 4;
         manager.add_request(request(0, vec![1, 2, 3], 1));
         manager.add_request(request(1, vec![4, 5, 6], 1));
         assert_eq!(

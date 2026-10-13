@@ -7,6 +7,7 @@ use crate::engine::{
     Batch, BatchContext, BatchPhase, Engine, EngineError, SamplingParams, ServerArgs,
 };
 use crate::profiling::{StepProfiler, StepStage, time_schedule};
+use tch::Tensor;
 
 use super::{
     DecodeManager, FinishReason, OutputToken, PrefillManager, Request, RequestId, Result,
@@ -15,6 +16,7 @@ use super::{
     request_manager::RequestManager,
     schedule_plan::SchedulePlan,
 };
+use crate::engine::MixedDecodeRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStrategy {
@@ -456,8 +458,31 @@ impl Scheduler {
 
     fn launch_plan(
         &mut self,
-        plan: SchedulePlan,
+        mut plan: SchedulePlan,
     ) -> std::result::Result<PendingBatch, EngineError> {
+        if plan.phase == BatchPhase::Prefill {
+            if let (Some(relay), Some(offset)) = (&plan.relay, plan.relay_offset) {
+                let slots = Tensor::from_slice(
+                    &relay
+                        .slots()
+                        .into_iter()
+                        .map(|slot| slot as i64)
+                        .collect::<Vec<_>>(),
+                )
+                .to_device(self.future_map.output_tokens().device());
+                let decode_ids = self
+                    .future_map
+                    .output_tokens()
+                    .index_select(0, &slots)
+                    .view([-1]);
+                let prefill_ids = plan.model_batch.input_ids.narrow(
+                    0,
+                    0,
+                    i64::try_from(offset).expect("mixed prefill token count fits i64"),
+                );
+                plan.model_batch.input_ids = Tensor::cat(&[prefill_ids, decode_ids], 0);
+            }
+        }
         self.launch_batch(plan.request_ids, plan.model_batch, plan.relay.as_ref())
     }
 
@@ -465,18 +490,68 @@ impl Scheduler {
     /// only builds a plan; it does not launch GPU work or consume the previous
     /// result.
     fn plan_after(&mut self, previous: &PendingBatch) -> Result<Option<SchedulePlan>> {
+        let previous_relay = if previous.phase == BatchPhase::Decode {
+            Some(self.future_map.plan(
+                &previous.request_ids,
+                &previous.inputs,
+                self.requests.running_requests(),
+            )?)
+        } else {
+            None
+        };
         if let Some(batch) = self.prefill.schedule_prefill(&mut self.requests)? {
+            if let Some(relay) = previous_relay {
+                let decode_rows = relay
+                    .rows()
+                    .map(|row| {
+                        let request = self
+                            .requests
+                            .running_request(row.uid)
+                            .expect("relay request is running");
+                        MixedDecodeRequest {
+                            input_id: 0,
+                            position: row.input.written_len.saturating_sub(1),
+                            page_ids: request
+                                .cache_handle
+                                .as_ref()
+                                .expect("relay request has KV handle")
+                                .page_ids
+                                .clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if !decode_rows.is_empty() {
+                    let prefill_tokens = batch.model_batch.input_ids.numel();
+                    let mixed = self.prefill.prepare_mixed_prefill(
+                        &self.requests,
+                        &batch.request_ids,
+                        &decode_rows,
+                    )?;
+                    let mut request_ids = batch.request_ids;
+                    request_ids.extend(relay.rows().map(|row| row.uid));
+                    return Ok(Some(SchedulePlan::mixed(
+                        request_ids,
+                        mixed,
+                        relay,
+                        prefill_tokens,
+                    )));
+                }
+            }
             return Ok(Some(SchedulePlan::prefill(
                 batch.request_ids,
                 batch.model_batch,
             )));
         }
 
-        let relay = self.future_map.plan(
-            &previous.request_ids,
-            &previous.inputs,
-            self.requests.running_requests(),
-        )?;
+        // A prefill result must be completed before decode planning because
+        // its sampled token is not stored in FutureMap. Throughput mode may
+        // overlap consecutive prefills, but it still establishes a barrier
+        // before switching back to decode.
+        if previous.phase == BatchPhase::Prefill {
+            return Ok(None);
+        }
+
+        let relay = previous_relay.expect("decode previous batch has relay plan");
         let Some(batch) = self.decode.schedule_relay(
             self.requests.running_requests(),
             &relay,
@@ -592,11 +667,11 @@ impl Scheduler {
         // A prefill's publish may canonicalize its pages. Wait for that
         // invocation and publish before planning decode for those same rows.
         // Incoming prefill alone does not require draining an old decode.
-        if self
-            .outstanding
-            .as_ref()
-            .is_some_and(|batch| batch.phase == BatchPhase::Prefill)
-        {
+        if self.outstanding.as_ref().is_some_and(|batch| {
+            batch.phase == BatchPhase::Prefill
+                && (self.args.disable_consecutive_prefill_overlap
+                    || self.requests.pending_len() == 0)
+        }) {
             self.drain_outstanding(&mut results);
         }
         if let Some(previous) = self.outstanding.take() {
@@ -1378,6 +1453,48 @@ mod tests {
     }
 
     #[test]
+    fn throughput_policy_builds_mixed_prefill_batch() {
+        let (mut scheduler, path) =
+            scheduler_with_execution(CacheStrategy::Radix, 2, 16, Device::Cpu, false);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(
+                Box::new(RelayTokenModel::default()),
+                Device::Cpu,
+            ))
+            .unwrap();
+        scheduler.args.disable_consecutive_prefill_overlap = false;
+        scheduler
+            .add_request(
+                vec![1, 2],
+                SamplingParams {
+                    max_tokens: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler.step_overlap().unwrap();
+        scheduler
+            .add_request(
+                vec![4, 5],
+                SamplingParams {
+                    max_tokens: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler.step_overlap().unwrap();
+        let pending = scheduler.outstanding.as_ref().unwrap();
+        assert_eq!(pending.phase, BatchPhase::Prefill);
+        assert_eq!(pending.request_ids.len(), 2);
+        assert_eq!(pending.sample.fence().ready().unwrap(), true);
+        while !scheduler.is_idle() {
+            scheduler.step_overlap().unwrap();
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn terminal_output_and_cancel_hold_pages_until_their_fence() {
         for cancel in [false, true] {
             let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 1, 16);
@@ -1608,7 +1725,7 @@ mod tests {
             );
             let pending = scheduler.outstanding.as_ref().unwrap();
             assert_eq!(pending.phase, BatchPhase::Prefill);
-            assert_eq!(pending.request_ids, vec![2]);
+            assert_eq!(pending.request_ids, vec![2, 1]);
             assert_eq!(scheduler.requests.running_request(2).unwrap().output_len, 0);
             outputs.extend(switching);
             if cancel_prefill {
