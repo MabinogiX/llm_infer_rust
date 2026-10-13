@@ -7,6 +7,7 @@ use crate::engine::{
     AttentionMetadata, Batch, BatchPhase, CompletionFence, InputReadFence, ServerArgs,
 };
 
+use super::future_map::RelayPlan;
 use super::{Request, RequestId, Result, SchedulerError};
 
 pub struct DecodeBatch {
@@ -107,7 +108,7 @@ impl DecodeManager {
     pub(crate) fn schedule_relay(
         &mut self,
         running: &[Request],
-        future: &[(RequestId, usize)],
+        future: &RelayPlan,
         ids: &Tensor,
     ) -> Result<Option<DecodeBatch>> {
         self.build(running, Some((future, ids)), true)
@@ -116,18 +117,13 @@ impl DecodeManager {
     fn build(
         &mut self,
         running: &[Request],
-        future: Option<(&[(RequestId, usize)], &Tensor)>,
+        future: Option<(&RelayPlan, &Tensor)>,
         async_metadata: bool,
     ) -> Result<Option<DecodeBatch>> {
         let active: Vec<_> = running
             .iter()
             .filter(|request| !request.is_finished())
-            .filter(|request| {
-                future.is_none_or(|(rows, _)| {
-                    rows.iter()
-                        .any(|(uid, len)| *uid == request.uid && *len > 0)
-                })
-            })
+            .filter(|request| future.is_none_or(|(plan, _)| plan.row(request.uid).is_some()))
             .collect();
         if active.is_empty() {
             return Ok(None);
@@ -171,13 +167,9 @@ impl DecodeManager {
 
         for (row, request) in active.into_iter().enumerate() {
             let len = if let Some((future, _)) = future {
-                let (index, (_, len)) = future
-                    .iter()
-                    .enumerate()
-                    .find(|(_, (uid, _))| *uid == request.uid)
-                    .expect("filtered relay request");
-                relay_rows.push(index as i64);
-                *len
+                let row = future.row(request.uid).expect("filtered relay request");
+                relay_rows.push(row.slot as i64);
+                row.input.written_len
             } else {
                 request.input_ids.len()
             };

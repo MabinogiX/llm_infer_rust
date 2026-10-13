@@ -15,6 +15,15 @@ pub struct BatchRequest {
     pub page_ids: Vec<usize>,
 }
 
+/// One existing decode request embedded into a mixed prefill batch. The
+/// query has length one; `position` is the uncached sequence position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedDecodeRequest {
+    pub input_id: i64,
+    pub position: usize,
+    pub page_ids: Vec<usize>,
+}
+
 impl BatchRequest {
     pub fn new(input_ids: Vec<i64>) -> Self {
         Self {
@@ -102,15 +111,54 @@ impl BatchContext {
             ));
         }
 
-        let mut input_ids = Vec::new();
-        let mut positions = Vec::new();
-        let mut write_loc = Vec::new();
-        let mut prefix_lens = Vec::with_capacity(requests.len());
-        let mut sequence_lengths = Vec::with_capacity(requests.len());
-        let mut logits_indices = Vec::with_capacity(requests.len());
-        let mut offset = 0usize;
+        let rows = requests
+            .iter()
+            .map(|request| {
+                if request.cached_len > request.input_ids.len() {
+                    return Err(BatchContextError::CachedLengthExceedsInput {
+                        cached_len: request.cached_len,
+                        input_len: request.input_ids.len(),
+                    });
+                }
+                if request.input_ids.len() > self.max_seq_len {
+                    return Err(BatchContextError::InvalidConfiguration(
+                        "request input exceeds max_seq_len",
+                    ));
+                }
+                let uncached = request.input_ids[request.cached_len..].to_vec();
+                if uncached.is_empty() {
+                    return Err(BatchContextError::EmptyUncachedRequest);
+                }
+                Ok(MixedRow {
+                    input_ids: uncached,
+                    positions: (request.cached_len..request.input_ids.len()).collect(),
+                    prefix_len: request.cached_len,
+                    total_len: request.input_ids.len(),
+                    page_ids: request.page_ids.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.prepare_rows(&rows)
+    }
 
-        for request in requests {
+    /// Builds a prefill-shaped batch containing new prefill rows followed by
+    /// one-token decode rows. The caller may replace the decode placeholder
+    /// IDs with a device relay after this method returns.
+    pub fn prepare_mixed_prefill(
+        &self,
+        prefills: &[BatchRequest],
+        decodes: &[MixedDecodeRequest],
+    ) -> Result<Batch> {
+        if prefills.is_empty() && decodes.is_empty() {
+            return Err(BatchContextError::EmptyBatch);
+        }
+        if prefills.len() + decodes.len() > self.max_running_req {
+            return Err(BatchContextError::InvalidConfiguration(
+                "request count exceeds max_running_req",
+            ));
+        }
+        let mut rows = Vec::with_capacity(prefills.len() + decodes.len());
+        for request in prefills {
             if request.cached_len > request.input_ids.len() {
                 return Err(BatchContextError::CachedLengthExceedsInput {
                     cached_len: request.cached_len,
@@ -122,37 +170,72 @@ impl BatchContext {
                     "request input exceeds max_seq_len",
                 ));
             }
-
-            let uncached = &request.input_ids[request.cached_len..];
+            let uncached = request.input_ids[request.cached_len..].to_vec();
             if uncached.is_empty() {
                 return Err(BatchContextError::EmptyUncachedRequest);
             }
-            input_ids.extend_from_slice(uncached);
+            rows.push(MixedRow {
+                input_ids: uncached,
+                positions: (request.cached_len..request.input_ids.len()).collect(),
+                prefix_len: request.cached_len,
+                total_len: request.input_ids.len(),
+                page_ids: request.page_ids.clone(),
+            });
+        }
+        for request in decodes {
+            if request.position >= self.max_seq_len {
+                return Err(BatchContextError::InvalidConfiguration(
+                    "decode position exceeds max_seq_len",
+                ));
+            }
+            rows.push(MixedRow {
+                input_ids: vec![request.input_id],
+                positions: vec![request.position],
+                prefix_len: request.position,
+                total_len: request.position + 1,
+                page_ids: request.page_ids.clone(),
+            });
+        }
+        self.prepare_rows(&rows)
+    }
+
+    fn prepare_rows(&self, rows: &[MixedRow]) -> Result<Batch> {
+        let mut input_ids = Vec::new();
+        let mut positions = Vec::new();
+        let mut write_loc = Vec::new();
+        let mut prefix_lens = Vec::with_capacity(rows.len());
+        let mut sequence_lengths = Vec::with_capacity(rows.len());
+        let mut logits_indices = Vec::with_capacity(rows.len());
+        let mut offset = 0usize;
+
+        for row in rows {
+            input_ids.extend_from_slice(&row.input_ids);
             positions.extend(
-                (request.cached_len..request.input_ids.len())
-                    .map(|position| {
+                row.positions
+                    .iter()
+                    .map(|&position| {
                         i64::try_from(position)
                             .map_err(|_| BatchContextError::IntegerOverflow("position"))
                     })
                     .collect::<Result<Vec<_>>>()?,
             );
-            write_loc.extend(self.build_write_locations(request)?);
-            prefix_lens.push(to_i32(request.cached_len, "cached_len")?);
-            sequence_lengths.push(to_i32(uncached.len(), "sequence length")?);
+            write_loc.extend(self.build_write_locations(row)?);
+            prefix_lens.push(to_i32(row.prefix_len, "cached_len")?);
+            sequence_lengths.push(to_i32(row.input_ids.len(), "sequence length")?);
             logits_indices.push(to_i64(
                 offset
-                    .checked_add(uncached.len() - 1)
+                    .checked_add(row.input_ids.len() - 1)
                     .ok_or(BatchContextError::IntegerOverflow("logits index"))?,
                 "logits index",
             )?);
             offset = offset
-                .checked_add(uncached.len())
+                .checked_add(row.input_ids.len())
                 .ok_or(BatchContextError::IntegerOverflow("total token count"))?;
         }
 
         let cumulative_lengths = cumulative_lengths(&sequence_lengths)?;
-        let block_table = self.build_block_table(requests)?;
-        let req_to_token = self.build_req_to_token(requests)?;
+        let block_table = self.build_block_table(rows)?;
+        let req_to_token = self.build_req_to_token(rows)?;
 
         Ok(Batch::prefill(
             Tensor::from_slice(&input_ids).to_device(self.device),
@@ -171,50 +254,46 @@ impl BatchContext {
         ))
     }
 
-    fn build_write_locations(&self, request: &BatchRequest) -> Result<Vec<i32>> {
-        let required_pages = request.input_ids.len().div_ceil(self.page_size);
-        if request.page_ids.len() < required_pages {
+    fn build_write_locations(&self, row: &MixedRow) -> Result<Vec<i32>> {
+        let required_pages = row.total_len.div_ceil(self.page_size);
+        if row.page_ids.len() < required_pages {
             return Err(BatchContextError::MissingWritablePage {
-                position: request
-                    .cached_len
-                    .max(request.page_ids.len().saturating_mul(self.page_size)),
+                position: row
+                    .prefix_len
+                    .max(row.page_ids.len().saturating_mul(self.page_size)),
             });
         }
-        let mut locations = Vec::with_capacity(request.input_ids.len() - request.cached_len);
-        for position in request.cached_len..request.input_ids.len() {
-            let page_id = request.page_ids[position / self.page_size];
+        let mut locations = Vec::with_capacity(row.input_ids.len());
+        for &position in &row.positions {
+            let page_id = row.page_ids[position / self.page_size];
             let location = cache_location(page_id, position % self.page_size, self.page_size)?;
             locations.push(location);
         }
         Ok(locations)
     }
 
-    fn build_block_table(&self, requests: &[BatchRequest]) -> Result<Tensor> {
+    fn build_block_table(&self, rows: &[MixedRow]) -> Result<Tensor> {
         let max_blocks = self.max_seq_len.div_ceil(self.page_size);
         let row_len = to_i64(max_blocks, "max blocks")?;
-        let mut values = vec![-1i32; requests.len() * max_blocks];
-        for (row, request) in requests.iter().enumerate() {
+        let mut values = vec![-1i32; rows.len() * max_blocks];
+        for (row, request) in rows.iter().enumerate() {
             for (column, &page_id) in request.page_ids.iter().take(max_blocks).enumerate() {
                 values[row * max_blocks + column] = to_i32(page_id, "page id")?;
             }
         }
         Ok(Tensor::from_slice(&values)
-            .view([to_i64(requests.len(), "request count")?, row_len])
+            .view([to_i64(rows.len(), "request count")?, row_len])
             .to_device(self.device))
     }
 
-    fn build_req_to_token(&self, requests: &[BatchRequest]) -> Result<Tensor> {
-        let mut values = vec![-1i32; requests.len() * self.max_seq_len];
-        for (row, request) in requests.iter().enumerate() {
+    fn build_req_to_token(&self, rows: &[MixedRow]) -> Result<Tensor> {
+        let mut values = vec![-1i32; rows.len() * self.max_seq_len];
+        for (row, request) in rows.iter().enumerate() {
             if request.page_ids.is_empty() {
                 continue;
             }
             let page_capacity = request.page_ids.len().saturating_mul(self.page_size);
-            let filled = request
-                .input_ids
-                .len()
-                .min(self.max_seq_len)
-                .min(page_capacity);
+            let filled = request.total_len.min(self.max_seq_len).min(page_capacity);
             for position in 0..filled {
                 values[row * self.max_seq_len + position] = cache_location(
                     request.page_ids[position / self.page_size],
@@ -225,11 +304,19 @@ impl BatchContext {
         }
         Ok(Tensor::from_slice(&values)
             .view([
-                to_i64(requests.len(), "request count")?,
+                to_i64(rows.len(), "request count")?,
                 to_i64(self.max_seq_len, "max sequence length")?,
             ])
             .to_device(self.device))
     }
+}
+
+struct MixedRow {
+    input_ids: Vec<i64>,
+    positions: Vec<usize>,
+    prefix_len: usize,
+    total_len: usize,
+    page_ids: Vec<usize>,
 }
 
 fn cumulative_lengths(lengths: &[i32]) -> Result<Vec<i32>> {
@@ -309,6 +396,71 @@ mod tests {
                 vec![14, 15, -1, -1, -1, -1, -1, -1]
             ]
         );
+    }
+
+    #[test]
+    fn prepares_mixed_prefill_with_one_token_decode_rows() {
+        let context = BatchContext::new(4, 8, 2, Device::Cpu).unwrap();
+        let batch = context
+            .prepare_mixed_prefill(
+                &[BatchRequest {
+                    input_ids: vec![1, 2],
+                    cached_len: 0,
+                    page_ids: vec![0],
+                }],
+                &[MixedDecodeRequest {
+                    input_id: 0,
+                    position: 2,
+                    page_ids: vec![1, 2],
+                }],
+            )
+            .unwrap();
+        assert_eq!(batch.phase, BatchPhase::Prefill);
+        assert_eq!(batch.input_ids.size(), vec![3]);
+        assert_eq!(batch.positions.size(), vec![3]);
+        let metadata = batch.attention_metadata.as_ref().unwrap();
+        let bounds = metadata.cu_seqlens_q.as_ref().unwrap();
+        let prefixes = metadata.prefix_lens.as_ref().unwrap();
+        assert_eq!(Vec::<i32>::try_from(bounds).unwrap(), vec![0, 2, 3]);
+        assert_eq!(Vec::<i32>::try_from(prefixes).unwrap(), vec![0, 2]);
+        assert_eq!(
+            Vec::<i32>::try_from(metadata.write_loc.as_ref().unwrap()).unwrap(),
+            vec![0, 1, 4]
+        );
+        assert_eq!(
+            Vec::<i64>::try_from(&batch.logits_indices.unwrap()).unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            Vec::<Vec<i32>>::try_from(metadata.block_table.as_ref().unwrap()).unwrap(),
+            vec![vec![0, -1, -1, -1], vec![1, 2, -1, -1]]
+        );
+        assert_eq!(
+            Vec::<Vec<i32>>::try_from(metadata.req_to_token.as_ref().unwrap()).unwrap(),
+            vec![
+                vec![0, 1, -1, -1, -1, -1, -1, -1],
+                vec![2, 3, 4, -1, -1, -1, -1, -1]
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_mixed_prefill() {
+        let context = BatchContext::new(1, 2, 2, Device::Cpu).unwrap();
+        let result = context.prepare_mixed_prefill(
+            &[BatchRequest {
+                input_ids: vec![1, 2, 3],
+                cached_len: 0,
+                page_ids: vec![0, 1],
+            }],
+            &[],
+        );
+        assert!(matches!(
+            result,
+            Err(BatchContextError::InvalidConfiguration(
+                "request input exceeds max_seq_len"
+            ))
+        ));
     }
 
     #[test]

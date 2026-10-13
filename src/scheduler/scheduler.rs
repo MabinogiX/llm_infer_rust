@@ -7,11 +7,16 @@ use crate::engine::{
     Batch, BatchContext, BatchPhase, Engine, EngineError, SamplingParams, ServerArgs,
 };
 use crate::profiling::{StepProfiler, StepStage, time_schedule};
+use tch::Tensor;
 
 use super::{
     DecodeManager, FinishReason, OutputToken, PrefillManager, Request, RequestId, Result,
     SchedulerError, SequenceStatus,
+    future_map::{CompletionInput, FutureMap, RelayPlan},
+    request_manager::RequestManager,
+    schedule_plan::SchedulePlan,
 };
+use crate::engine::MixedDecodeRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStrategy {
@@ -21,13 +26,6 @@ pub enum CacheStrategy {
 
 /// Completion boundary for an outstanding forward; the CPU sequence may lag
 /// its device-side token relay by one invocation.
-#[derive(Clone, Copy)]
-struct CompletionInput {
-    written_len: usize,
-    length_finished: bool,
-    ignore_eos: bool,
-}
-
 struct PendingBatch {
     fence: crate::engine::CompletionFence,
     phase: BatchPhase,
@@ -50,12 +48,14 @@ pub struct Scheduler {
     cache_strategy: CacheStrategy,
     eos_token_ids: BTreeSet<i64>,
     next_uid: RequestId,
+    requests: RequestManager,
     prefill: PrefillManager,
     decode: DecodeManager,
     aborted: VecDeque<OutputToken>,
     last_step_error: Option<EngineError>,
     outstanding: Option<PendingBatch>,
     retired: VecDeque<RetiredRequest>,
+    future_map: FutureMap,
 }
 
 impl Scheduler {
@@ -80,20 +80,25 @@ impl Scheduler {
             args.page_size,
             engine.device(),
         )?;
-        let prefill = PrefillManager::new(&args, cache, batch_context);
+        let requests = RequestManager::new(cache);
+        let prefill = PrefillManager::new(&args, batch_context);
         let decode = DecodeManager::new(&args, engine.device())?;
+        let future_map_rows = args.max_running_req;
+        let future_map_device = engine.device();
         Ok(Self {
             engine,
             args,
             cache_strategy,
             eos_token_ids,
             next_uid: 0,
+            requests,
             prefill,
             decode,
             aborted: VecDeque::new(),
             last_step_error: None,
             outstanding: None,
             retired: VecDeque::new(),
+            future_map: FutureMap::new(future_map_rows, future_map_device),
         })
     }
 
@@ -106,6 +111,8 @@ impl Scheduler {
         let mut outputs = Vec::new();
         self.drain_outstanding(&mut outputs);
         self.reap_retired(true);
+        self.future_map
+            .release_inactive(self.requests.running_requests());
         self.aborted.extend(outputs);
         &mut self.engine
     }
@@ -119,11 +126,11 @@ impl Scheduler {
     }
 
     pub fn pending_len(&self) -> usize {
-        self.prefill.pending_len()
+        self.requests.pending_len()
     }
 
     pub fn running_len(&self) -> usize {
-        self.prefill.running_len()
+        self.requests.running_len()
     }
 
     pub fn last_step_error(&self) -> Option<&EngineError> {
@@ -145,7 +152,7 @@ impl Scheduler {
             self.aborted
                 .push_back(self.terminal_result(uid, FinishReason::Abort));
         } else {
-            self.prefill.add_request(Request {
+            self.requests.add_request(Request {
                 uid,
                 input_ids,
                 sampling_params: sampling_params.normalized(),
@@ -161,20 +168,20 @@ impl Scheduler {
     /// Cancel logically now; a handle still used by the outstanding invocation
     /// is detached and released only after its completion event.
     pub fn abort_request(&mut self, uid: RequestId) -> bool {
-        if self.prefill.running_request(uid).is_some() {
+        if self.requests.running_request(uid).is_some() {
             self.retire_request(uid, false);
             true
         } else {
-            self.prefill.abort(uid)
+            self.requests.abort(uid)
         }
     }
 
     pub fn is_idle(&self) -> bool {
         self.outstanding.is_none()
             && self.retired.is_empty()
-            && self.prefill.pending_len() == 0
-            && self.prefill.running_len() == 0
-            && !self.prefill.has_aborted()
+            && self.requests.pending_len() == 0
+            && self.requests.running_len() == 0
+            && !self.requests.has_aborted()
             && self.aborted.is_empty()
     }
 
@@ -196,8 +203,9 @@ impl Scheduler {
 
     fn step_serial(&mut self) -> Result<Vec<OutputToken>> {
         self.last_step_error = None;
-        let (batch, schedule_us) =
-            time_schedule(self.engine.device(), || self.prefill.schedule_prefill());
+        let (batch, schedule_us) = time_schedule(self.engine.device(), || {
+            self.prefill.schedule_prefill(&mut self.requests)
+        });
         let batch = batch?;
         let mut results: Vec<_> = self.aborted.drain(..).collect();
         if let Some(batch) = batch {
@@ -210,13 +218,14 @@ impl Scheduler {
             )?;
         }
         results.extend(
-            self.prefill
+            self.requests
                 .drain_aborted()
                 .into_iter()
                 .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
         );
         let (decode_batch, schedule_us) = time_schedule(self.engine.device(), || {
-            self.decode.schedule_decode(self.prefill.running_requests())
+            self.decode
+                .schedule_decode(self.requests.running_requests())
         });
         let decode_batch = decode_batch?;
         if let Some(batch) = decode_batch {
@@ -246,7 +255,7 @@ impl Scheduler {
                 .map(|uid| {
                     (
                         *uid,
-                        self.prefill
+                        self.requests
                             .running_request(*uid)
                             .expect("scheduled request is running")
                             .output_len
@@ -259,7 +268,7 @@ impl Scheduler {
             request_ids
                 .iter()
                 .map(|uid| {
-                    self.prefill
+                    self.requests
                         .running_request(*uid)
                         .expect("scheduled request is running")
                         .sampling_params
@@ -305,7 +314,7 @@ impl Scheduler {
                 for (row, (uid, token_id)) in request_ids.into_iter().zip(tokens).enumerate() {
                     // Aborted rows, including their speculative sampled tokens,
                     // are ignored after the outstanding invocation is fenced.
-                    if self.prefill.running_request(uid).is_none() {
+                    if self.requests.running_request(uid).is_none() {
                         continue;
                     }
                     let input = inputs
@@ -314,8 +323,8 @@ impl Scheduler {
                         .unwrap_or_else(|| self.completion_input(uid));
                     let reason = self.finish_reason(input, token_id);
                     if reason.is_some() && self.resource_fence(uid).is_some() {
-                        self.prefill.mark_written(uid, input.written_len);
-                        self.prefill
+                        self.requests.mark_written(uid, input.written_len);
+                        self.requests
                             .running_request_mut(uid)
                             .unwrap()
                             .append_token(token_id);
@@ -329,16 +338,16 @@ impl Scheduler {
                         continue;
                     }
                     if phase == BatchPhase::Prefill || reason.is_some() {
-                        if let Err(error) = self.prefill.publish(uid) {
+                        if let Err(error) = self.requests.publish(uid) {
                             tracing::error!(uid, error = %error, "KV cache publish failed");
-                            self.prefill.remove_batch(&[uid]);
+                            self.requests.remove_batch(&[uid]);
                             results.push(self.terminal_result(uid, FinishReason::Error));
                             continue;
                         }
                     } else {
-                        self.prefill.mark_written(uid, input.written_len);
+                        self.requests.mark_written(uid, input.written_len);
                     }
-                    let request = self.prefill.running_request_mut(uid).unwrap();
+                    let request = self.requests.running_request_mut(uid).unwrap();
                     request.append_token(token_id);
                     if reason.is_some() {
                         request.status = SequenceStatus::Finished;
@@ -351,12 +360,12 @@ impl Scheduler {
                         finish_reason: reason,
                     });
                 }
-                self.prefill.remove_batch(&finished);
+                self.requests.remove_batch(&finished);
             }
             Err(error) => {
                 self.last_step_error = Some(error);
                 for uid in request_ids {
-                    if self.prefill.running_request(uid).is_some() {
+                    if self.requests.running_request(uid).is_some() {
                         self.retire_request(uid, false);
                         results.push(self.terminal_result(uid, FinishReason::Error));
                     }
@@ -375,7 +384,7 @@ impl Scheduler {
     fn retire_request(&mut self, uid: RequestId, publish: bool) {
         let fence = self.resource_fence(uid);
         let mut request = self
-            .prefill
+            .requests
             .retire(uid)
             .expect("retired request is running");
         request.status = SequenceStatus::Finished;
@@ -392,7 +401,7 @@ impl Scheduler {
 
     fn release_retired(&mut self, request: Request, publish: bool) {
         let uid = request.uid;
-        if let Err(error) = self.prefill.release_retired(request, publish) {
+        if let Err(error) = self.requests.release_retired(request, publish) {
             // Logical terminal output was already emitted. Cache maintenance
             // failure is reported here, without emitting a second terminal.
             tracing::error!(uid, error = %error, "deferred KV cache publish failed");
@@ -442,38 +451,177 @@ impl Scheduler {
     fn launch_decode(
         &mut self,
         batch: super::decode::DecodeBatch,
-        future: Option<&[(RequestId, usize)]>,
+        future: Option<&RelayPlan>,
     ) -> std::result::Result<PendingBatch, EngineError> {
         self.launch_batch(batch.request_ids, batch.model_batch, future)
+    }
+
+    fn launch_plan(
+        &mut self,
+        mut plan: SchedulePlan,
+    ) -> std::result::Result<PendingBatch, EngineError> {
+        if plan.phase == BatchPhase::Prefill {
+            if let (Some(relay), Some(offset)) = (&plan.relay, plan.relay_offset) {
+                let slots = Tensor::from_slice(
+                    &relay
+                        .slots()
+                        .into_iter()
+                        .map(|slot| slot as i64)
+                        .collect::<Vec<_>>(),
+                )
+                .to_device(self.future_map.output_tokens().device());
+                let decode_ids = self
+                    .future_map
+                    .output_tokens()
+                    .index_select(0, &slots)
+                    .view([-1]);
+                let offset = i64::try_from(offset).map_err(|_| {
+                    EngineError::InvalidArgument(
+                        "mixed prefill token count exceeds i64".to_string(),
+                    )
+                })?;
+                let prefill_ids = plan.model_batch.input_ids.narrow(0, 0, offset);
+                plan.model_batch.input_ids = Tensor::cat(&[prefill_ids, decode_ids], 0);
+            }
+        }
+        self.launch_batch(plan.request_ids, plan.model_batch, plan.relay.as_ref())
+    }
+
+    /// Select the next batch after an outstanding invocation. This method
+    /// only builds a plan; it does not launch GPU work or consume the previous
+    /// result.
+    fn plan_after(&mut self, previous: &PendingBatch) -> Result<Option<SchedulePlan>> {
+        let previous_relay = if previous.phase == BatchPhase::Decode {
+            Some(self.future_map.plan(
+                &previous.request_ids,
+                &previous.inputs,
+                self.requests.running_requests(),
+            )?)
+        } else {
+            None
+        };
+        if let Some(selection) = self
+            .prefill
+            .schedule_prefill_selection(&mut self.requests)?
+        {
+            if let Some(relay) = previous_relay {
+                let decode_rows = relay
+                    .rows()
+                    .map(|row| {
+                        let request = self
+                            .requests
+                            .running_request(row.uid)
+                            .expect("relay request is running");
+                        MixedDecodeRequest {
+                            input_id: 0,
+                            position: row.input.written_len.saturating_sub(1),
+                            page_ids: request
+                                .cache_handle
+                                .as_ref()
+                                .expect("relay request has KV handle")
+                                .page_ids
+                                .clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if !decode_rows.is_empty() {
+                    let mixed = match self.prefill.prepare_mixed_prefill(
+                        &self.requests,
+                        &selection.request_ids,
+                        &decode_rows,
+                    ) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            self.prefill
+                                .rollback_selection(&mut self.requests, &selection.request_ids);
+                            return Err(error.into());
+                        }
+                    };
+                    let mut request_ids = selection.request_ids.clone();
+                    request_ids.extend(relay.rows().map(|row| row.uid));
+                    return Ok(Some(SchedulePlan::mixed(
+                        request_ids,
+                        mixed,
+                        relay,
+                        selection.token_count,
+                    )));
+                }
+            }
+            let model_batch = match self.prefill.build_prefill(&self.requests, &selection) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.prefill
+                        .rollback_selection(&mut self.requests, &selection.request_ids);
+                    return Err(error.into());
+                }
+            };
+            return Ok(Some(SchedulePlan::prefill(
+                selection.request_ids,
+                model_batch,
+            )));
+        }
+
+        // A prefill result must be completed before decode planning because
+        // its sampled token is not stored in FutureMap. Throughput mode may
+        // overlap consecutive prefills, but it still establishes a barrier
+        // before switching back to decode.
+        if previous.phase == BatchPhase::Prefill {
+            return Ok(None);
+        }
+
+        let relay = previous_relay.expect("decode previous batch has relay plan");
+        let Some(batch) = self.decode.schedule_relay(
+            self.requests.running_requests(),
+            &relay,
+            self.future_map.output_tokens(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SchedulePlan::decode(batch, Some(relay))))
     }
 
     fn launch_batch(
         &mut self,
         request_ids: Vec<RequestId>,
         model_batch: Batch,
-        future: Option<&[(RequestId, usize)]>,
+        future: Option<&RelayPlan>,
     ) -> std::result::Result<PendingBatch, EngineError> {
         let params = request_ids
             .iter()
-            .map(|uid| self.prefill.running_request(*uid).unwrap().sampling_params)
+            .map(|uid| self.requests.running_request(*uid).unwrap().sampling_params)
             .collect::<Vec<_>>();
         let inputs = request_ids
             .iter()
             .map(|uid| {
-                let request = self.prefill.running_request(*uid).unwrap();
+                let request = self.requests.running_request(*uid).unwrap();
                 let written_len = future
-                    .and_then(|rows| rows.iter().find(|(id, _)| id == uid))
-                    .map(|(_, len)| *len)
+                    .and_then(|plan| plan.input(*uid))
+                    .map(|input| input.written_len)
                     .unwrap_or(request.input_ids.len());
-                let output_len = request.output_len + 1 + written_len - request.input_ids.len();
-                CompletionInput {
+                let output_len = request
+                    .output_len
+                    .checked_add(1)
+                    .and_then(|value| value.checked_add(written_len))
+                    .and_then(|value| value.checked_sub(request.input_ids.len()))
+                    .ok_or_else(|| {
+                        EngineError::InvalidArgument(
+                            "decode completion length exceeds usize bounds".to_owned(),
+                        )
+                    })?;
+                let next_len = written_len.checked_add(1).ok_or_else(|| {
+                    EngineError::InvalidArgument(
+                        "decode written length exceeds usize bounds".to_owned(),
+                    )
+                })?;
+                Ok(CompletionInput {
                     written_len,
                     length_finished: output_len >= request.sampling_params.max_tokens
-                        || written_len + 1 >= self.args.max_seq_len,
+                        || next_len >= self.args.max_seq_len,
                     ignore_eos: request.sampling_params.ignore_eos,
-                }
+                })
             })
-            .collect();
+            .collect::<std::result::Result<Vec<_>, EngineError>>()?;
         let sample =
             self.engine
                 .forward_with_read_fence(&model_batch)
@@ -485,13 +633,20 @@ impl Scheduler {
                     Ok(sample)
                 });
         match sample {
-            Ok(sample) => Ok(PendingBatch {
-                fence: sample.fence(),
-                phase: model_batch.phase,
-                request_ids: request_ids,
-                inputs,
-                sample,
-            }),
+            Ok(sample) => {
+                if model_batch.phase == BatchPhase::Decode {
+                    self.future_map
+                        .publish(&request_ids, &sample.relay())
+                        .map_err(|error| EngineError::InvalidArgument(error.to_string()))?;
+                }
+                Ok(PendingBatch {
+                    fence: sample.fence(),
+                    phase: model_batch.phase,
+                    request_ids,
+                    inputs,
+                    sample,
+                })
+            }
             Err(error) => {
                 self.synchronize();
                 Err(error)
@@ -544,16 +699,16 @@ impl Scheduler {
         // A prefill's publish may canonicalize its pages. Wait for that
         // invocation and publish before planning decode for those same rows.
         // Incoming prefill alone does not require draining an old decode.
-        if self
-            .outstanding
-            .as_ref()
-            .is_some_and(|batch| batch.phase == BatchPhase::Prefill)
-        {
+        if self.outstanding.as_ref().is_some_and(|batch| {
+            batch.phase == BatchPhase::Prefill
+                && (self.args.disable_consecutive_prefill_overlap
+                    || self.requests.pending_len() == 0)
+        }) {
             self.drain_outstanding(&mut results);
         }
         if let Some(previous) = self.outstanding.take() {
-            let prefill = match self.prefill.schedule_prefill() {
-                Ok(batch) => batch,
+            let plan = match self.plan_after(&previous) {
+                Ok(plan) => plan,
                 Err(error) => {
                     self.outstanding = Some(previous);
                     self.drain_outstanding(&mut results);
@@ -561,55 +716,12 @@ impl Scheduler {
                     return Err(error);
                 }
             };
-            let (next_ids, next_phase, next) = if let Some(batch) = prefill {
-                let ids = batch.request_ids.clone();
-                (
-                    ids,
-                    BatchPhase::Prefill,
-                    self.launch_batch(batch.request_ids, batch.model_batch, None)
-                        .map(Some),
-                )
+            let (next_ids, next_phase, next) = if let Some(plan) = plan {
+                let ids = plan.request_ids.clone();
+                let phase = plan.phase;
+                (ids, phase, self.launch_plan(plan).map(Some))
             } else {
-                let future = previous
-                    .request_ids
-                    .iter()
-                    .zip(&previous.inputs)
-                    .map(|(uid, input)| {
-                        (
-                            *uid,
-                            if input.length_finished {
-                                0
-                            } else {
-                                input.written_len + 1
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let relay = previous.sample.relay();
-                let batch = match self.decode.schedule_relay(
-                    self.prefill.running_requests(),
-                    &future,
-                    &relay,
-                ) {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        self.outstanding = Some(previous);
-                        self.drain_outstanding(&mut results);
-                        self.aborted.extend(results);
-                        return Err(error);
-                    }
-                };
-                let ids = batch
-                    .as_ref()
-                    .map(|batch| batch.request_ids.clone())
-                    .unwrap_or_default();
-                (
-                    ids,
-                    BatchPhase::Decode,
-                    batch
-                        .map(|batch| self.launch_decode(batch, Some(&future)))
-                        .transpose(),
-                )
+                (Vec::new(), BatchPhase::Decode, Ok(None))
             };
             let (phase, ids, inputs, tokens) = Self::read_pending(previous);
             match next {
@@ -626,8 +738,10 @@ impl Scheduler {
                 }
             }
             self.reap_retired(false);
+            self.future_map
+                .release_inactive(self.requests.running_requests());
             results.extend(
-                self.prefill
+                self.requests
                     .drain_aborted()
                     .into_iter()
                     .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
@@ -636,8 +750,11 @@ impl Scheduler {
         }
         // No GPU invocation remains; any detached handle can now be reclaimed.
         self.reap_retired(true);
-        let (batch, schedule_us) =
-            time_schedule(self.engine.device(), || self.prefill.schedule_prefill());
+        self.future_map
+            .release_inactive(self.requests.running_requests());
+        let (batch, schedule_us) = time_schedule(self.engine.device(), || {
+            self.prefill.schedule_prefill(&mut self.requests)
+        });
         if let Some(batch) = batch? {
             self.run_phase(
                 batch.request_ids,
@@ -648,14 +765,14 @@ impl Scheduler {
             )?;
         }
         results.extend(
-            self.prefill
+            self.requests
                 .drain_aborted()
                 .into_iter()
                 .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
         );
         if let Some(batch) = self
             .decode
-            .schedule_pipeline(self.prefill.running_requests())?
+            .schedule_pipeline(self.requests.running_requests())?
         {
             let ids = batch.request_ids.clone();
             match self.launch_decode(batch, None) {
@@ -670,7 +787,7 @@ impl Scheduler {
 
     fn completion_input(&self, uid: RequestId) -> CompletionInput {
         let request = self
-            .prefill
+            .requests
             .running_request(uid)
             .expect("scheduled request is running");
         CompletionInput {
@@ -1090,11 +1207,9 @@ mod tests {
                 inner: RadixCacheManager::new(pool, 2).unwrap(),
                 calls: 0,
             });
-            scheduler.prefill = PrefillManager::new(
-                &scheduler.args,
-                cache,
-                BatchContext::new(2, 4, 2, device).unwrap(),
-            );
+            scheduler.requests = RequestManager::new(cache);
+            scheduler.prefill =
+                PrefillManager::new(&scheduler.args, BatchContext::new(2, 4, 2, device).unwrap());
             for ids in [vec![1, 2], vec![3, 4]] {
                 scheduler
                     .add_request(
@@ -1252,11 +1367,15 @@ mod tests {
                         },
                     )
                     .unwrap();
-                let batch = scheduler.prefill.schedule_prefill().unwrap().unwrap();
+                let batch = scheduler
+                    .prefill
+                    .schedule_prefill(&mut scheduler.requests)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(batch.request_ids, vec![3]);
                 if strategy == CacheStrategy::Radix {
-                    assert_eq!(scheduler.prefill.running_request(3).unwrap().cached_len, 6);
-                    let request = scheduler.prefill.running_request(3).unwrap();
+                    assert_eq!(scheduler.requests.running_request(3).unwrap().cached_len, 6);
+                    let request = scheduler.requests.running_request(3).unwrap();
                     let handle = request.cache_handle.as_ref().unwrap();
                     let cache = scheduler
                         .engine()
@@ -1366,6 +1485,62 @@ mod tests {
     }
 
     #[test]
+    fn throughput_policy_builds_mixed_prefill_batch() {
+        let (mut scheduler, path) =
+            scheduler_with_execution(CacheStrategy::Radix, 2, 16, Device::Cpu, false);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(
+                Box::new(RelayTokenModel::default()),
+                Device::Cpu,
+            ))
+            .unwrap();
+        scheduler.args.disable_consecutive_prefill_overlap = false;
+        scheduler
+            .add_request(
+                vec![1, 2],
+                SamplingParams {
+                    max_tokens: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut outputs = scheduler.step_overlap().unwrap();
+        scheduler
+            .add_request(
+                vec![4, 5],
+                SamplingParams {
+                    max_tokens: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        outputs.extend(scheduler.step_overlap().unwrap());
+        let pending = scheduler.outstanding.as_ref().unwrap();
+        assert_eq!(pending.phase, BatchPhase::Prefill);
+        assert_eq!(pending.request_ids.len(), 2);
+        assert_eq!(pending.sample.fence().ready().unwrap(), true);
+        while !scheduler.is_idle() {
+            outputs.extend(scheduler.step_overlap().unwrap());
+        }
+        let mut rows = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for output in outputs {
+            rows.entry(output.uid)
+                .or_default()
+                .push((output.token_id, output.finish_reason));
+        }
+        assert_eq!(
+            rows[&0].iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+        assert_eq!(
+            rows[&1].iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+            vec![6, 7]
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn terminal_output_and_cancel_hold_pages_until_their_fence() {
         for cancel in [false, true] {
             let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 1, 16);
@@ -1387,7 +1562,7 @@ mod tests {
             scheduler.outstanding.as_mut().unwrap().fence = fence;
             let free = scheduler.engine().kv_cache_pool().unwrap().free_count();
             let private_pages = scheduler
-                .prefill
+                .requests
                 .running_request(0)
                 .unwrap()
                 .cache_handle
@@ -1410,7 +1585,7 @@ mod tests {
                 assert_eq!(outputs.len(), 1);
                 assert_eq!(outputs[0].finish_reason, Some(FinishReason::Stop));
             }
-            assert!(scheduler.prefill.running_request(0).is_none());
+            assert!(scheduler.requests.running_request(0).is_none());
             assert_eq!(scheduler.retired.len(), 1);
             assert!(!ready.get()); // No blocking wait happened at logical finish.
             scheduler.reap_retired(false);
@@ -1430,9 +1605,13 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let batch = scheduler.prefill.schedule_prefill().unwrap().unwrap();
+            let batch = scheduler
+                .prefill
+                .schedule_prefill(&mut scheduler.requests)
+                .unwrap()
+                .unwrap();
             assert_eq!(batch.request_ids, vec![1]);
-            assert_eq!(scheduler.prefill.running_request(1).unwrap().cached_len, 2);
+            assert_eq!(scheduler.requests.running_request(1).unwrap().cached_len, 2);
             drop(batch);
             let free = scheduler.engine().kv_cache_pool().unwrap().free_count();
             ready.set(true);
@@ -1459,12 +1638,12 @@ mod tests {
             .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), Device::Cpu))
             .unwrap();
         let pool = scheduler.engine.shared_kv_cache_pool().unwrap();
+        scheduler.requests = RequestManager::new(Box::new(FailSecondPublish {
+            inner: RadixCacheManager::new(pool, 2).unwrap(),
+            calls: 0,
+        }));
         scheduler.prefill = PrefillManager::new(
             &scheduler.args,
-            Box::new(FailSecondPublish {
-                inner: RadixCacheManager::new(pool, 2).unwrap(),
-                calls: 0,
-            }),
             BatchContext::new(1, 16, 2, Device::Cpu).unwrap(),
         );
         scheduler
@@ -1479,7 +1658,7 @@ mod tests {
         scheduler.step_serial().unwrap();
         let batch = scheduler
             .decode
-            .schedule_decode(scheduler.prefill.running_requests())
+            .schedule_decode(scheduler.requests.running_requests())
             .unwrap()
             .unwrap();
         let mut pending = scheduler.launch_decode(batch, None).unwrap();
@@ -1560,10 +1739,10 @@ mod tests {
                 scheduler.outstanding.as_ref().unwrap().phase,
                 BatchPhase::Decode
             );
-            assert!(scheduler.prefill.running_request(0).is_none());
+            assert!(scheduler.requests.running_request(0).is_none());
             assert_eq!(
                 *scheduler
-                    .prefill
+                    .requests
                     .running_request(1)
                     .unwrap()
                     .input_ids
@@ -1592,8 +1771,8 @@ mod tests {
             );
             let pending = scheduler.outstanding.as_ref().unwrap();
             assert_eq!(pending.phase, BatchPhase::Prefill);
-            assert_eq!(pending.request_ids, vec![2]);
-            assert_eq!(scheduler.prefill.running_request(2).unwrap().output_len, 0);
+            assert_eq!(pending.request_ids, vec![2, 1]);
+            assert_eq!(scheduler.requests.running_request(2).unwrap().output_len, 0);
             outputs.extend(switching);
             if cancel_prefill {
                 assert!(scheduler.abort_request(2));
@@ -1962,7 +2141,8 @@ mod tests {
             calls: 0,
         });
         let context = BatchContext::new(2, 4, 2, Device::Cpu).unwrap();
-        scheduler.prefill = PrefillManager::new(&scheduler.args, cache, context);
+        scheduler.requests = RequestManager::new(cache);
+        scheduler.prefill = PrefillManager::new(&scheduler.args, context);
         let first = scheduler
             .add_request(
                 vec![1, 2],

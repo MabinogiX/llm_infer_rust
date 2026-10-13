@@ -29,6 +29,11 @@ pub struct ServerArgs {
     pub tp_size: usize,
     pub memory_ratio: f64,
     pub max_running_req: usize,
+    /// Maximum uncached tokens admitted into one prefill batch; zero means no
+    /// independent token limit.
+    pub max_prefill_tokens_per_batch: usize,
+    /// Drain a prefill before launching another prefill to prioritize TTFT.
+    pub disable_consecutive_prefill_overlap: bool,
     /// Maximum captured decode batch size. None uses max_running_req; zero disables capture.
     pub cuda_graph_bs: Option<usize>,
     /// Maximum aggregate token bucket for segmented prefill graphs; zero disables.
@@ -52,6 +57,8 @@ impl ServerArgs {
             tp_size: 1,
             memory_ratio: 0.9,
             max_running_req: 256,
+            max_prefill_tokens_per_batch: 8192,
+            disable_consecutive_prefill_overlap: true,
             cuda_graph_bs: None,
             prefill_cuda_graph_max_tokens: 2048,
             disable_cpu_gpu_overlap: false,

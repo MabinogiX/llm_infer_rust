@@ -10,7 +10,7 @@ mod model_runner;
 mod sampling;
 pub(crate) mod segmented_graph;
 
-pub use batch_context::{BatchContext, BatchContextError, BatchRequest};
+pub use batch_context::{BatchContext, BatchContextError, BatchRequest, MixedDecodeRequest};
 pub use engine::{
     Engine, EngineError, Result, RuntimeModelConfig, ServerArgs, validate_max_seq_len,
     validate_model_path,
