@@ -2,6 +2,7 @@
 
 mod decode;
 mod error;
+mod future_map;
 mod prefill;
 mod request;
 mod scheduler;

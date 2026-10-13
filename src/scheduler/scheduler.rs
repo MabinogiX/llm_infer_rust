@@ -11,6 +11,7 @@ use crate::profiling::{StepProfiler, StepStage, time_schedule};
 use super::{
     DecodeManager, FinishReason, OutputToken, PrefillManager, Request, RequestId, Result,
     SchedulerError, SequenceStatus,
+    future_map::{CompletionInput, FutureMap, RelayPlan},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,13 +22,6 @@ pub enum CacheStrategy {
 
 /// Completion boundary for an outstanding forward; the CPU sequence may lag
 /// its device-side token relay by one invocation.
-#[derive(Clone, Copy)]
-struct CompletionInput {
-    written_len: usize,
-    length_finished: bool,
-    ignore_eos: bool,
-}
-
 struct PendingBatch {
     fence: crate::engine::CompletionFence,
     phase: BatchPhase,
@@ -56,6 +50,7 @@ pub struct Scheduler {
     last_step_error: Option<EngineError>,
     outstanding: Option<PendingBatch>,
     retired: VecDeque<RetiredRequest>,
+    future_map: FutureMap,
 }
 
 impl Scheduler {
@@ -82,6 +77,8 @@ impl Scheduler {
         )?;
         let prefill = PrefillManager::new(&args, cache, batch_context);
         let decode = DecodeManager::new(&args, engine.device())?;
+        let future_map_rows = args.max_running_req;
+        let future_map_device = engine.device();
         Ok(Self {
             engine,
             args,
@@ -94,6 +91,7 @@ impl Scheduler {
             last_step_error: None,
             outstanding: None,
             retired: VecDeque::new(),
+            future_map: FutureMap::new(future_map_rows, future_map_device),
         })
     }
 
@@ -106,6 +104,8 @@ impl Scheduler {
         let mut outputs = Vec::new();
         self.drain_outstanding(&mut outputs);
         self.reap_retired(true);
+        self.future_map
+            .release_inactive(self.prefill.running_requests());
         self.aborted.extend(outputs);
         &mut self.engine
     }
@@ -442,7 +442,7 @@ impl Scheduler {
     fn launch_decode(
         &mut self,
         batch: super::decode::DecodeBatch,
-        future: Option<&[(RequestId, usize)]>,
+        future: Option<&RelayPlan>,
     ) -> std::result::Result<PendingBatch, EngineError> {
         self.launch_batch(batch.request_ids, batch.model_batch, future)
     }
@@ -451,7 +451,7 @@ impl Scheduler {
         &mut self,
         request_ids: Vec<RequestId>,
         model_batch: Batch,
-        future: Option<&[(RequestId, usize)]>,
+        future: Option<&RelayPlan>,
     ) -> std::result::Result<PendingBatch, EngineError> {
         let params = request_ids
             .iter()
@@ -462,8 +462,8 @@ impl Scheduler {
             .map(|uid| {
                 let request = self.prefill.running_request(*uid).unwrap();
                 let written_len = future
-                    .and_then(|rows| rows.iter().find(|(id, _)| id == uid))
-                    .map(|(_, len)| *len)
+                    .and_then(|plan| plan.input(*uid))
+                    .map(|input| input.written_len)
                     .unwrap_or(request.input_ids.len());
                 let output_len = request.output_len + 1 + written_len - request.input_ids.len();
                 CompletionInput {
@@ -485,13 +485,20 @@ impl Scheduler {
                     Ok(sample)
                 });
         match sample {
-            Ok(sample) => Ok(PendingBatch {
-                fence: sample.fence(),
-                phase: model_batch.phase,
-                request_ids: request_ids,
-                inputs,
-                sample,
-            }),
+            Ok(sample) => {
+                if model_batch.phase == BatchPhase::Decode {
+                    self.future_map
+                        .publish(&request_ids, &sample.relay())
+                        .map_err(|error| EngineError::InvalidArgument(error.to_string()))?;
+                }
+                Ok(PendingBatch {
+                    fence: sample.fence(),
+                    phase: model_batch.phase,
+                    request_ids,
+                    inputs,
+                    sample,
+                })
+            }
             Err(error) => {
                 self.synchronize();
                 Err(error)
@@ -570,26 +577,15 @@ impl Scheduler {
                         .map(Some),
                 )
             } else {
-                let future = previous
-                    .request_ids
-                    .iter()
-                    .zip(&previous.inputs)
-                    .map(|(uid, input)| {
-                        (
-                            *uid,
-                            if input.length_finished {
-                                0
-                            } else {
-                                input.written_len + 1
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let relay = previous.sample.relay();
+                let future = self.future_map.plan(
+                    &previous.request_ids,
+                    &previous.inputs,
+                    self.prefill.running_requests(),
+                )?;
                 let batch = match self.decode.schedule_relay(
                     self.prefill.running_requests(),
                     &future,
-                    &relay,
+                    self.future_map.output_tokens(),
                 ) {
                     Ok(batch) => batch,
                     Err(error) => {
@@ -626,6 +622,8 @@ impl Scheduler {
                 }
             }
             self.reap_retired(false);
+            self.future_map
+                .release_inactive(self.prefill.running_requests());
             results.extend(
                 self.prefill
                     .drain_aborted()
@@ -636,6 +634,8 @@ impl Scheduler {
         }
         // No GPU invocation remains; any detached handle can now be reclaimed.
         self.reap_retired(true);
+        self.future_map
+            .release_inactive(self.prefill.running_requests());
         let (batch, schedule_us) =
             time_schedule(self.engine.device(), || self.prefill.schedule_prefill());
         if let Some(batch) = batch? {
