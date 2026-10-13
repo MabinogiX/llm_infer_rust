@@ -475,11 +475,12 @@ impl Scheduler {
                     .output_tokens()
                     .index_select(0, &slots)
                     .view([-1]);
-                let prefill_ids = plan.model_batch.input_ids.narrow(
-                    0,
-                    0,
-                    i64::try_from(offset).expect("mixed prefill token count fits i64"),
-                );
+                let offset = i64::try_from(offset).map_err(|_| {
+                    EngineError::InvalidArgument(
+                        "mixed prefill token count exceeds i64".to_string(),
+                    )
+                })?;
+                let prefill_ids = plan.model_batch.input_ids.narrow(0, 0, offset);
                 plan.model_batch.input_ids = Tensor::cat(&[prefill_ids, decode_ids], 0);
             }
         }
@@ -499,7 +500,10 @@ impl Scheduler {
         } else {
             None
         };
-        if let Some(batch) = self.prefill.schedule_prefill(&mut self.requests)? {
+        if let Some(selection) = self
+            .prefill
+            .schedule_prefill_selection(&mut self.requests)?
+        {
             if let Some(relay) = previous_relay {
                 let decode_rows = relay
                     .rows()
@@ -521,25 +525,39 @@ impl Scheduler {
                     })
                     .collect::<Vec<_>>();
                 if !decode_rows.is_empty() {
-                    let prefill_tokens = batch.model_batch.input_ids.numel();
-                    let mixed = self.prefill.prepare_mixed_prefill(
+                    let mixed = match self.prefill.prepare_mixed_prefill(
                         &self.requests,
-                        &batch.request_ids,
+                        &selection.request_ids,
                         &decode_rows,
-                    )?;
-                    let mut request_ids = batch.request_ids;
+                    ) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            self.prefill
+                                .rollback_selection(&mut self.requests, &selection.request_ids);
+                            return Err(error.into());
+                        }
+                    };
+                    let mut request_ids = selection.request_ids.clone();
                     request_ids.extend(relay.rows().map(|row| row.uid));
                     return Ok(Some(SchedulePlan::mixed(
                         request_ids,
                         mixed,
                         relay,
-                        prefill_tokens,
+                        selection.token_count,
                     )));
                 }
             }
+            let model_batch = match self.prefill.build_prefill(&self.requests, &selection) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.prefill
+                        .rollback_selection(&mut self.requests, &selection.request_ids);
+                    return Err(error.into());
+                }
+            };
             return Ok(Some(SchedulePlan::prefill(
-                batch.request_ids,
-                batch.model_batch,
+                selection.request_ids,
+                model_batch,
             )));
         }
 
@@ -581,15 +599,29 @@ impl Scheduler {
                     .and_then(|plan| plan.input(*uid))
                     .map(|input| input.written_len)
                     .unwrap_or(request.input_ids.len());
-                let output_len = request.output_len + 1 + written_len - request.input_ids.len();
-                CompletionInput {
+                let output_len = request
+                    .output_len
+                    .checked_add(1)
+                    .and_then(|value| value.checked_add(written_len))
+                    .and_then(|value| value.checked_sub(request.input_ids.len()))
+                    .ok_or_else(|| {
+                        EngineError::InvalidArgument(
+                            "decode completion length exceeds usize bounds".to_owned(),
+                        )
+                    })?;
+                let next_len = written_len.checked_add(1).ok_or_else(|| {
+                    EngineError::InvalidArgument(
+                        "decode written length exceeds usize bounds".to_owned(),
+                    )
+                })?;
+                Ok(CompletionInput {
                     written_len,
                     length_finished: output_len >= request.sampling_params.max_tokens
-                        || written_len + 1 >= self.args.max_seq_len,
+                        || next_len >= self.args.max_seq_len,
                     ignore_eos: request.sampling_params.ignore_eos,
-                }
+                })
             })
-            .collect();
+            .collect::<std::result::Result<Vec<_>, EngineError>>()?;
         let sample =
             self.engine
                 .forward_with_read_fence(&model_batch)
@@ -1473,7 +1505,7 @@ mod tests {
                 },
             )
             .unwrap();
-        scheduler.step_overlap().unwrap();
+        let mut outputs = scheduler.step_overlap().unwrap();
         scheduler
             .add_request(
                 vec![4, 5],
@@ -1483,14 +1515,28 @@ mod tests {
                 },
             )
             .unwrap();
-        scheduler.step_overlap().unwrap();
+        outputs.extend(scheduler.step_overlap().unwrap());
         let pending = scheduler.outstanding.as_ref().unwrap();
         assert_eq!(pending.phase, BatchPhase::Prefill);
         assert_eq!(pending.request_ids.len(), 2);
         assert_eq!(pending.sample.fence().ready().unwrap(), true);
         while !scheduler.is_idle() {
-            scheduler.step_overlap().unwrap();
+            outputs.extend(scheduler.step_overlap().unwrap());
         }
+        let mut rows = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for output in outputs {
+            rows.entry(output.uid)
+                .or_default()
+                .push((output.token_id, output.finish_reason));
+        }
+        assert_eq!(
+            rows[&0].iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+        assert_eq!(
+            rows[&1].iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+            vec![6, 7]
+        );
         fs::remove_dir_all(path).unwrap();
     }
 

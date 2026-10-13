@@ -33,7 +33,7 @@ KV retirement 契约继续有效。后续加入 [调度输入读取边界与 met
 
 若能形成新 prefill，先发射它，再等旧 decode 的 readback event 并返回旧结果。当前 outstanding 成为 prefill，避免为了“有新请求到来”先把 decode 流水线排空。若请求槽满、预算或内存不足而未形成 prefill，继续 decode relay，存活请求仍前进。
 
-Prefill 自身完成后，需要先 publish 再为这些 UID 准备 decode：radix canonicalization 可能替换其页 ID、释放重复私有页，不能让同一请求的下一轮持旧页表发射。这是页表依赖屏障。连续 prefill 也先提交已完成的 prefill 结果；本阶段没有混合批次或 chunked prefill。
+Prefill 自身完成后，需要先 publish 再为这些 UID 准备 decode：radix canonicalization 可能替换其页 ID、释放重复私有页，不能让同一请求的下一轮持旧页表发射。这是页表依赖屏障。连续 prefill 也先提交已完成的 prefill 结果；mixed prefill 复用同一 prefill-shaped Batch，在该屏障之外不增加额外的 KV 回收语义。
 
 长 prefill 的 GPU 计算仍会推迟后续 decode，因为 GPU forward 串行。消除的是额外的 CPU 排空与结果提交等待，不承诺其他请求的 TPOT 完全不受 prefill 工作影响。现有 pageable metadata H2D 和 backend 规划也可能同步，完整 host shadow 尚未实施。
 
@@ -45,7 +45,7 @@ Scheduler 销毁显式等待 outstanding 的 fence，之后才处理剩余 retir
 
 ## 验收
 
-CPU 130 项（129 lib + 1 integration）、CUDA 23 项（22 lib + 1 integration）、Python 基准依赖回归 2 项通过，格式与 diff 检查通过。日志为 `logs/overlap-retirement-{cpu,cuda,build,benchmark}-20261012.log`。
+CPU 136 项通过（1 项 ignored）、CUDA 23 项（22 lib + 1 integration）、Python 基准依赖回归 2 项通过，格式与 diff 检查通过。日志为 `logs/overlap-retirement-{cpu,cuda,build,benchmark}-20261012.log`。
 
 新增测试覆盖：事件未完成时终止结果已生成、KV 页保持持有、逻辑结束打开请求槽、共享前缀仍可被其他请求引用、事件完成后恰好释放；延迟 publish 部分成功后失败的页回收和单次终止；EOS 与存活请求继续流水线；decode→异步 prefill 的先发射后提交；取消 in-flight prefill 的结果丢弃。既有同一 runner logits/KV/保留输出回归继续执行。
 

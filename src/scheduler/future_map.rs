@@ -85,8 +85,15 @@ impl FutureMap {
         if slots.is_empty() {
             return Ok(());
         }
-        let index = Tensor::from_slice(&slots.iter().map(|&slot| slot as i64).collect::<Vec<_>>())
-            .to_device(self.output_tokens.device());
+        let index_values = slots
+            .iter()
+            .map(|&slot| {
+                i64::try_from(slot).map_err(|_| {
+                    SchedulerError::InvalidDecode("future map slot exceeds i64".to_owned())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let index = Tensor::from_slice(&index_values).to_device(self.output_tokens.device());
         let _ = self.output_tokens.index_copy_(0, &index, ids);
         Ok(())
     }
@@ -128,7 +135,11 @@ impl FutureMap {
                 uid: request.uid,
                 slot,
                 input: CompletionInput {
-                    written_len: input.written_len + 1,
+                    written_len: input.written_len.checked_add(1).ok_or_else(|| {
+                        SchedulerError::InvalidDecode(
+                            "future map written length exceeds usize".to_owned(),
+                        )
+                    })?,
                     ..input
                 },
             });
@@ -217,5 +228,42 @@ mod tests {
         assert_eq!(row_7.uid, 7);
         assert_ne!(row_9.slot, row_7.slot);
         assert_eq!(row_9.input.written_len, 6);
+    }
+
+    #[test]
+    fn publishes_values_and_reuses_released_slots() {
+        let mut map = FutureMap::new(2, Device::Cpu);
+        map.publish(&[7, 9], &Tensor::from_slice(&[11_i64, 22]))
+            .unwrap();
+        assert_eq!(
+            Vec::<i64>::try_from(map.output_tokens()).unwrap(),
+            vec![11, 22]
+        );
+        map.release_inactive(&[Request {
+            uid: 9,
+            input_ids: vec![1],
+            sampling_params: Default::default(),
+            cached_len: 0,
+            output_len: 0,
+            cache_handle: None,
+            status: super::super::SequenceStatus::Running,
+        }]);
+        map.publish(&[11], &Tensor::from_slice(&[33_i64])).unwrap();
+        assert!(map.by_uid.contains_key(&11));
+        assert_eq!(map.by_uid.len(), 2);
+    }
+
+    #[test]
+    fn rejects_publish_size_mismatch_and_slot_exhaustion() {
+        let mut map = FutureMap::new(1, Device::Cpu);
+        assert!(matches!(
+            map.publish(&[7], &Tensor::from_slice(&[1_i64, 2])),
+            Err(SchedulerError::InvalidDecode(_))
+        ));
+        map.publish(&[7], &Tensor::from_slice(&[1_i64])).unwrap();
+        assert!(matches!(
+            map.publish(&[9], &Tensor::from_slice(&[2_i64])),
+            Err(SchedulerError::InvalidDecode(_))
+        ));
     }
 }

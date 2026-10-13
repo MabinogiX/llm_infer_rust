@@ -165,6 +165,11 @@ impl BatchContext {
                     input_len: request.input_ids.len(),
                 });
             }
+            if request.input_ids.len() > self.max_seq_len {
+                return Err(BatchContextError::InvalidConfiguration(
+                    "request input exceeds max_seq_len",
+                ));
+            }
             let uncached = request.input_ids[request.cached_len..].to_vec();
             if uncached.is_empty() {
                 return Err(BatchContextError::EmptyUncachedRequest);
@@ -418,6 +423,44 @@ mod tests {
         let prefixes = metadata.prefix_lens.as_ref().unwrap();
         assert_eq!(Vec::<i32>::try_from(bounds).unwrap(), vec![0, 2, 3]);
         assert_eq!(Vec::<i32>::try_from(prefixes).unwrap(), vec![0, 2]);
+        assert_eq!(
+            Vec::<i32>::try_from(metadata.write_loc.as_ref().unwrap()).unwrap(),
+            vec![0, 1, 4]
+        );
+        assert_eq!(
+            Vec::<i64>::try_from(&batch.logits_indices.unwrap()).unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            Vec::<Vec<i32>>::try_from(metadata.block_table.as_ref().unwrap()).unwrap(),
+            vec![vec![0, -1, -1, -1], vec![1, 2, -1, -1]]
+        );
+        assert_eq!(
+            Vec::<Vec<i32>>::try_from(metadata.req_to_token.as_ref().unwrap()).unwrap(),
+            vec![
+                vec![0, 1, -1, -1, -1, -1, -1, -1],
+                vec![2, 3, 4, -1, -1, -1, -1, -1]
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_mixed_prefill() {
+        let context = BatchContext::new(1, 2, 2, Device::Cpu).unwrap();
+        let result = context.prepare_mixed_prefill(
+            &[BatchRequest {
+                input_ids: vec![1, 2, 3],
+                cached_len: 0,
+                page_ids: vec![0, 1],
+            }],
+            &[],
+        );
+        assert!(matches!(
+            result,
+            Err(BatchContextError::InvalidConfiguration(
+                "request input exceeds max_seq_len"
+            ))
+        ));
     }
 
     #[test]

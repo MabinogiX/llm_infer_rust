@@ -10,6 +10,11 @@ pub struct PrefillBatch {
     pub model_batch: Batch,
 }
 
+pub(crate) struct PrefillSelection {
+    pub(crate) request_ids: Vec<RequestId>,
+    pub(crate) token_count: usize,
+}
+
 pub struct PrefillManager {
     batch_context: BatchContext,
     max_running_req: usize,
@@ -31,23 +36,44 @@ impl PrefillManager {
         &mut self,
         requests: &mut RequestManager,
     ) -> Result<Option<PrefillBatch>> {
+        let Some(selection) = self.schedule_prefill_selection(requests)? else {
+            return Ok(None);
+        };
+        let model_batch = match self.build_prefill(requests, &selection) {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.rollback_selection(requests, &selection.request_ids);
+                return Err(error);
+            }
+        };
+        Ok(Some(PrefillBatch {
+            request_ids: selection.request_ids,
+            model_batch,
+        }))
+    }
+
+    pub(crate) fn schedule_prefill_selection(
+        &mut self,
+        requests: &mut RequestManager,
+    ) -> Result<Option<PrefillSelection>> {
         let mut selected = Vec::new();
-        let result = self.select_and_build(requests, &mut selected);
+        let result = self.select_requests(requests, &mut selected);
         if result.is_err() {
-            // A preparation error must not make accepted requests disappear.
-            // Undo allocations and put this step's selections back at the
-            // head of the queue in their original order.
-            let mut restored = Vec::new();
-            for uid in &selected {
-                if let Some(request) = requests.remove_running(*uid) {
-                    restored.push(request);
-                }
-            }
-            for request in restored.into_iter().rev() {
-                requests.restore_waiting(request);
-            }
+            self.rollback_selection(requests, &selected);
         }
         result
+    }
+
+    pub(crate) fn rollback_selection(&self, requests: &mut RequestManager, selected: &[RequestId]) {
+        let mut restored = Vec::new();
+        for uid in selected {
+            if let Some(request) = requests.remove_running(*uid) {
+                restored.push(request);
+            }
+        }
+        for request in restored.into_iter().rev() {
+            requests.restore_waiting(request);
+        }
     }
 
     pub(crate) fn prepare_mixed_prefill(
@@ -69,11 +95,11 @@ impl PrefillManager {
             .prepare_mixed_prefill(&prefills, decode_rows)?)
     }
 
-    fn select_and_build(
+    fn select_requests(
         &mut self,
         requests: &mut RequestManager,
         selected: &mut Vec<RequestId>,
-    ) -> Result<Option<PrefillBatch>> {
+    ) -> Result<Option<PrefillSelection>> {
         let mut total_tokens = 0usize;
         while requests.running_len() < self.max_running_req {
             let Some(request) = requests.pending_front() else {
@@ -109,7 +135,11 @@ impl PrefillManager {
                 AcquireOutcome::DeferredBudget | AcquireOutcome::DeferredMemory => break,
             };
             let matched_len = handle.cached_len;
-            let uncached = prompt_len - matched_len;
+            let uncached = prompt_len.checked_sub(matched_len).ok_or_else(|| {
+                super::SchedulerError::InvalidDecode(
+                    "cache matched length exceeds prompt length".to_owned(),
+                )
+            })?;
             let mut request = requests.pop_pending().expect("front exists");
             request.cached_len = matched_len;
             request.cache_handle = Some(handle);
@@ -122,7 +152,19 @@ impl PrefillManager {
         if selected.is_empty() {
             return Ok(None);
         }
-        let batch_requests = selected
+        Ok(Some(PrefillSelection {
+            request_ids: std::mem::take(selected),
+            token_count: total_tokens,
+        }))
+    }
+
+    pub(crate) fn build_prefill(
+        &self,
+        requests: &RequestManager,
+        selection: &PrefillSelection,
+    ) -> Result<Batch> {
+        let batch_requests = selection
+            .request_ids
             .iter()
             .map(|uid| {
                 let request = requests
@@ -141,7 +183,7 @@ impl PrefillManager {
             })
             .collect::<Vec<_>>();
         let model_batch = self.batch_context.prepare_prefill(&batch_requests)?;
-        for uid in selected.iter().copied() {
+        for uid in selection.request_ids.iter().copied() {
             let request = requests
                 .running_request(uid)
                 .expect("selected request is running");
@@ -152,10 +194,7 @@ impl PrefillManager {
                 "prefill KV cache match"
             );
         }
-        Ok(Some(PrefillBatch {
-            request_ids: std::mem::take(selected),
-            model_batch,
-        }))
+        Ok(model_batch)
     }
 }
 
