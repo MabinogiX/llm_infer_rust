@@ -2,8 +2,8 @@
 
 use crate::engine::{Batch, BatchPhase};
 
-use super::future_map::RelayPlan;
 use super::{DecodeBatch, RequestId};
+use super::{future_map::RelayPlan, prefill::PrefillChunk};
 
 pub(crate) struct SchedulePlan {
     pub(crate) phase: BatchPhase,
@@ -13,16 +13,22 @@ pub(crate) struct SchedulePlan {
     /// token buffer. Initial decode and prefill use batch-owned inputs.
     pub(crate) relay: Option<RelayPlan>,
     pub(crate) relay_offset: Option<usize>,
+    pub(crate) chunk: Option<PrefillChunk>,
 }
 
 impl SchedulePlan {
-    pub(crate) fn prefill(request_ids: Vec<RequestId>, model_batch: Batch) -> Self {
+    pub(crate) fn prefill(
+        request_ids: Vec<RequestId>,
+        model_batch: Batch,
+        chunk: Option<PrefillChunk>,
+    ) -> Self {
         Self {
             phase: BatchPhase::Prefill,
             request_ids,
             model_batch,
             relay: None,
             relay_offset: None,
+            chunk,
         }
     }
 
@@ -33,6 +39,7 @@ impl SchedulePlan {
             model_batch: batch.model_batch,
             relay,
             relay_offset: None,
+            chunk: None,
         }
     }
 
@@ -41,6 +48,7 @@ impl SchedulePlan {
         model_batch: Batch,
         relay: RelayPlan,
         relay_offset: usize,
+        chunk: Option<PrefillChunk>,
     ) -> Self {
         Self {
             phase: BatchPhase::Prefill,
@@ -48,6 +56,7 @@ impl SchedulePlan {
             model_batch,
             relay: Some(relay),
             relay_offset: Some(relay_offset),
+            chunk,
         }
     }
 }

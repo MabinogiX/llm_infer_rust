@@ -7,6 +7,7 @@ use std::{
     cell::{Ref, RefCell, RefMut},
     fmt,
     path::{Path, PathBuf},
+    process::Command,
     rc::Rc,
 };
 
@@ -32,6 +33,10 @@ pub struct ServerArgs {
     /// Maximum uncached tokens admitted into one prefill batch; zero means no
     /// independent token limit.
     pub max_prefill_tokens_per_batch: usize,
+    /// Maximum tokens processed for one request in a prefill chunk; zero disables chunking.
+    pub chunked_prefill_size: usize,
+    /// Whether chunked_prefill_size was explicitly supplied by the user.
+    pub chunked_prefill_size_explicit: bool,
     /// Drain a prefill before launching another prefill to prioritize TTFT.
     pub disable_consecutive_prefill_overlap: bool,
     /// Maximum captured decode batch size. None uses max_running_req; zero disables capture.
@@ -58,6 +63,8 @@ impl ServerArgs {
             memory_ratio: 0.9,
             max_running_req: 256,
             max_prefill_tokens_per_batch: 8192,
+            chunked_prefill_size: 0,
+            chunked_prefill_size_explicit: false,
             disable_consecutive_prefill_overlap: true,
             cuda_graph_bs: None,
             prefill_cuda_graph_max_tokens: 2048,
@@ -247,6 +254,7 @@ impl Engine {
             return Err(EngineError::NotImplemented("Rust 分布式张量并行初始化"));
         }
         validate_max_seq_len(&server_args, runtime_config)?;
+        validate_chunked_prefill(server_args)?;
         let device = resolve_device(&server_args.device, Cuda::is_available())?;
         let kind = resolve_kind(&server_args.dtype, runtime_config.checkpoint_kind, device)?;
         factory.validate_runtime(runtime_config, kind, device, &server_args.attention_backend)?;
@@ -274,13 +282,14 @@ impl Engine {
     }
 
     pub fn with_cache_spec(
-        server_args: ServerArgs,
+        mut server_args: ServerArgs,
         runtime_config: RuntimeModelConfig,
         tp_rank: usize,
         kind: Kind,
         device: Device,
         spec: ModelCacheSpec,
     ) -> Result<Self> {
+        resolve_chunked_prefill_size(&mut server_args, device);
         validate_model_path(&server_args.model_path)?;
         validate_parallelism(server_args.tp_size, tp_rank)?;
         if server_args.tp_size > 1 {
@@ -522,6 +531,66 @@ pub fn validate_max_seq_len(
     Ok(())
 }
 
+fn validate_chunked_prefill(server_args: &ServerArgs) -> Result<()> {
+    if server_args.chunked_prefill_size > 0 && server_args.page_size == 0 {
+        return Err(EngineError::InvalidArgument(
+            "page_size must be greater than zero when chunked prefill is enabled".to_owned(),
+        ));
+    }
+    if server_args.chunked_prefill_size > 0
+        && server_args.chunked_prefill_size % server_args.page_size != 0
+    {
+        return Err(EngineError::InvalidArgument(
+            "chunked_prefill_size must be divisible by page_size".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_chunked_prefill_size(server_args: &mut ServerArgs, device: Device) {
+    if server_args.chunked_prefill_size_explicit
+        || server_args.chunked_prefill_size != 0
+        || !matches!(device, Device::Cuda(_))
+    {
+        return;
+    }
+    let Device::Cuda(index) = device else {
+        return;
+    };
+    let index_text = index.to_string();
+    let memory_mib = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.total",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &index_text,
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.lines().next()?.trim().parse::<u64>().ok())
+        .unwrap_or(4096);
+    server_args.chunked_prefill_size = auto_chunked_prefill_size(memory_mib);
+    tracing::info!(
+        memory_mib,
+        chunked_prefill_size = server_args.chunked_prefill_size,
+        "auto-selected chunked prefill size"
+    );
+}
+
+fn auto_chunked_prefill_size(memory_mib: u64) -> usize {
+    if memory_mib < 20 * 1024 {
+        2048
+    } else if memory_mib < 60 * 1024 {
+        4096
+    } else if memory_mib < 160 * 1024 {
+        8192
+    } else {
+        16384
+    }
+}
+
 /// Fails early when `model_path` cannot be a local Hugging Face model directory.
 pub fn validate_model_path(model_path: &Path) -> Result<()> {
     if !model_path.exists() {
@@ -621,6 +690,16 @@ mod tests {
             max_position_embeddings: 4,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn auto_chunked_prefill_matches_sglang_memory_buckets() {
+        assert_eq!(auto_chunked_prefill_size(19 * 1024), 2048);
+        assert_eq!(auto_chunked_prefill_size(20 * 1024), 4096);
+        assert_eq!(auto_chunked_prefill_size(59 * 1024), 4096);
+        assert_eq!(auto_chunked_prefill_size(60 * 1024), 8192);
+        assert_eq!(auto_chunked_prefill_size(159 * 1024), 8192);
+        assert_eq!(auto_chunked_prefill_size(160 * 1024), 16384);
     }
 
     #[test]

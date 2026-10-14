@@ -395,11 +395,13 @@ mod tests {
     }
 
     fn running(uid: RequestId, input_ids: Vec<i64>, pages: Vec<usize>) -> Request {
+        let prompt_len = input_ids.len();
         Request {
             uid,
             input_ids,
             sampling_params: SamplingParams::default(),
             cached_len: 0,
+            prefill_cursor: prompt_len,
             output_len: 1,
             cache_handle: Some(BaseCacheHandle {
                 page_ids: pages,

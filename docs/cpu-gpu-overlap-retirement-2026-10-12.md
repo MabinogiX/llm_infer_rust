@@ -45,7 +45,7 @@ Scheduler 销毁显式等待 outstanding 的 fence，之后才处理剩余 retir
 
 ## 验收
 
-CPU 136 项通过（1 项 ignored）、CUDA 23 项（22 lib + 1 integration）、Python 基准依赖回归 2 项通过，格式与 diff 检查通过。日志为 `logs/overlap-retirement-{cpu,cuda,build,benchmark}-20261012.log`。
+CPU 139 项通过（1 项 ignored）、CUDA 23 项（22 lib + 1 integration）、Python 基准依赖回归 2 项通过，格式与 diff 检查通过。日志为 `logs/overlap-retirement-{cpu,cuda,build,benchmark}-20261012.log`。
 
 新增测试覆盖：事件未完成时终止结果已生成、KV 页保持持有、逻辑结束打开请求槽、共享前缀仍可被其他请求引用、事件完成后恰好释放；延迟 publish 部分成功后失败的页回收和单次终止；EOS 与存活请求继续流水线；decode→异步 prefill 的先发射后提交；取消 in-flight prefill 的结果丢弃。既有同一 runner logits/KV/保留输出回归继续执行。
 

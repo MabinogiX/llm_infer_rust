@@ -18,6 +18,7 @@ Options:\n\
   --memory-ratio R          KV cache memory ratio (default 0.9)\n\
   --max-running-req N       Maximum active requests (default 256)\n\
   --max-prefill-tokens-per-batch N  Maximum uncached prefill tokens per batch (0 disables)\n\
+  --chunked-prefill-size N  Maximum tokens per request chunk (-1/0 disables; omitted auto-selects)\n\
   --enable-consecutive-prefill-overlap  Prefer throughput over consecutive-prefill TTFT\n\
   --cuda-graph-bs N         Maximum CUDA decode graph batch (0 disables)\n\
   --prefill-cuda-graph-max-tokens N  Maximum prefill graph tokens (default 2048; 0 disables)\n\
@@ -55,6 +56,15 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--max-running-req" => engine.max_running_req = parse_value(&value()?, &flag)?,
             "--max-prefill-tokens-per-batch" => {
                 engine.max_prefill_tokens_per_batch = parse_value(&value()?, &flag)?
+            }
+            "--chunked-prefill-size" => {
+                let text = value()?;
+                if text == "-1" {
+                    engine.chunked_prefill_size = 0;
+                } else {
+                    engine.chunked_prefill_size = parse_value(&text, &flag)?;
+                }
+                engine.chunked_prefill_size_explicit = true;
             }
             "--enable-consecutive-prefill-overlap" => {
                 engine.disable_consecutive_prefill_overlap = false
@@ -148,6 +158,8 @@ mod tests {
                 "/tmp/model",
                 "--max-prefill-tokens-per-batch",
                 "3072",
+                "--chunked-prefill-size",
+                "1024",
                 "--enable-consecutive-prefill-overlap",
             ]
             .map(str::to_owned),
@@ -157,11 +169,18 @@ mod tests {
             prefill_policy_args.engine.max_prefill_tokens_per_batch,
             3072
         );
+        assert_eq!(prefill_policy_args.engine.chunked_prefill_size, 1024);
         assert!(
             !prefill_policy_args
                 .engine
                 .disable_consecutive_prefill_overlap
         );
+        let disabled_chunked = parse_args(
+            ["--model-path", "/tmp/model", "--chunked-prefill-size", "-1"].map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(disabled_chunked.engine.chunked_prefill_size, 0);
+        assert!(disabled_chunked.engine.chunked_prefill_size_explicit);
         assert!(!args.engine.disable_cpu_gpu_overlap);
         assert!(!args.engine.disable_async_metadata);
         assert!(

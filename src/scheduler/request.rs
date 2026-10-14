@@ -35,6 +35,9 @@ pub struct Request {
     pub input_ids: Vec<i64>,
     pub sampling_params: SamplingParams,
     pub cached_len: usize,
+    /// Absolute prompt boundary already written by prefill.  It advances
+    /// between chunked-prefill forwards and equals `input_ids.len()` normally.
+    pub prefill_cursor: usize,
     pub output_len: usize,
     pub cache_handle: Option<BaseCacheHandle>,
     pub status: SequenceStatus,

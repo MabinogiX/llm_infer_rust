@@ -13,6 +13,7 @@ use super::{
     DecodeManager, FinishReason, OutputToken, PrefillManager, Request, RequestId, Result,
     SchedulerError, SequenceStatus,
     future_map::{CompletionInput, FutureMap, RelayPlan},
+    prefill::PrefillChunk,
     request_manager::RequestManager,
     schedule_plan::SchedulePlan,
 };
@@ -32,6 +33,7 @@ struct PendingBatch {
     request_ids: Vec<RequestId>,
     inputs: Vec<CompletionInput>,
     sample: crate::engine::PendingSample,
+    chunk: Option<PrefillChunk>,
 }
 
 /// Own the detached sequence/handle until the last GPU invocation using it
@@ -157,6 +159,7 @@ impl Scheduler {
                 input_ids,
                 sampling_params: sampling_params.normalized(),
                 cached_len: 0,
+                prefill_cursor: 0,
                 output_len: 0,
                 cache_handle: None,
                 status: SequenceStatus::Waiting,
@@ -209,13 +212,24 @@ impl Scheduler {
         let batch = batch?;
         let mut results: Vec<_> = self.aborted.drain(..).collect();
         if let Some(batch) = batch {
+            let chunk = batch.chunk;
             self.run_phase(
                 batch.request_ids,
                 batch.model_batch,
                 BatchPhase::Prefill,
                 schedule_us,
+                chunk,
                 &mut results,
             )?;
+            if chunk.is_some_and(|chunk| !chunk.is_last) {
+                results.extend(
+                    self.requests
+                        .drain_aborted()
+                        .into_iter()
+                        .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
+                );
+                return Ok(results);
+            }
         }
         results.extend(
             self.requests
@@ -234,6 +248,7 @@ impl Scheduler {
                 batch.model_batch,
                 BatchPhase::Decode,
                 schedule_us,
+                None,
                 &mut results,
             )?;
         }
@@ -246,6 +261,7 @@ impl Scheduler {
         model_batch: Batch,
         phase: BatchPhase,
         schedule_us: u128,
+        chunk: Option<PrefillChunk>,
         results: &mut Vec<OutputToken>,
     ) -> Result<()> {
         let mut profiler = StepProfiler::new(self.engine.device(), schedule_us);
@@ -276,6 +292,30 @@ impl Scheduler {
                 .collect::<Vec<_>>()
         });
         let logits = profiler.measure(StepStage::Forward, || self.engine.forward(&model_batch));
+        if chunk.is_some_and(|chunk| !chunk.is_last) {
+            let forward_ok = logits.is_ok();
+            match logits {
+                Ok(_) => {
+                    let chunk = chunk.expect("non-final chunk metadata");
+                    if let Err(error) = self.requests.publish_prefix(chunk.uid, chunk.end) {
+                        self.last_step_error = Some(EngineError::KVCache(error));
+                        self.requests.remove_batch(&[chunk.uid]);
+                    } else if let Some(request) = self.requests.running_request_mut(chunk.uid) {
+                        request.prefill_cursor = chunk.end;
+                    }
+                }
+                Err(error) => {
+                    self.synchronize();
+                    self.complete(request_ids, None, BatchPhase::Prefill, Err(error), results);
+                }
+            }
+            profiler.log(
+                BatchPhase::Prefill,
+                profile_requests.as_deref().unwrap_or(&[]),
+                forward_ok,
+            );
+            return Ok(());
+        }
         let sampled = profiler.measure(StepStage::Sample, || {
             logits
                 .and_then(|logits| self.engine.sample(&logits, &params))
@@ -336,6 +376,11 @@ impl Scheduler {
                             finish_reason: reason,
                         });
                         continue;
+                    }
+                    if phase == BatchPhase::Prefill {
+                        if let Some(request) = self.requests.running_request_mut(uid) {
+                            request.prefill_cursor = request.input_ids.len();
+                        }
                     }
                     if phase == BatchPhase::Prefill || reason.is_some() {
                         if let Err(error) = self.requests.publish(uid) {
@@ -453,7 +498,7 @@ impl Scheduler {
         batch: super::decode::DecodeBatch,
         future: Option<&RelayPlan>,
     ) -> std::result::Result<PendingBatch, EngineError> {
-        self.launch_batch(batch.request_ids, batch.model_batch, future)
+        self.launch_batch(batch.request_ids, batch.model_batch, future, None)
     }
 
     fn launch_plan(
@@ -484,7 +529,12 @@ impl Scheduler {
                 plan.model_batch.input_ids = Tensor::cat(&[prefill_ids, decode_ids], 0);
             }
         }
-        self.launch_batch(plan.request_ids, plan.model_batch, plan.relay.as_ref())
+        self.launch_batch(
+            plan.request_ids,
+            plan.model_batch,
+            plan.relay.as_ref(),
+            plan.chunk,
+        )
     }
 
     /// Select the next batch after an outstanding invocation. This method
@@ -529,6 +579,7 @@ impl Scheduler {
                         &self.requests,
                         &selection.request_ids,
                         &decode_rows,
+                        selection.chunk,
                     ) {
                         Ok(batch) => batch,
                         Err(error) => {
@@ -544,6 +595,7 @@ impl Scheduler {
                         mixed,
                         relay,
                         selection.token_count,
+                        selection.chunk,
                     )));
                 }
             }
@@ -558,6 +610,7 @@ impl Scheduler {
             return Ok(Some(SchedulePlan::prefill(
                 selection.request_ids,
                 model_batch,
+                selection.chunk,
             )));
         }
 
@@ -586,6 +639,7 @@ impl Scheduler {
         request_ids: Vec<RequestId>,
         model_batch: Batch,
         future: Option<&RelayPlan>,
+        chunk: Option<PrefillChunk>,
     ) -> std::result::Result<PendingBatch, EngineError> {
         let params = request_ids
             .iter()
@@ -645,6 +699,7 @@ impl Scheduler {
                     request_ids,
                     inputs,
                     sample,
+                    chunk,
                 })
             }
             Err(error) => {
@@ -668,6 +723,7 @@ impl Scheduler {
             request_ids,
             inputs,
             sample,
+            ..
         } = pending;
         let tokens = sample
             .finish()
@@ -686,10 +742,56 @@ impl Scheduler {
 
     fn drain_outstanding(&mut self, results: &mut Vec<OutputToken>) {
         if let Some(pending) = self.outstanding.take() {
+            let chunk = pending.chunk;
             let (phase, ids, inputs, tokens) = Self::read_pending(pending);
-            self.complete(ids, Some(inputs), phase, tokens, results);
+            if let Some(chunk) = chunk.filter(|chunk| !chunk.is_last) {
+                match tokens {
+                    Ok(tokens) => {
+                        self.complete_mixed_chunk_rows(ids, inputs, tokens, phase, chunk, results)
+                    }
+                    Err(error) => self.complete(ids, Some(inputs), phase, Err(error), results),
+                }
+            } else {
+                self.complete(ids, Some(inputs), phase, tokens, results);
+            }
         }
         self.reap_retired(false);
+    }
+
+    fn complete_mixed_chunk_rows(
+        &mut self,
+        request_ids: Vec<RequestId>,
+        inputs: Vec<CompletionInput>,
+        tokens: Vec<i64>,
+        phase: BatchPhase,
+        chunk: PrefillChunk,
+        results: &mut Vec<OutputToken>,
+    ) {
+        let mut other_ids = Vec::new();
+        let mut other_inputs = Vec::new();
+        let mut other_tokens = Vec::new();
+        for ((uid, input), token) in request_ids.into_iter().zip(inputs).zip(tokens) {
+            if uid != chunk.uid {
+                other_ids.push(uid);
+                other_inputs.push(input);
+                other_tokens.push(token);
+            }
+        }
+        if !other_ids.is_empty() {
+            self.complete(
+                other_ids,
+                Some(other_inputs),
+                phase,
+                Ok(other_tokens),
+                results,
+            );
+        }
+        if let Err(error) = self.requests.publish_prefix(chunk.uid, chunk.end) {
+            self.last_step_error = Some(EngineError::KVCache(error));
+            self.requests.remove_batch(&[chunk.uid]);
+        } else if let Some(request) = self.requests.running_request_mut(chunk.uid) {
+            request.prefill_cursor = chunk.end;
+        }
     }
 
     fn step_overlap(&mut self) -> Result<Vec<OutputToken>> {
@@ -700,9 +802,10 @@ impl Scheduler {
         // invocation and publish before planning decode for those same rows.
         // Incoming prefill alone does not require draining an old decode.
         if self.outstanding.as_ref().is_some_and(|batch| {
-            batch.phase == BatchPhase::Prefill
-                && (self.args.disable_consecutive_prefill_overlap
-                    || self.requests.pending_len() == 0)
+            batch.chunk.is_some()
+                || (batch.phase == BatchPhase::Prefill
+                    && (self.args.disable_consecutive_prefill_overlap
+                        || self.requests.pending_len() == 0))
         }) {
             self.drain_outstanding(&mut results);
         }
@@ -756,13 +859,24 @@ impl Scheduler {
             self.prefill.schedule_prefill(&mut self.requests)
         });
         if let Some(batch) = batch? {
+            let chunk = batch.chunk;
             self.run_phase(
                 batch.request_ids,
                 batch.model_batch,
                 BatchPhase::Prefill,
                 schedule_us,
+                chunk,
                 &mut results,
             )?;
+            if chunk.is_some_and(|chunk| !chunk.is_last) {
+                results.extend(
+                    self.requests
+                        .drain_aborted()
+                        .into_iter()
+                        .map(|uid| self.terminal_result(uid, FinishReason::Abort)),
+                );
+                return Ok(results);
+            }
         }
         results.extend(
             self.requests
@@ -1537,6 +1651,96 @@ mod tests {
             rows[&1].iter().map(|(token, _)| *token).collect::<Vec<_>>(),
             vec![6, 7]
         );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chunked_prefill_emits_only_final_chunk_and_matches_decode() {
+        let (mut scheduler, path) =
+            scheduler_with_execution(CacheStrategy::Radix, 1, 16, Device::Cpu, false);
+        scheduler.prefill.set_chunked_prefill_size(2);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(
+                Box::new(RelayTokenModel::default()),
+                Device::Cpu,
+            ))
+            .unwrap();
+        scheduler
+            .add_request(
+                vec![1, 2, 3, 4, 5],
+                SamplingParams {
+                    max_tokens: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mut outputs = Vec::new();
+        let mut steps = 0;
+        while !scheduler.is_idle() || steps == 0 {
+            outputs.extend(scheduler.step_overlap().unwrap());
+            steps += 1;
+            assert!(steps < 16);
+        }
+        assert!(
+            (3..=5).contains(&steps),
+            "three prefill chunks plus overlap completion barriers, got {steps}"
+        );
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.token_id)
+                .collect::<Vec<_>>(),
+            vec![6, 7]
+        );
+        assert_eq!(outputs.iter().filter(|output| output.finished).count(), 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chunked_prefill_can_mix_with_an_outstanding_decode() {
+        let (mut scheduler, path) =
+            scheduler_with_execution(CacheStrategy::Radix, 2, 16, Device::Cpu, false);
+        scheduler.prefill.set_chunked_prefill_size(2);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(
+                Box::new(RelayTokenModel::default()),
+                Device::Cpu,
+            ))
+            .unwrap();
+        scheduler
+            .add_request(
+                vec![1],
+                SamplingParams {
+                    max_tokens: 4,
+                    ignore_eos: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler.step_overlap().unwrap();
+        assert!(scheduler.outstanding.is_some());
+        scheduler
+            .add_request(
+                vec![1, 2, 3, 4, 5],
+                SamplingParams {
+                    max_tokens: 2,
+                    ignore_eos: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut outputs = Vec::new();
+        let mut steps = 0;
+        while !scheduler.is_idle() {
+            outputs.extend(scheduler.step_overlap().unwrap());
+            steps += 1;
+            assert!(steps < 32);
+        }
+        assert!(outputs.iter().any(|output| output.uid == 0));
+        assert!(outputs.iter().any(|output| output.uid == 1));
         fs::remove_dir_all(path).unwrap();
     }
 

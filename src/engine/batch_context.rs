@@ -11,6 +11,8 @@ use super::{AttentionMetadata, Batch, BatchPhase};
 pub struct BatchRequest {
     pub input_ids: Vec<i64>,
     pub cached_len: usize,
+    /// Exclusive absolute prompt end for a chunk; `None` means full prompt.
+    pub end_len: Option<usize>,
     /// Non-owning snapshot used only to construct this forward's tensors.
     pub page_ids: Vec<usize>,
 }
@@ -29,6 +31,7 @@ impl BatchRequest {
         Self {
             input_ids,
             cached_len: 0,
+            end_len: None,
             page_ids: Vec::new(),
         }
     }
@@ -125,15 +128,21 @@ impl BatchContext {
                         "request input exceeds max_seq_len",
                     ));
                 }
-                let uncached = request.input_ids[request.cached_len..].to_vec();
+                let end_len = request.end_len.unwrap_or(request.input_ids.len());
+                if end_len < request.cached_len || end_len > request.input_ids.len() {
+                    return Err(BatchContextError::InvalidConfiguration(
+                        "prefill end_len must be within cached_len..=input length",
+                    ));
+                }
+                let uncached = request.input_ids[request.cached_len..end_len].to_vec();
                 if uncached.is_empty() {
                     return Err(BatchContextError::EmptyUncachedRequest);
                 }
                 Ok(MixedRow {
                     input_ids: uncached,
-                    positions: (request.cached_len..request.input_ids.len()).collect(),
+                    positions: (request.cached_len..end_len).collect(),
                     prefix_len: request.cached_len,
-                    total_len: request.input_ids.len(),
+                    total_len: end_len,
                     page_ids: request.page_ids.clone(),
                 })
             })
@@ -170,15 +179,21 @@ impl BatchContext {
                     "request input exceeds max_seq_len",
                 ));
             }
-            let uncached = request.input_ids[request.cached_len..].to_vec();
+            let end_len = request.end_len.unwrap_or(request.input_ids.len());
+            if end_len < request.cached_len || end_len > request.input_ids.len() {
+                return Err(BatchContextError::InvalidConfiguration(
+                    "prefill end_len must be within cached_len..=input length",
+                ));
+            }
+            let uncached = request.input_ids[request.cached_len..end_len].to_vec();
             if uncached.is_empty() {
                 return Err(BatchContextError::EmptyUncachedRequest);
             }
             rows.push(MixedRow {
                 input_ids: uncached,
-                positions: (request.cached_len..request.input_ids.len()).collect(),
+                positions: (request.cached_len..end_len).collect(),
                 prefix_len: request.cached_len,
-                total_len: request.input_ids.len(),
+                total_len: end_len,
                 page_ids: request.page_ids.clone(),
             });
         }
@@ -362,11 +377,13 @@ mod tests {
             BatchRequest {
                 input_ids: vec![10, 11, 12],
                 cached_len: 2,
+                end_len: None,
                 page_ids: vec![5, 3],
             },
             BatchRequest {
                 input_ids: vec![20, 21],
                 cached_len: 0,
+                end_len: None,
                 page_ids: vec![7],
             },
         ];
@@ -406,6 +423,7 @@ mod tests {
                 &[BatchRequest {
                     input_ids: vec![1, 2],
                     cached_len: 0,
+                    end_len: None,
                     page_ids: vec![0],
                 }],
                 &[MixedDecodeRequest {
@@ -451,6 +469,7 @@ mod tests {
             &[BatchRequest {
                 input_ids: vec![1, 2, 3],
                 cached_len: 0,
+                end_len: None,
                 page_ids: vec![0, 1],
             }],
             &[],
@@ -469,6 +488,7 @@ mod tests {
         let request = BatchRequest {
             input_ids: vec![1],
             cached_len: 1,
+            end_len: None,
             page_ids: Vec::new(),
         };
         assert!(matches!(
@@ -483,6 +503,7 @@ mod tests {
         let request = BatchRequest {
             input_ids: vec![1, 2, 3],
             cached_len: 0,
+            end_len: None,
             page_ids: vec![0],
         };
         assert!(matches!(
@@ -492,6 +513,7 @@ mod tests {
         let cached_request = BatchRequest {
             input_ids: vec![1, 2, 3],
             cached_len: 2,
+            end_len: None,
             page_ids: vec![0],
         };
         assert!(matches!(

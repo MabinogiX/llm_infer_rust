@@ -8,11 +8,20 @@ use super::{RequestId, Result, SequenceStatus, request_manager::RequestManager};
 pub struct PrefillBatch {
     pub request_ids: Vec<RequestId>,
     pub model_batch: Batch,
+    pub(crate) chunk: Option<PrefillChunk>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefillChunk {
+    pub(crate) uid: RequestId,
+    pub(crate) end: usize,
+    pub(crate) is_last: bool,
 }
 
 pub(crate) struct PrefillSelection {
     pub(crate) request_ids: Vec<RequestId>,
     pub(crate) token_count: usize,
+    pub(crate) chunk: Option<PrefillChunk>,
 }
 
 pub struct PrefillManager {
@@ -20,6 +29,7 @@ pub struct PrefillManager {
     max_running_req: usize,
     max_seq_len: usize,
     max_prefill_tokens_per_batch: usize,
+    chunked_prefill_size: usize,
 }
 
 impl PrefillManager {
@@ -29,7 +39,13 @@ impl PrefillManager {
             max_running_req: args.max_running_req,
             max_seq_len: args.max_seq_len,
             max_prefill_tokens_per_batch: args.max_prefill_tokens_per_batch,
+            chunked_prefill_size: args.chunked_prefill_size,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_chunked_prefill_size(&mut self, size: usize) {
+        self.chunked_prefill_size = size;
     }
 
     pub(crate) fn schedule_prefill(
@@ -49,6 +65,7 @@ impl PrefillManager {
         Ok(Some(PrefillBatch {
             request_ids: selection.request_ids,
             model_batch,
+            chunk: selection.chunk,
         }))
     }
 
@@ -56,8 +73,36 @@ impl PrefillManager {
         &mut self,
         requests: &mut RequestManager,
     ) -> Result<Option<PrefillSelection>> {
+        if let Some(selection) = self.select_continuation(requests)? {
+            if selection.chunk.is_some_and(|chunk| !chunk.is_last) {
+                return Ok(Some(selection));
+            }
+            let mut extra_ids = Vec::new();
+            let extra = match self.select_requests(
+                requests,
+                &mut extra_ids,
+                selection.token_count,
+                false,
+            ) {
+                Ok(extra) => extra,
+                Err(error) => {
+                    self.rollback_selection(requests, &extra_ids);
+                    return Err(error);
+                }
+            };
+            let Some(extra) = extra else {
+                return Ok(Some(selection));
+            };
+            let mut request_ids = selection.request_ids;
+            request_ids.extend(extra.request_ids);
+            return Ok(Some(PrefillSelection {
+                request_ids,
+                token_count: selection.token_count + extra.token_count,
+                chunk: selection.chunk,
+            }));
+        }
         let mut selected = Vec::new();
-        let result = self.select_requests(requests, &mut selected);
+        let result = self.select_requests(requests, &mut selected, 0, true);
         if result.is_err() {
             self.rollback_selection(requests, &selected);
         }
@@ -81,13 +126,22 @@ impl PrefillManager {
         requests: &RequestManager,
         prefill_ids: &[RequestId],
         decode_rows: &[MixedDecodeRequest],
+        chunk: Option<PrefillChunk>,
     ) -> Result<Batch> {
         let prefills = prefill_ids
             .iter()
             .map(|&uid| {
-                requests
+                let request = requests
                     .batch_request(uid)
-                    .expect("scheduled prefill request is running")
+                    .expect("scheduled prefill request is running");
+                let chunk = chunk.filter(|chunk| chunk.uid == uid);
+                BatchRequest {
+                    cached_len: chunk.map_or(request.cached_len, |_| {
+                        requests.running_request(uid).unwrap().prefill_cursor
+                    }),
+                    end_len: chunk.map(|chunk| chunk.end),
+                    ..request
+                }
             })
             .collect::<Vec<_>>();
         Ok(self
@@ -99,8 +153,9 @@ impl PrefillManager {
         &mut self,
         requests: &mut RequestManager,
         selected: &mut Vec<RequestId>,
+        mut total_tokens: usize,
+        allow_chunk: bool,
     ) -> Result<Option<PrefillSelection>> {
-        let mut total_tokens = 0usize;
         while requests.running_len() < self.max_running_req {
             let Some(request) = requests.pending_front() else {
                 break;
@@ -117,7 +172,9 @@ impl PrefillManager {
                 .saturating_add(request.sampling_params.max_tokens.saturating_sub(1))
                 .min(self.max_seq_len);
             let prompt_len = request.input_ids.len();
-            let budget = if selected.is_empty() || self.max_prefill_tokens_per_batch == 0 {
+            let budget = if (selected.is_empty() && total_tokens == 0)
+                || self.max_prefill_tokens_per_batch == 0
+            {
                 None
             } else {
                 Some(
@@ -142,11 +199,41 @@ impl PrefillManager {
             })?;
             let mut request = requests.pop_pending().expect("front exists");
             request.cached_len = matched_len;
+            request.prefill_cursor = matched_len;
             request.cache_handle = Some(handle);
             request.status = SequenceStatus::Running;
+            let chunk_len = if allow_chunk && self.chunked_prefill_size > 0 {
+                let budget_limit = if self.max_prefill_tokens_per_batch == 0 {
+                    uncached
+                } else {
+                    self.max_prefill_tokens_per_batch
+                };
+                uncached.min(self.chunked_prefill_size).min(budget_limit)
+            } else {
+                uncached
+            };
+            let chunk = (chunk_len < uncached).then_some(PrefillChunk {
+                uid: request.uid,
+                end: matched_len + chunk_len,
+                is_last: false,
+            });
             selected.push(request.uid);
             requests.add_running(request);
-            total_tokens += uncached;
+            total_tokens += chunk_len;
+            if chunk.is_some() {
+                return Ok(Some(PrefillSelection {
+                    request_ids: std::mem::take(selected),
+                    token_count: total_tokens,
+                    chunk,
+                }));
+            }
+            if allow_chunk && self.chunked_prefill_size > 0 {
+                return Ok(Some(PrefillSelection {
+                    request_ids: std::mem::take(selected),
+                    token_count: total_tokens,
+                    chunk: None,
+                }));
+            }
         }
 
         if selected.is_empty() {
@@ -155,7 +242,43 @@ impl PrefillManager {
         Ok(Some(PrefillSelection {
             request_ids: std::mem::take(selected),
             token_count: total_tokens,
+            chunk: None,
         }))
+    }
+
+    fn select_continuation(
+        &self,
+        requests: &mut RequestManager,
+    ) -> Result<Option<PrefillSelection>> {
+        let Some(chunk_size) = (self.chunked_prefill_size > 0).then_some(self.chunked_prefill_size)
+        else {
+            return Ok(None);
+        };
+        let Some(request) = requests.running_requests().iter().find(|request| {
+            request.prefill_cursor < request.input_ids.len().saturating_sub(request.output_len)
+        }) else {
+            return Ok(None);
+        };
+        let prompt_len = request.input_ids.len().saturating_sub(request.output_len);
+        let budget_limit = if self.max_prefill_tokens_per_batch == 0 {
+            chunk_size
+        } else {
+            self.max_prefill_tokens_per_batch
+        };
+        let end = request
+            .prefill_cursor
+            .saturating_add(chunk_size.min(budget_limit))
+            .min(prompt_len);
+        let selection = PrefillSelection {
+            request_ids: vec![request.uid],
+            token_count: end - request.prefill_cursor,
+            chunk: Some(PrefillChunk {
+                uid: request.uid,
+                end,
+                is_last: end == prompt_len,
+            }),
+        };
+        Ok(Some(selection))
     }
 
     pub(crate) fn build_prefill(
@@ -170,9 +293,11 @@ impl PrefillManager {
                 let request = requests
                     .running_request(*uid)
                     .expect("selected request is running");
+                let chunk = selection.chunk.filter(|chunk| chunk.uid == *uid);
                 BatchRequest {
                     input_ids: request.input_ids.clone(),
-                    cached_len: request.cached_len,
+                    cached_len: chunk.map_or(request.cached_len, |_| request.prefill_cursor),
+                    end_len: chunk.map(|chunk| chunk.end),
                     page_ids: request
                         .cache_handle
                         .as_ref()
@@ -291,6 +416,7 @@ mod tests {
                 ..Default::default()
             },
             cached_len: 0,
+            prefill_cursor: 0,
             output_len: 0,
             cache_handle: None,
             status: SequenceStatus::Waiting,

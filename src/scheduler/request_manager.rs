@@ -61,6 +61,7 @@ impl RequestManager {
         Some(BatchRequest {
             input_ids: request.input_ids.clone(),
             cached_len: request.cached_len,
+            end_len: None,
             page_ids: request.cache_handle.as_ref()?.page_ids.clone(),
         })
     }
@@ -172,6 +173,28 @@ impl RequestManager {
         cache.publish(handle, &request.input_ids)
     }
 
+    pub(crate) fn publish_prefix(
+        &mut self,
+        uid: RequestId,
+        written_len: usize,
+    ) -> crate::engine::kvcache::Result<()> {
+        let (running, cache) = (&mut self.running, &mut self.cache);
+        let request = running
+            .iter_mut()
+            .find(|request| request.uid == uid)
+            .expect("scheduled request is running");
+        if written_len > request.input_ids.len() {
+            return Err(crate::engine::kvcache::KVCacheError::InvalidArgument(
+                "written prefix exceeds request input".to_owned(),
+            ));
+        }
+        let handle = request
+            .cache_handle
+            .as_mut()
+            .expect("running request has KV handle");
+        cache.publish(handle, &request.input_ids[..written_len])
+    }
+
     pub(crate) fn mark_written(&mut self, uid: RequestId, written_len: usize) {
         let request = self
             .running_request_mut(uid)
@@ -186,6 +209,7 @@ impl RequestManager {
     pub(crate) fn restore_waiting(&mut self, mut request: Request) {
         self.release_handle(&mut request);
         request.cached_len = 0;
+        request.prefill_cursor = 0;
         request.status = SequenceStatus::Waiting;
         self.push_pending_front(request);
     }
