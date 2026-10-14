@@ -35,6 +35,7 @@ async fn main() -> ExitCode {
         max_seq_len = engine.max_seq_len,
         max_running_req = engine.max_running_req,
         max_prefill_tokens_per_batch = engine.max_prefill_tokens_per_batch,
+        chunked_prefill_size = engine.chunked_prefill_size,
         disable_consecutive_prefill_overlap = engine.disable_consecutive_prefill_overlap,
         page_size = engine.page_size,
         memory_ratio = engine.memory_ratio,
