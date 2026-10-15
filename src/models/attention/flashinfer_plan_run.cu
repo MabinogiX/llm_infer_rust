@@ -20,6 +20,19 @@
 namespace {
 using Variant = flashinfer::DefaultAttention<false, false, false, false>;
 
+// Fixed-capacity output: no nonzero/masked_select count readback is needed.
+__global__ void pack_decode_metadata(
+    const int32_t* table, const int32_t* lengths, const int32_t* indptr,
+    int32_t* indices, int32_t* last_len, int64_t columns, int64_t stride,
+    int64_t page_size) {
+  const int row = blockIdx.x;
+  const int begin = indptr[row];
+  const int pages = indptr[row + 1] - begin;
+  if (threadIdx.x == 0) last_len[row] = (lengths[row] - 1) % page_size + 1;
+  for (int col = threadIdx.x; col < pages; col += blockDim.x)
+    indices[begin + col] = table[row * stride + col];
+}
+
 struct NativePlan {
   flashinfer::DecodePlanInfo info{};
   flashinfer::PrefillPlanInfo prefill_info{};
@@ -159,6 +172,16 @@ cudaError_t run(const NativePlan& plan, const void* query,
                                                         false, stream);
 }
 }  // namespace
+
+extern "C" const char* sglang_flashinfer_pack_decode_metadata(
+    const int32_t* table, const int32_t* lengths, const int32_t* indptr,
+    int32_t* indices, int32_t* last_len, int64_t batch, int64_t columns,
+    int64_t stride, int64_t page_size, void* stream) {
+  pack_decode_metadata<<<batch, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+      table, lengths, indptr, indices, last_len, columns, stride, page_size);
+  auto status = cudaGetLastError();
+  return status == cudaSuccess ? nullptr : cudaGetErrorString(status);
+}
 
 extern "C" void* sglang_flashinfer_native_plan(
     void* existing, const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,

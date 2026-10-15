@@ -11,3 +11,7 @@ from `python/sglang/kernels/jit/csrc/elementwise/`; TensorView host wrappers and
 their includes are removed. Device algorithms are unchanged. Our ATen adapters
 provide validation, CUDA stream and launch configuration; no TVM runtime needed.
 PDL is disabled on the A100. CUDA compilation requires C++20 for upstream helpers.
+
+SiLU × up retains FP32 activation arithmetic and 16-byte vector loads/stores.
+Common-width specializations remove runtime address division while preserving
+the distributed CTA layout for small A100 batches. No activation source is copied.

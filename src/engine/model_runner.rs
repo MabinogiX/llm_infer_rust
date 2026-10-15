@@ -29,6 +29,9 @@ pub enum BatchPhase {
 #[derive(Debug)]
 pub struct AttentionMetadata {
     pub forward_mode: BatchPhase,
+    /// Scheduler-owned immutable host snapshot. Lengths agree with cache_seqlens.
+    /// Omit for callers without a host shadow; backends retain their fallback.
+    pub decode_host: Option<DecodeHostMetadata>,
     pub write_loc: Option<Tensor>,
     pub cu_seqlens_q: Option<Tensor>,
     pub prefix_lens: Option<Tensor>,
@@ -36,6 +39,14 @@ pub struct AttentionMetadata {
     pub req_to_token: Option<Tensor>,
     pub cache_seqlens: Option<Tensor>,
     pub max_seqlen: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodeHostMetadata {
+    pub cache_seqlens: Vec<i32>,
+    /// Globally unique revisions for the entire contents of each source row.
+    /// None means that graph replay must copy every row.
+    pub block_table_versions: Option<Vec<u64>>,
 }
 
 /// A scheduler-prepared model invocation.
@@ -87,7 +98,7 @@ impl Batch {
 /// Planning updates happen before replay, outside stream capture.
 pub trait DecodeGraphState {
     /// Refresh plans and metadata outside stream capture, before every replay.
-    fn prepare_replay(&self) -> Result<()>;
+    fn prepare_replay(&self, host: Option<&DecodeHostMetadata>) -> Result<()>;
     fn needs_req_to_token(&self) -> bool {
         true
     }

@@ -37,7 +37,7 @@ UploadGuard 在正常结束或提前退出时恢复原 execution stream，并建
 
 ## 尚未改变的依赖
 
-FlashInfer graph.prepare_replay 仍会从 private GPU metadata 取得 CPU 规划信息，因此仍可能等待 execution stream。尚未实现完整 host shadow / 无 D2H 规划。本阶段隐藏的是 CPU metadata 准备和 H2D 上传，不宣称所有 GPU→CPU 同步已消除。
+本文阶段的 FlashInfer graph.prepare_replay 仍从 private GPU metadata 取得 CPU 规划信息。本阶段测量只包含 CPU metadata 准备和 H2D 上传的重叠。2026-10-15 后续实现为调度 decode batch 增加 CPU 长度快照与固定分页索引缓冲，消除 captured decode 正常路径的规划 D2H；Pinned workspace 复用仅等待此前规划上传完成事件。缺少 host shadow 的调用保留原规划 fallback。
 
 长 prefill 的 GPU 工作依然会占用同一 execution stream；早期事件不允许并发执行两轮共用 activation pool 的模型 forward。对新增字段或 backend，不应把本事件扩大解释为“所有共享资源读取完成”。
 

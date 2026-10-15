@@ -100,10 +100,21 @@ impl<'a> ForwardBatch<'a> {
                     .as_ref()
                     .ok_or_else(|| invalid("decode requires cache lengths"))?;
                 check_vector(lengths, device, self.tokens())?;
+                if let Some(host) = &meta.decode_host {
+                    if host.cache_seqlens.len() != self.tokens()
+                        || host.cache_seqlens.iter().any(|&length| length <= 0)
+                        || host
+                            .block_table_versions
+                            .as_ref()
+                            .is_some_and(|versions| versions.len() != self.tokens())
+                    {
+                        return Err(invalid("invalid decode host metadata"));
+                    }
+                }
                 self.tokens()
             }
             ForwardMode::Prefill { .. } => {
-                if meta.cache_seqlens.is_some() {
+                if meta.cache_seqlens.is_some() || meta.decode_host.is_some() {
                     return Err(invalid("prefill cannot carry decode cache lengths"));
                 }
                 let bounds = meta
@@ -195,6 +206,7 @@ mod tests {
             Tensor::zeros([2, 1], (Kind::Int64, Device::Cpu)),
             Some(AttentionMetadata {
                 forward_mode: BatchPhase::Decode,
+                decode_host: None,
                 write_loc: Some(Tensor::from_slice(&[2i32, 4])),
                 cache_seqlens: Some(Tensor::from_slice(&[1i32, 2])),
                 block_table: Some(Tensor::ones([2, 2], (Kind::Int, Device::Cpu))),
@@ -251,12 +263,38 @@ mod tests {
         );
     }
     #[test]
+    fn validates_decode_host_snapshot_without_device_readback() {
+        for (lengths, versions, valid) in [
+            (vec![1, 2], None, true),
+            (vec![1], None, false),
+            (vec![0, 2], None, false),
+            (vec![1, 2], Some(vec![1]), false),
+            (vec![1, 2], Some(vec![1, 2]), true),
+        ] {
+            let mut batch = decode();
+            batch.attention_metadata.as_mut().unwrap().decode_host =
+                Some(super::super::DecodeHostMetadata {
+                    cache_seqlens: lengths,
+                    block_table_versions: versions,
+                });
+            assert_eq!(
+                ForwardBatch::from_scheduler(&batch)
+                    .unwrap()
+                    .validate(Device::Cpu)
+                    .is_ok(),
+                valid
+            );
+        }
+    }
+
+    #[test]
     fn prefill_requires_logit_rows_and_cache_boundaries_to_agree() {
         let batch = Batch::prefill(
             Tensor::ones([3], (Kind::Int64, Device::Cpu)),
             Tensor::zeros([3], (Kind::Int64, Device::Cpu)),
             Some(AttentionMetadata {
                 forward_mode: BatchPhase::Prefill,
+                decode_host: None,
                 write_loc: Some(Tensor::from_slice(&[2i32, 3, 4])),
                 cache_seqlens: None,
                 block_table: None,

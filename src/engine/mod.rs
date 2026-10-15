@@ -18,8 +18,8 @@ pub use engine::{
 pub(crate) use metadata_transfer::InputReadFence;
 pub use model_loader::{ModelFactory, ModelLoadError, ModelWeights, load_hf_safetensors};
 pub use model_runner::{
-    AttentionMetadata, Batch, BatchPhase, DecodeGraphState, ModelExecutor, ModelRunner,
-    ModelRunnerError,
+    AttentionMetadata, Batch, BatchPhase, DecodeGraphState, DecodeHostMetadata, ModelExecutor,
+    ModelRunner, ModelRunnerError,
 };
 pub(crate) use sampling::{CompletionFence, PendingSample};
 pub use sampling::{Sampler, SamplingError, SamplingParams};

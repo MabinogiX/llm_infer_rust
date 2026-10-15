@@ -19,6 +19,7 @@ struct CapturedGraph {
     positions: Tensor,
     metadata: AttentionMetadata,
     output: Tensor,
+    table_versions: RefCell<Vec<Option<u64>>>,
 }
 
 /// Holds one graph per batch size; padding reads the permanent reserved page 0.
@@ -128,6 +129,7 @@ impl DecodeGraphRunner {
         let positions = Tensor::zeros([rows, 1], (Kind::Int64, device));
         let mut metadata = AttentionMetadata {
             forward_mode: BatchPhase::Decode,
+            decode_host: None,
             write_loc: Some(self.pad_locations.narrow(0, 0, rows).copy()),
             cu_seqlens_q: None,
             prefix_lens: None,
@@ -187,6 +189,7 @@ impl DecodeGraphRunner {
             positions,
             metadata,
             output,
+            table_versions: RefCell::new(vec![None; size]),
         })
     }
 
@@ -260,7 +263,7 @@ impl DecodeGraphRunner {
             .copy_(&batch.positions.view([rows, 1]));
         copy_field(&graph.metadata.write_loc, &source.write_loc, rows)?;
         copy_field(&graph.metadata.cache_seqlens, &source.cache_seqlens, rows)?;
-        copy_field(&graph.metadata.block_table, &source.block_table, rows)?;
+        copy_block_table(graph, source, rows)?;
         if graph.metadata.req_to_token.is_some() {
             copy_field(&graph.metadata.req_to_token, &source.req_to_token, rows)?;
         }
@@ -273,6 +276,8 @@ impl DecodeGraphRunner {
             None
         };
         if size < graph.input_ids.size()[0] as usize {
+            // Padding overwrites private rows, invalidating any previous snapshot.
+            graph.table_versions.borrow_mut()[size..].fill(None);
             let start = rows;
             let count = graph.input_ids.size()[0] - rows;
             let _ = graph.input_ids.narrow(0, start, count).fill_(1);
@@ -310,7 +315,7 @@ impl DecodeGraphRunner {
             }
         }
         if let Some(backend) = graph.backend.as_ref() {
-            backend.prepare_replay()?;
+            backend.prepare_replay(source.decode_host.as_ref())?;
         }
         graph.native.replay()?;
         Ok(Some((
@@ -327,6 +332,112 @@ impl Drop for DecodeGraphRunner {
             Cuda::synchronize(device as i64);
         }
         self.graphs.clear();
+    }
+}
+
+fn copy_block_table(graph: &CapturedGraph, source: &AttentionMetadata, rows: i64) -> Result<()> {
+    let (Some(target), Some(value)) = (&graph.metadata.block_table, &source.block_table) else {
+        return copy_field(&graph.metadata.block_table, &source.block_table, rows);
+    };
+    let versions = source
+        .decode_host
+        .as_ref()
+        .and_then(|host| host.block_table_versions.as_deref());
+    copy_table_rows(
+        target,
+        value,
+        versions,
+        &mut graph.table_versions.borrow_mut(),
+        rows as usize,
+    )?;
+    Ok(())
+}
+
+/// Revisions describe whole source rows, including future allocated pages.
+/// Coalesce adjacent dirty rows; token growth within those pages needs no copy.
+fn copy_table_rows(
+    target: &Tensor,
+    source: &Tensor,
+    versions: Option<&[u64]>,
+    cached: &mut [Option<u64>],
+    rows: usize,
+) -> Result<usize> {
+    if let Some(versions) = versions {
+        if versions.len() != rows || cached.len() < rows {
+            return Err(ModelRunnerError::Model(
+                "invalid block table revisions".into(),
+            ));
+        }
+        let mut copied = 0;
+        let mut row = 0;
+        while row < rows {
+            if cached[row] == Some(versions[row]) {
+                row += 1;
+                continue;
+            }
+            let start = row;
+            while row < rows && cached[row] != Some(versions[row]) {
+                cached[row] = Some(versions[row]);
+                row += 1;
+            }
+            let count = row - start;
+            target
+                .narrow(0, start as i64, count as i64)
+                .copy_(&source.narrow(0, start as i64, count as i64));
+            copied += count;
+        }
+        Ok(copied)
+    } else {
+        target
+            .narrow(0, 0, rows as i64)
+            .copy_(&source.narrow(0, 0, rows as i64));
+        cached.fill(None);
+        Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod table_copy_tests {
+    use super::*;
+
+    #[test]
+    fn revisions_preserve_private_rows_and_invalidate_fallback_and_padding() {
+        let source = Tensor::from_slice(&[1i32, 2, 3, 4, 5, 6]).view([3, 2]);
+        let target = Tensor::zeros([3, 2], (Kind::Int, Device::Cpu));
+        let mut cached = vec![None; 3];
+        assert_eq!(
+            copy_table_rows(&target, &source, Some(&[1, 2, 3]), &mut cached, 3).unwrap(),
+            3
+        );
+        assert_eq!(
+            copy_table_rows(&target, &source, Some(&[1, 2, 3]), &mut cached, 3).unwrap(),
+            0
+        );
+        let _ = source.get(1).fill_(9);
+        assert_eq!(
+            copy_table_rows(&target, &source, Some(&[1, 4, 3]), &mut cached, 3).unwrap(),
+            1
+        );
+        assert_eq!(
+            Vec::<i32>::try_from(target.view([-1])).unwrap(),
+            [1, 2, 9, 9, 5, 6]
+        );
+        // A padded row is overwritten even if its source revision is stable.
+        let _ = target.get(2).zero_();
+        cached[2] = None;
+        assert_eq!(
+            copy_table_rows(&target, &source, Some(&[1, 4, 3]), &mut cached, 3).unwrap(),
+            1
+        );
+        assert_eq!(
+            copy_table_rows(&target, &source, None, &mut cached, 2).unwrap(),
+            2
+        );
+        assert!(cached.iter().all(Option::is_none));
+        assert_eq!(
+            copy_table_rows(&target, &source, Some(&[4, 1]), &mut cached, 2).unwrap(),
+            2
+        );
     }
 }
 
@@ -719,6 +830,14 @@ mod tests {
                     forward_mode: BatchPhase::Decode,
                     write_loc: Some(Tensor::from_slice(&locations).to_device(device)),
                     cache_seqlens: Some(Tensor::from_slice(&lengths).to_device(device)),
+                    decode_host: (iteration != 2).then(|| super::super::DecodeHostMetadata {
+                        cache_seqlens: lengths.clone(),
+                        block_table_versions: Some(
+                            (0..rows)
+                                .map(|row| 100 + iteration as u64 * 10 + row as u64)
+                                .collect(),
+                        ),
+                    }),
                     block_table: Some(
                         Tensor::from_slice(&table)
                             .to_device(device)
@@ -758,8 +877,13 @@ mod tests {
             let replay = graph
                 .replay_with_read_fence(ForwardBatch::from_scheduler(&batch).unwrap())
                 .unwrap();
+            // Reuse unchanged private page tables while the preceding replay
+            // can still be executing; pinned planner inputs must remain valid.
+            let replay_again = graph
+                .replay_with_read_fence(ForwardBatch::from_scheduler(&batch).unwrap())
+                .unwrap();
             assert_eq!(replay.is_some(), rows <= 4);
-            let actual = if let Some((output, read_done)) = replay {
+            let actual = if let Some((output, read_done)) = replay_again {
                 let read_done =
                     read_done.expect("captured decode must expose its source-read fence");
                 let upload = crate::engine::metadata_transfer::MetadataUpload::new(device).unwrap();

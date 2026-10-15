@@ -1,10 +1,15 @@
 //! Builds one-token decode batches from running requests and their KV page tables.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use tch::{Device, Kind, Tensor};
+
+// Revisions remain unique across DecodeManager instances and buffer lifetimes.
+static NEXT_TABLE_VERSION: AtomicU64 = AtomicU64::new(1);
 
 use crate::engine::metadata_transfer::{MetadataUpload, UploadGuard};
 use crate::engine::{
-    AttentionMetadata, Batch, BatchPhase, CompletionFence, InputReadFence, ServerArgs,
+    AttentionMetadata, Batch, BatchPhase, CompletionFence, DecodeHostMetadata, InputReadFence,
+    ServerArgs,
 };
 
 use super::future_map::RelayPlan;
@@ -42,6 +47,7 @@ struct RowMapping {
     uid: Option<RequestId>,
     pages: Vec<usize>,
     len: usize,
+    table_version: u64,
 }
 
 impl DecodeManager {
@@ -282,6 +288,9 @@ impl DecodeManager {
                     self.mapped_tokens += locations.len();
                 }
                 let previous = &mut self.row_mappings[row];
+                if reset || previous.pages != pages {
+                    previous.table_version = NEXT_TABLE_VERSION.fetch_add(1, Ordering::Relaxed);
+                }
                 previous.uid = Some(request.uid);
                 if previous.pages != pages {
                     previous.pages.clear();
@@ -341,6 +350,15 @@ impl DecodeManager {
                 block_table: Some(self.block_table_buf.narrow(0, 0, rows_i64)),
                 req_to_token: Some(self.req_to_token_buf.narrow(0, 0, rows_i64)),
                 cache_seqlens: Some(self.cache_seqlens_buf.narrow(0, 0, rows_i64)),
+                decode_host: Some(DecodeHostMetadata {
+                    cache_seqlens,
+                    block_table_versions: Some(
+                        self.row_mappings[..rows]
+                            .iter()
+                            .map(|mapping| mapping.table_version)
+                            .collect(),
+                    ),
+                }),
                 max_seqlen: Some(max_seqlen),
             }),
         );
@@ -504,6 +522,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(manager.mapped_tokens, 2);
+        let initial_version = manager.row_mappings[0].table_version;
         request.input_ids.push(3);
         drop(
             manager
@@ -511,6 +530,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(manager.mapped_tokens, 3);
+        assert_eq!(manager.row_mappings[0].table_version, initial_version);
         request.input_ids.push(4);
         drop(
             manager
@@ -525,6 +545,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(manager.mapped_tokens, 8);
+        assert_ne!(manager.row_mappings[0].table_version, initial_version);
         assert_eq!(
             Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
             vec![18, 19, 12, 13, -1, -1]

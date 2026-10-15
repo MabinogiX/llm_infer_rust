@@ -1,4 +1,6 @@
 #include <ATen/ATen.h>
+#include <cuda_runtime.h>
+#include <limits>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -20,6 +22,14 @@ struct FlashInferPlan {
   at::Tensor indices;
   at::Tensor indptr;
   at::Tensor last_page_len;
+  at::Tensor host_indptr;
+  cudaEvent_t upload_done = nullptr;
+  ~FlashInferPlan() {
+    if (upload_done) {
+      cudaEventSynchronize(upload_done);
+      cudaEventDestroy(upload_done);
+    }
+  }
   void* native_plan = nullptr;
   int64_t num_q_heads;
   int64_t num_kv_heads;
@@ -33,6 +43,9 @@ extern "C" void* sglang_flashinfer_native_plan(
     void* existing, const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,
     int32_t num_kv_heads, int32_t page_size, int32_t dtype_code, bool graph,
     void* stream, const char** error);
+extern "C" const char* sglang_flashinfer_pack_decode_metadata(
+    const int32_t*, const int32_t*, const int32_t*, int32_t*, int32_t*,
+    int64_t, int64_t, int64_t, int64_t, void*);
 extern "C" void sglang_flashinfer_native_plan_drop(void* plan);
 extern "C" uint64_t sglang_flashinfer_native_allocations(const void* plan);
 extern "C" const char* sglang_flashinfer_native_run(
@@ -48,7 +61,8 @@ extern "C" const char* sglang_flashinfer_error() { return last_error.c_str(); }
 extern "C" void* sglang_flashinfer_prepare(
     void* existing, const at::Tensor* block_table, const at::Tensor* sequence_lengths,
     int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
-    int64_t page_size, int64_t dtype_code, bool graph) {
+    int64_t page_size, int64_t dtype_code, bool graph,
+    const int32_t* host_lengths, int64_t host_rows) {
   try {
     if (!block_table->is_cuda() || !sequence_lengths->is_cuda()) {
       throw std::runtime_error("FlashInfer metadata must be CUDA tensors");
@@ -72,34 +86,75 @@ extern "C" void* sglang_flashinfer_prepare(
         plan->dtype_code != dtype_code || plan->graph != graph ||
         (graph && plan->graph_columns != block_table->size(1))))
       throw std::runtime_error("FlashInfer workspace geometry changed");
-    auto pages = at::floor_divide(sequence_lengths->to(at::kInt) + page_size - 1,
-                                  page_size);
-    auto indptr = at::cat({at::zeros({1}, pages.options()), pages.cumsum(0, at::kInt)});
-    auto columns = at::arange(block_table->size(1), pages.options());
-    auto indices = block_table->masked_select(columns.unsqueeze(0) < pages.unsqueeze(1))
-                        .to(at::kInt).contiguous();
-    auto last_len = ((sequence_lengths->to(at::kInt) - 1) % page_size + 1).contiguous();
-    if (graph) {
-      if (!existing) {
-        plan->indptr = at::empty_like(indptr);
-        plan->indices = at::empty({block_table->numel()}, pages.options());
-        plan->last_page_len = at::empty_like(last_len);
-      }
-      // Graph nodes keep these addresses; only their contents may change.
-      if (indices.numel() > plan->indices.numel() ||
-          indptr.sizes() != plan->indptr.sizes() || last_len.sizes() != plan->last_page_len.sizes())
-        throw std::runtime_error("FlashInfer graph metadata capacity exceeded");
-      plan->indptr.copy_(indptr);
-      plan->indices.narrow(0,0,indices.numel()).copy_(indices);
-      plan->last_page_len.copy_(last_len);
-    } else {
-      plan->indptr = indptr; plan->indices = indices; plan->last_page_len = last_len;
-    }
-    auto indptr_host = plan->indptr.to(at::kCPU).contiguous();
-    // This blocking read also drains earlier work on the same stream before
-    // DecodePlan overwrites its reusable pinned and device workspaces.
-    const char* native_error = nullptr;
     auto stream = c10::cuda::getCurrentCUDAStream(block_table->get_device()).stream();
+    const bool host_plan = graph && host_lengths;
+    at::Tensor indptr_host;
+    if (host_plan) {
+      const int64_t batch = block_table->size(0);
+      if (host_rows != batch || block_table->scalar_type() != at::kInt ||
+          sequence_lengths->scalar_type() != at::kInt ||
+          !block_table->is_contiguous() || !sequence_lengths->is_contiguous())
+        throw std::runtime_error("invalid FlashInfer host decode metadata");
+      // Only wait for the PREVIOUS plan's uploads, not for its model graph.
+      // CPU writes below reuse pinned sources also consumed by DecodePlan.
+      if (plan->upload_done) {
+        auto status = cudaEventSynchronize(plan->upload_done);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+      }
+      if (!plan->host_indptr.defined())
+        plan->host_indptr = at::empty({batch + 1},
+            at::TensorOptions().dtype(at::kInt).device(at::kCPU).pinned_memory(true));
+      auto* ptr = plan->host_indptr.data_ptr<int32_t>();
+      int64_t total_pages = 0;
+      ptr[0] = 0;
+      for (int64_t row = 0; row < batch; ++row) {
+        const int64_t length = host_lengths[row];
+        if (length <= 0 || length > block_table->size(1) * page_size)
+          throw std::runtime_error("host cache length exceeds block table capacity");
+        total_pages += (length + page_size - 1) / page_size;
+        if (total_pages > std::numeric_limits<int32_t>::max())
+          throw std::runtime_error("FlashInfer page indptr overflow");
+        ptr[row + 1] = static_cast<int32_t>(total_pages);
+      }
+      if (!existing) {
+        plan->indptr = at::empty({batch + 1}, sequence_lengths->options());
+        plan->indices = at::empty({block_table->numel()}, sequence_lengths->options());
+        plan->last_page_len = at::empty_like(*sequence_lengths);
+      }
+      plan->indptr.copy_(plan->host_indptr, true);
+      auto error = sglang_flashinfer_pack_decode_metadata(
+          block_table->data_ptr<int32_t>(), sequence_lengths->data_ptr<int32_t>(),
+          plan->indptr.data_ptr<int32_t>(), plan->indices.data_ptr<int32_t>(),
+          plan->last_page_len.data_ptr<int32_t>(), batch, block_table->size(1),
+          block_table->stride(0), page_size, stream);
+      if (error) throw std::runtime_error(error);
+      indptr_host = plan->host_indptr;
+    } else {
+      auto pages = at::floor_divide(sequence_lengths->to(at::kInt) + page_size - 1, page_size);
+      auto indptr = at::cat({at::zeros({1}, pages.options()), pages.cumsum(0, at::kInt)});
+      auto columns = at::arange(block_table->size(1), pages.options());
+      auto indices = block_table->masked_select(columns.unsqueeze(0) < pages.unsqueeze(1))
+                          .to(at::kInt).contiguous();
+      auto last_len = ((sequence_lengths->to(at::kInt) - 1) % page_size + 1).contiguous();
+      if (graph) {
+        if (!existing) {
+          plan->indptr = at::empty_like(indptr);
+          plan->indices = at::empty({block_table->numel()}, pages.options());
+          plan->last_page_len = at::empty_like(last_len);
+        }
+        if (indices.numel() > plan->indices.numel() ||
+            indptr.sizes() != plan->indptr.sizes() || last_len.sizes() != plan->last_page_len.sizes())
+          throw std::runtime_error("FlashInfer graph metadata capacity exceeded");
+        plan->indptr.copy_(indptr);
+        plan->indices.narrow(0, 0, indices.numel()).copy_(indices);
+        plan->last_page_len.copy_(last_len);
+      } else {
+        plan->indptr = indptr; plan->indices = indices; plan->last_page_len = last_len;
+      }
+      indptr_host = plan->indptr.to(at::kCPU).contiguous();
+    }
+    // The fallback D2H drains the stream; the host path fences only pinned uploads.
+    const char* native_error = nullptr;
     auto* native_plan = sglang_flashinfer_native_plan(
         plan->native_plan, indptr_host.data_ptr<int32_t>(), block_table->size(0), num_q_heads,
         num_kv_heads, page_size, dtype_code, graph, stream, &native_error);
@@ -107,6 +162,14 @@ extern "C" void* sglang_flashinfer_prepare(
       throw std::runtime_error(native_error ? native_error : "FlashInfer plan failed");
     }
     plan->native_plan = native_plan;
+    if (graph) {
+      if (!plan->upload_done) {
+        auto status = cudaEventCreateWithFlags(&plan->upload_done, cudaEventDisableTiming);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+      }
+      auto status = cudaEventRecord(plan->upload_done, stream);
+      if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    }
     plan->num_q_heads = num_q_heads;
     plan->num_kv_heads = num_kv_heads;
     plan->head_dim = head_dim;

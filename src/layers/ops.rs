@@ -321,6 +321,30 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn silu_matches_fp32_reference_for_decode_prefill_and_tail_widths() {
+        assert!(Cuda::is_available());
+        for kind in [Kind::BFloat16, Kind::Half] {
+            for (tokens, width) in [(1, 8), (1, 3072), (3, 13), (65, 3072), (2, 8200)] {
+                let input = Tensor::randn([tokens, width * 2], (kind, Device::Cuda(0)));
+                let fp32 = input.to_kind(Kind::Float);
+                let expected =
+                    (fp32.narrow(1, 0, width).silu() * fp32.narrow(1, width, width)).to_kind(kind);
+                let actual = silu_and_mul(&input);
+                let tolerance = if kind == Kind::BFloat16 {
+                    0.03125
+                } else {
+                    0.00390625
+                };
+                assert!(
+                    max_error(&actual, &expected) <= tolerance,
+                    "kind={kind:?}, tokens={tokens}, width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
     fn fused_add_norm_matches_fp32_sum_for_both_cuda_dtypes() {
         assert!(Cuda::is_available(), "CUDA test requires an available GPU");
         tch::manual_seed(19);

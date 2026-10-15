@@ -51,6 +51,10 @@ Linux CUDA 环境中，模型权重和 KV cache 绑定后会捕获 decode CUDA G
 
 FlashInfer decode 图的实现、前置条件与测量结果见 [CUDA Graph 验证记录](docs/cuda-graph-decode.md)。
 
+FlashInfer captured decode 使用调度器持有的 CPU 序列长度快照规划，在固定 GPU 缓冲中生成分页索引，避免逐步 `masked_select` 和规划用的 GPU→CPU 回传。Pinned 规划缓冲通过上传完成事件保护，GPU workspace 更新与图执行在同一执行 stream 上有序提交。页表行使用版本号，只在内容变化时复制到图私有缓冲；请求换行、补齐行覆盖和无版本快照的 fallback 都会使对应副本失效。没有 CPU 快照的调用仍可使用原规划路径。
+
+FutureMap 的 scatter 索引也保留在 GPU，仅在槽位序列变化时刷新，避免采样后重复上传索引所引入的阻塞 H2D。实现、缓冲生命周期与交替 A/B 结果见 [decode 性能优化记录](docs/decode-performance-optimizations.md)。
+
 Qwen3 的 CUDA BF16/FP16 prefill 在启动时捕获全部配置的分段图，按整批未缓存 token 总数分桶。`--prefill-cuda-graph-max-tokens N` 设置最大桶（默认 2048），设为 `0` 独立禁用 prefill graph；`--cuda-graph-bs 0` 只禁用 decode graph。图从大桶到小桶捕获，完成后服务才开始监听；请求期间不捕获、不淘汰图，超限或缺失的桶使用 eager。启动耗时和显存需求随捕获桶增加，可调低 token 上限。CPU、float32 和逐步同步 profiling 使用 eager prefill。实现和验证见 [Prefill 分段图验证记录](docs/cuda-graph-prefill.md)。
 
 ### FlashInfer 分页 decode 与 prefill
