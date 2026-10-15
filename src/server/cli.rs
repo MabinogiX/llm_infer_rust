@@ -15,7 +15,8 @@ Options:\n\
   --host IP                 Bind address (default 127.0.0.1)\n\
   --port PORT               Bind port (default 8000)\n\
   --tp-size N               Tensor parallel size (only 1 is supported)\n\
-  --memory-ratio R          KV cache memory ratio (default 0.9)\n\
+  --memory-ratio R          GPU memory fraction for weights + KV cache (default 0.9)\n\
+  --max-total-tokens N      Optional KV pool token cap (rounded down to whole pages)\n\
   --max-running-req N       Maximum active requests (default 256)\n\
   --max-prefill-tokens-per-batch N  Maximum uncached prefill tokens per batch (0 disables)\n\
   --chunked-prefill-size N  Maximum tokens per request chunk (-1/0 disables; omitted auto-selects)\n\
@@ -53,6 +54,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--port" => port = parse_value(&value()?, &flag)?,
             "--tp-size" => engine.tp_size = parse_value(&value()?, &flag)?,
             "--memory-ratio" => engine.memory_ratio = parse_value(&value()?, &flag)?,
+            "--max-total-tokens" => engine.max_total_tokens = Some(parse_value(&value()?, &flag)?),
             "--max-running-req" => engine.max_running_req = parse_value(&value()?, &flag)?,
             "--max-prefill-tokens-per-batch" => {
                 engine.max_prefill_tokens_per_batch = parse_value(&value()?, &flag)?
@@ -152,6 +154,12 @@ mod tests {
             parse_args(["--model-path", "/tmp/model", "--cuda-graph-bs", "4"].map(str::to_owned))
                 .unwrap();
         assert_eq!(graph_args.engine.cuda_graph_bs, Some(4));
+        assert_eq!(args.engine.max_total_tokens, None);
+        let cache_args = parse_args(
+            ["--model-path", "/tmp/model", "--max-total-tokens", "40960"].map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(cache_args.engine.max_total_tokens, Some(40960));
         let prefill_policy_args = parse_args(
             [
                 "--model-path",

@@ -14,6 +14,7 @@ pub struct KVCacheServerConfig {
     pub max_running_req: usize,
     pub max_seq_len: usize,
     pub memory_ratio: f64,
+    pub max_total_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,7 @@ impl KVCacheAllocator {
                 "memory_ratio must be in the range 0.0..=1.0".to_owned(),
             ));
         }
+        validate_token_cap(server)?;
         let spec = ModelCacheSpec::uniform(model.num_layers, model.num_kv_heads, model.head_dim)?;
         Ok(Self { config, spec })
     }
@@ -71,6 +73,7 @@ impl KVCacheAllocator {
                 "memory_ratio must be in the range 0.0..=1.0".into(),
             ));
         }
+        validate_token_cap(server)?;
         if spec.layers().len() != config.model.num_layers {
             return Err(KVCacheError::InvalidArgument(
                 "cache layer count must match runtime model layer count".into(),
@@ -100,7 +103,7 @@ impl KVCacheAllocator {
         }
     }
 
-    /// Number of pages that fit the memory budget, capped by scheduler demand.
+    /// Number of usable pages that fit the memory budget, excluding the sink.
     pub fn num_pages(
         &self,
         available: usize,
@@ -139,17 +142,52 @@ impl KVCacheAllocator {
                 available_bytes: available,
             });
         }
-        let pages_per_request = server.max_seq_len / server.page_size + 1;
-        let max_pages_needed = server.max_running_req.saturating_mul(pages_per_request);
-        Ok(pages_that_fit.min(max_pages_needed))
+        // The shared pool also retains radix prefixes from completed requests.
+        // Active-request limits must not cap its capacity on the GPU.
+        Ok(server.max_total_tokens.map_or(pages_that_fit, |tokens| {
+            pages_that_fit.min(tokens / server.page_size)
+        }))
     }
 
     pub fn allocate(&self, kind: Kind, device: Device, tp_size: usize) -> Result<KVCachePool> {
         let spec = self.spec.per_rank(tp_size)?;
         let available = self.available_memory(device)?;
-        let num_pages = self.num_pages_for_spec(available, &spec, kind.elt_size_in_bytes())?;
-        KVCachePool::with_spec(spec, num_pages, self.config.server.page_size, kind, device)
+        let itemsize = kind.elt_size_in_bytes();
+        let mut num_pages = self.num_pages_for_spec(available, &spec, itemsize)?;
+        let server = self.config.server;
+        // CPU has a fixed fallback budget rather than accelerator telemetry.
+        // Preserve bounded allocations for small CPU servers and test fixtures.
+        if device == Device::Cpu {
+            let pages_per_request = server.max_seq_len / server.page_size + 1;
+            num_pages = num_pages.min(server.max_running_req.saturating_mul(pages_per_request));
+        }
+        let allocated_bytes = (num_pages + 1) * spec.bytes_per_page(server.page_size, itemsize)?;
+        let pool = KVCachePool::with_spec(spec, num_pages, server.page_size, kind, device)?;
+        tracing::info!(
+            ?device,
+            memory_ratio = server.memory_ratio,
+            max_total_tokens = server.max_total_tokens,
+            budget_bytes = available,
+            allocated_bytes,
+            usable_pages = num_pages,
+            page_size = server.page_size,
+            token_capacity = num_pages.saturating_mul(server.page_size),
+            "allocated KV cache pool"
+        );
+        Ok(pool)
     }
+}
+
+fn validate_token_cap(server: KVCacheServerConfig) -> Result<()> {
+    if server
+        .max_total_tokens
+        .is_some_and(|tokens| tokens < server.page_size)
+    {
+        return Err(KVCacheError::InvalidArgument(
+            "max_total_tokens must hold at least one KV page".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn cuda_cache_budget(free: usize, total: usize, memory_ratio: f64) -> usize {
@@ -208,6 +246,7 @@ mod tests {
                 max_running_req: 8,
                 max_seq_len: 128,
                 memory_ratio: 0.9,
+                max_total_tokens: None,
             },
             model: KVCacheModelConfig {
                 num_layers: 2,
@@ -257,9 +296,72 @@ mod tests {
     }
 
     #[test]
-    fn caps_pages_by_scheduler_demand() {
-        // 1 GiB can fit more pages than 8 requests * (128 / 16 + 1) pages.
-        assert_eq!(allocator().num_pages(1024 * 1024 * 1024, 8, 4).unwrap(), 72);
+    fn sizes_pages_by_memory_budget_independently_of_scheduler_limits() {
+        let budget = 1024 * 1024 * 1024;
+        let allocator = allocator();
+        let bytes = allocator.spec.bytes_per_page(16, 4).unwrap();
+        assert_eq!(
+            allocator.num_pages(budget, 8, 4).unwrap(),
+            budget / bytes - 1
+        );
+
+        let mut config = allocator.config;
+        config.server.max_running_req = 1;
+        config.server.max_seq_len = 16;
+        assert_eq!(
+            KVCacheAllocator::new(config)
+                .unwrap()
+                .num_pages(budget, 8, 4)
+                .unwrap(),
+            budget / bytes - 1
+        );
+    }
+
+    #[test]
+    fn single_qwen3_request_can_use_full_gpu_cache_budget() {
+        let allocator = KVCacheAllocator::new(KVCacheAllocationConfig {
+            server: KVCacheServerConfig {
+                page_size: 16,
+                max_running_req: 1,
+                max_seq_len: 40960,
+                memory_ratio: 0.9,
+                max_total_tokens: None,
+            },
+            model: KVCacheModelConfig {
+                num_layers: 28,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+        })
+        .unwrap();
+        let budget = 64 * 1024 * 1024 * 1024usize;
+        let bytes = allocator.spec.bytes_per_page(16, 2).unwrap();
+        let pages = allocator.num_pages(budget, 8, 2).unwrap();
+        assert_eq!(pages, budget / bytes - 1);
+        assert!((pages + 1) * bytes <= budget);
+        assert!(budget - (pages + 1) * bytes < bytes);
+    }
+
+    #[test]
+    fn cpu_pool_keeps_small_scheduler_demand_cap() {
+        let pool = allocator().allocate(Kind::Float, Device::Cpu, 1).unwrap();
+        assert_eq!(pool.layout.num_pages, 72);
+    }
+
+    #[test]
+    fn explicit_token_cap_rounds_down_without_exceeding_memory_budget() {
+        let mut config = allocator().config;
+        config.server.max_total_tokens = Some(47);
+        let allocator = KVCacheAllocator::new(config).unwrap();
+        let bytes = allocator.spec.bytes_per_page(16, 4).unwrap();
+        assert_eq!(allocator.num_pages(bytes * 100, 8, 4).unwrap(), 2);
+        assert_eq!(allocator.num_pages(bytes * 2, 8, 4).unwrap(), 1);
+        assert!(allocator.num_pages(bytes, 8, 4).is_err());
+        for tokens in [0, 15] {
+            config.server.max_total_tokens = Some(tokens);
+            assert!(KVCacheAllocator::new(config).is_err());
+            assert!(KVCacheAllocator::with_spec(config, allocator.spec.clone()).is_err());
+        }
     }
 
     #[test]

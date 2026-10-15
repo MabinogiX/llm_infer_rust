@@ -78,6 +78,12 @@ CUDA 非贪心采样在构建包含 FlashInfer 时，使用与原版 SGLang 相�
 
 Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-server.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
 
+`--memory-ratio` 默认 `0.9`，表示模型权重与 KV 池的总显存预算占 GPU 总显存的比例。KV 预算为 `总显存 × memory-ratio − 当前已用显存`，按完整 page 向下取整，并包含保留的 sink page。CUDA KV 池在启动时预分配，不受 `--max-running-req` 或 `--max-seq-len` 限制；这两个参数分别限制活跃请求数和单请求长度，已完成请求的前缀仍可保留在共享 radix cache 中。CPU 保留最多 512 MiB 且受并发容量限制的分配策略。
+
+启动日志 `allocated KV cache pool` 会显示预算、实际分配字节数、可用页数及 token 容量。CUDA Graph、激活和后端 workspace 会额外占用显存，因此 `nvidia-smi` 最终占用可能高于 `memory-ratio`；应为这些开销保留空间，必要时降低该参数。例如 `--memory-ratio 0.8` 使用约 80% 的权重与 KV 预算，其余空间供执行时使用。更大的 KV 池主要增加并发/前缀缓存容量，不保证单请求推理更快。
+
+如需小缓存或在同一卡上运行多个实例，可显式设置 `--max-total-tokens N` 限制整个共享 KV 池的可用 token 容量（默认不限制）。该值向下取整到完整 page，至少为一个 page；它只提供上限，不会突破显存预算，也不会改变单请求长度限制。例如 `--max-total-tokens 40960` 将缓存限制在最多 40960 个 token。
+
 模型专有代码集中在 `src/models/<模型名>/`：`config.rs` 解析和校验模型强类型配置，`model.rs` 实现模型结构及持有配置的 factory，`template.rs` 处理输入模板，`output.rs` 解析输出，`definition.rs` 提供配置解析器、factory 和默认模板／parser 的注册定义。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择模型，并统一初始化 tokenizer、Engine、Scheduler 和输出解析器。不支持的模型或执行组合会在加载权重前报错。新增模型时实现配置、运行时描述及能力校验并登记，无须在模型目录中复制运行时装配；请求处理过程不切换模型。
 
 共享计算位于 `src/layers/`：bias-free linear、embedding／logits 行选择、`PackedQkv`、`DenseSwiGlu`、RMSNorm／residual RMSNorm／QK norm 和 `HalfSplitRope`，包括对应 CUDA 内核。接口目前只表达 Qwen3 已验证的直接 norm scale、FP32 累积和全维 half-split RoPE 语义，CUDA Q/K 变换会原地更新 projection 视图。模型保留权重命名和绑定、QK norm 的选用、残差组合、attention 调用及 graph 分段。第二个真实模型的接口验证仍待完成。

@@ -172,6 +172,7 @@ fn compare_cached_and_full_forward(device: Device) {
     args.attention_backend = "pt".into();
     args.max_seq_len = 8;
     args.max_running_req = 2;
+    args.max_total_tokens = Some(32);
     args.page_size = 2;
     args.cuda_graph_bs = Some(0);
     args.prefill_cuda_graph_max_tokens = 0;
