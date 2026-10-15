@@ -2,7 +2,7 @@
 
 日期：2026-10-08。本文记录架构分析与后续计划，不代表相关能力已实现。
 
-分析基于本地 `sglang-rust` HEAD `c21fde4` 与原版 `sglang` HEAD `ac656ee79a` 的当前源码。远程 Rust 项目为 `sglang-test:/sjtu/yaosikai/llm_infer_rust`。本文中的原版路径指 `sglang/python/sglang/srt/`，主要参考 Python SRT 的模块职责与接口设计。
+分析基于本地 `sglang-rust` HEAD `c21fde4` 与原版 `sglang` HEAD `ac656ee79a` 的当前源码。远程 Rust 项目为 `sglang-test:/llm_infer_rust`。本文中的原版路径指 `sglang/python/sglang/srt/`，主要参考 Python SRT 的模块职责与接口设计。
 
 ## 1. 目标与待确认事项
 
@@ -198,9 +198,9 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 
 本地 macOS／CPU 验证：`cargo test --all-targets --no-fail-fast`，109 项测试通过。覆盖配置拒绝、EOS 来源优先级与严格校验、统一启动加载微型 dense Qwen3 safetensors checkpoint、prefill／decode 生成、无 EOS 时 token 0 不误停及 abort；原有 Qwen3 前向、权重绑定、模板／parser、调度和缓存测试通过。
 
-按用户指定的工作方式，在本地开发并同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust`，以该远端代码和测试结果为验收依据。两端基于同一提交 `da6c5c1`，同步文件通过 SHA-256 校验，远端 `tmp.sh`／benchmark 脚本保留。
+按用户指定的工作方式，在本地开发并同步至 `sglang-test:/llm_infer_rust`，以该远端代码和测试结果为验收依据。两端基于同一提交 `da6c5c1`，同步文件通过 SHA-256 校验，远端 `tmp.sh`／benchmark 脚本保留。
 
-远端 A100 GPU 1 验证：`cargo test --release --all-targets -- --test-threads=1`，119 项通过、1 项已有采样微基准默认忽略；release 服务二进制已更新。首次 CUDA 回归暴露测试执行器未声明 graph 支持，已在本地补齐其 backend 能力转发并同步，完整回归通过。真实 `/sjtu/yaosikai/Qwen3-0.6B`、BF16、FlashInfer、max-running-req=4、max-seq-len=40960，eager（decode/prefill graph 均关闭）和 graph（decode 上限 4、prefill token 上限 2048）各 12 项 HTTP 回归通过；8 组含不同长度和重复前缀的贪心请求，文本、usage 和 finish_reason 完全一致。已有 CUDA kernel／graph 数值回归随 Rust 测试通过，服务日志确认 decode 与 segmented prefill graph 捕获。临时服务均已退出。
+远端 A100 GPU 1 验证：`cargo test --release --all-targets -- --test-threads=1`，119 项通过、1 项已有采样微基准默认忽略；release 服务二进制已更新。首次 CUDA 回归暴露测试执行器未声明 graph 支持，已在本地补齐其 backend 能力转发并同步，完整回归通过。真实 `/Qwen3-0.6B`、BF16、FlashInfer、max-running-req=4、max-seq-len=40960，eager（decode/prefill graph 均关闭）和 graph（decode 上限 4、prefill token 上限 2048）各 12 项 HTTP 回归通过；8 组含不同长度和重复前缀的贪心请求，文本、usage 和 finish_reason 完全一致。已有 CUDA kernel／graph 数值回归随 Rust 测试通过，服务日志确认 decode 与 segmented prefill graph 捕获。临时服务均已退出。
 
 远端记录保存在项目 `logs/registration-config-tests-20261009.log`、`logs/registration-config-build-20261009.log`、`logs/registration-config-http-summary-20261009.log` 和 `logs/registration-config-eager-graph-comparison-20261009.json`，两种模式各自的服务／API 日志也位于 `logs/`。本次未做性能测量，重构不作为推理提速证据。
 
@@ -218,7 +218,7 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 
 新增 packed QKV 对照独立 projection、packed SwiGLU 对照 gate/up/down、embedding／tied weight 与 live logits 行重排测试；原有 norm、RoPE、CUDA 和 graph 数值测试随提取保留。用户已确认先完成 Qwen3 提取和回归，第二模型验证待办；尚未完成阶段 2 的全部加载与内存验收，本次不作为推理提速证据。
 
-本地 macOS／CPU 全目标 Rust 测试 114 项通过。最终源码同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust` 并以 SHA-256 校验；远端 A100 GPU 1 release 全目标测试 124 项通过、1 项已有采样微基准忽略，release 二进制更新。真实 Qwen3-0.6B／BF16／FlashInfer 下，eager 和 decode＋segmented prefill graph 各 12 项 HTTP 测试通过；每种模式的 8 组不同长度与重复前缀请求，其 text／usage／finish_reason 均与提取前基线完全一致，两种模式也互相一致。临时服务退出后 GPU 显存恢复。远端验收记录为 `logs/shared-layers-tests-20261009.log`、`logs/shared-layers-build-20261009.log`、`logs/shared-layers-http-summary-20261009.log`、`logs/shared-layers-eager-graph-comparison-20261009.json` 及各模式服务／API 日志。
+本地 macOS／CPU 全目标 Rust 测试 114 项通过。最终源码同步至 `sglang-test:/llm_infer_rust` 并以 SHA-256 校验；远端 A100 GPU 1 release 全目标测试 124 项通过、1 项已有采样微基准忽略，release 二进制更新。真实 Qwen3-0.6B／BF16／FlashInfer 下，eager 和 decode＋segmented prefill graph 各 12 项 HTTP 测试通过；每种模式的 8 组不同长度与重复前缀请求，其 text／usage／finish_reason 均与提取前基线完全一致，两种模式也互相一致。临时服务退出后 GPU 显存恢复。远端验收记录为 `logs/shared-layers-tests-20261009.log`、`logs/shared-layers-build-20261009.log`、`logs/shared-layers-http-summary-20261009.log`、`logs/shared-layers-eager-graph-comparison-20261009.json` 及各模式服务／API 日志。
 
 ### 5.4 分层分页 KV 实施记录（2026-10-09）
 
@@ -226,7 +226,7 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 
 范围按用户要求收敛到通用 full-history Transformer KV，没有增加少数架构的特殊分支。新增异构 A／B／A 缓存组的生命周期测试，以及通过 Engine 加载和绑定接口的异构 attention 数值对照；此测试 factory 不作为生产模型注册。Qwen3 的 backend／内核限制继续校验。详细接口、生命周期、支持范围和后续工作见 [设计文档](layered-state-cache-design-2026-10-09.md)。
 
-本地 macOS／CPU 全目标测试 121 项通过，`cargo fmt --all -- --check` 和 `git diff --check` 通过；CUDA 专用分支在本地无 GPU 时不执行实际计算。最终代码同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust`，两端基于 `0904a14`，本次修改及新增文件通过 SHA-256 校验；远端 `tmp.sh`、benchmark 脚本和已有日志保留。
+本地 macOS／CPU 全目标测试 121 项通过，`cargo fmt --all -- --check` 和 `git diff --check` 通过；CUDA 专用分支在本地无 GPU 时不执行实际计算。最终代码同步至 `sglang-test:/llm_infer_rust`，两端基于 `0904a14`，本次修改及新增文件通过 SHA-256 校验；远端 `tmp.sh`、benchmark 脚本和已有日志保留。
 
 远端 A100 GPU 1 使用完整 CUDA／FlashInfer 构建，release 全目标测试 131 项通过、1 项已有采样微基准忽略，release 服务二进制已更新。真实 Qwen3-0.6B／BF16／FlashInfer 下，eager 和 decode＋segmented prefill graph 各 12 项 HTTP 回归通过；8 组不同长度及重复前缀请求的 text／usage／finish_reason 在两种模式间、与既有重构前基线均完全一致。服务日志确认 graph 捕获，临时服务已退出，GPU 1 显存恢复到测试前的 7 MiB。
 
@@ -244,7 +244,7 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 
 新增不同段输入形状的算术测试程序，验证通用接口及失败／缺失／超限桶、padding、保留输出和地址重绑定；没有新增生产模型。Qwen3 的分段 prefill 数值回归扩展至 BF16／FP16 与 `pt`／`fa`／FlashInfer，保留动态长度、前缀命中、clear／recapture 和既有 decode 数值测试。设计与接口约定见 [执行与 CUDA graph 设计](execution-cuda-graph-design-2026-10-10.md)。
 
-本地 macOS／CPU 全目标测试 125 项通过，`cargo fmt --all -- --check` 和 `git diff --check` 通过；本地无 CUDA，实际 GPU 数值验证在远端执行。本次变更及新增文件共 16 个同步至 `sglang-test:/sjtu/yaosikai/llm_infer_rust` 并通过 SHA-256 校验。两端 Git HEAD 不同，开发前已逐文件核对源码一致；远端已有脚本和日志保留。
+本地 macOS／CPU 全目标测试 125 项通过，`cargo fmt --all -- --check` 和 `git diff --check` 通过；本地无 CUDA，实际 GPU 数值验证在远端执行。本次变更及新增文件共 16 个同步至 `sglang-test:/llm_infer_rust` 并通过 SHA-256 校验。两端 Git HEAD 不同，开发前已逐文件核对源码一致；远端已有脚本和日志保留。
 
 远端 A100 GPU 1 release 全目标测试 136 项通过、1 项已有采样微基准忽略。BF16／FP16 × `pt`／`fa`／FlashInfer 六种分段 prefill 对照通过；真实 Qwen3-0.6B／BF16／FlashInfer 的 eager 与 decode＋segmented prefill graph 各 12 项 HTTP 回归通过。8 组不同长度和重复前缀请求的 text／usage／finish_reason 在两种模式间、与已有重构前基线均完全一致。服务日志确认两种 graph 捕获，release 二进制已更新，临时服务退出后 GPU 1 显存恢复至 7 MiB。
 

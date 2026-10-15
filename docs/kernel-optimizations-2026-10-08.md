@@ -1,6 +1,6 @@
 # FlashInfer 对齐、归一化及 KV 写入优化
 
-日期：2026-10-08。远程项目：`sglang-test:/sjtu/yaosikai/llm_infer_rust`。基于 Rust HEAD `694df85`；原版 SGLang HEAD `15b256bdb`。原有 `tmp.sh`、`benchmark.sh` 未修改。
+日期：2026-10-08。远程项目：`sglang-test:/llm_infer_rust`。基于 Rust HEAD `694df85`；原版 SGLang HEAD `15b256bdb`。原有 `tmp.sh`、`benchmark.sh` 未修改。
 
 ## 实现
 

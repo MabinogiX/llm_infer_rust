@@ -1,0 +1,180 @@
+SGLang smoke: 100 requests, concurrency=1, ISL/OSL=64/32
+benchmark_args=Namespace(backend='vllm-chat', base_url='http://127.0.0.1:8001', host='0.0.0.0', port=None, ready_check_timeout_sec=60, dataset_name='random', dataset_path='', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='default', served_model_name=None, tokenizer='/llm_infer_rust/../Qwen3-0.6B', num_prompts=100, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=64, random_output_len=32, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=1, output_file='/llm_infer_rust/benchmark/results/20261015-065349/sglang-smoke.jsonl', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=False, seed=42, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, flush_cache_timeout=60.0, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag='c1-i64-o32', header=None)
+Waiting up to 60s for http://127.0.0.1:8001/v1/models to become ready...
+Server ready in 0.0s.
+Fail to load tokenizer config with error=default is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `hf auth login` or by passing `token=<your_token>`
+
+WARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.
+Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.
+
+Namespace(backend='vllm-chat', base_url='http://127.0.0.1:8001', host='0.0.0.0', port=30000, ready_check_timeout_sec=60, dataset_name='random', dataset_path='', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='default', served_model_name=None, tokenizer='/llm_infer_rust/../Qwen3-0.6B', num_prompts=100, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=64, random_output_len=32, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=1, output_file='/llm_infer_rust/benchmark/results/20261015-065349/sglang-smoke.jsonl', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=False, seed=42, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, flush_cache_timeout=60.0, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag='c1-i64-o32', header=None)
+
+#Input tokens: 6400
+#Output tokens: 3200
+Starting warmup with 1 sequences...
+Warmup completed with 1 sequences. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 vllm-chat 
+Traffic request rate:                    inf       
+Max request concurrency:                 1         
+Successful requests:                     100       
+Benchmark duration (s):                  6.30      
+Total input tokens:                      6400      
+Total input text tokens:                 6400      
+Total generated tokens:                  3200      
+Total generated tokens (retokenized):    3100      
+Request throughput (req/s):              15.88     
+Input token throughput (tok/s):          1016.28   
+Output token throughput (tok/s):         508.14    
+Peak output token throughput (tok/s):    495.00    
+Peak concurrent requests:                17        
+Total token throughput (tok/s):          1524.43   
+Concurrency:                             0.99      
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   62.53     
+Median E2E Latency (ms):                 62.30     
+P90 E2E Latency (ms):                    62.56     
+P95 E2E Latency (ms):                    62.74     
+P99 E2E Latency (ms):                    71.56     
+---------------Time to First Token----------------
+Mean TTFT (ms):                          6.42      
+Median TTFT (ms):                        6.36      
+P90 TTFT (ms):                           6.59      
+P95 TTFT (ms):                           6.79      
+P99 TTFT (ms):                           7.81      
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          1.81      
+Median TPOT (ms):                        1.81      
+P90 TPOT (ms):                           1.81      
+P95 TPOT (ms):                           1.81      
+P99 TPOT (ms):                           2.06      
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.87      
+Median ITL (ms):                         1.86      
+P90 ITL (ms):                            1.90      
+P95 ITL (ms):                            1.97      
+P99 ITL (ms):                            2.13      
+Max ITL (ms):                            2.35      
+==================================================
+SGLang smoke: 100 requests, concurrency=8, ISL/OSL=64/32
+benchmark_args=Namespace(backend='vllm-chat', base_url='http://127.0.0.1:8001', host='0.0.0.0', port=None, ready_check_timeout_sec=60, dataset_name='random', dataset_path='', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='default', served_model_name=None, tokenizer='/llm_infer_rust/../Qwen3-0.6B', num_prompts=100, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=64, random_output_len=32, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=8, output_file='/llm_infer_rust/benchmark/results/20261015-065349/sglang-smoke.jsonl', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=False, seed=42, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, flush_cache_timeout=60.0, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag='c8-i64-o32', header=None)
+Waiting up to 60s for http://127.0.0.1:8001/v1/models to become ready...
+Server ready in 0.0s.
+Fail to load tokenizer config with error=default is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `hf auth login` or by passing `token=<your_token>`
+
+WARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.
+Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.
+
+Namespace(backend='vllm-chat', base_url='http://127.0.0.1:8001', host='0.0.0.0', port=30000, ready_check_timeout_sec=60, dataset_name='random', dataset_path='', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='default', served_model_name=None, tokenizer='/llm_infer_rust/../Qwen3-0.6B', num_prompts=100, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=64, random_output_len=32, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=8, output_file='/llm_infer_rust/benchmark/results/20261015-065349/sglang-smoke.jsonl', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=False, seed=42, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, flush_cache_timeout=60.0, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag='c8-i64-o32', header=None)
+
+#Input tokens: 6400
+#Output tokens: 3200
+Starting warmup with 1 sequences...
+Warmup completed with 1 sequences. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 vllm-chat 
+Traffic request rate:                    inf       
+Max request concurrency:                 8         
+Successful requests:                     100       
+Benchmark duration (s):                  6.15      
+Total input tokens:                      6400      
+Total input text tokens:                 6400      
+Total generated tokens:                  3200      
+Total generated tokens (retokenized):    3100      
+Request throughput (req/s):              16.27     
+Input token throughput (tok/s):          1041.15   
+Output token throughput (tok/s):         520.58    
+Peak output token throughput (tok/s):    509.00    
+Peak concurrent requests:                25        
+Total token throughput (tok/s):          1561.73   
+Concurrency:                             7.71      
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   473.92    
+Median E2E Latency (ms):                 487.96    
+P90 E2E Latency (ms):                    488.46    
+P95 E2E Latency (ms):                    488.67    
+P99 E2E Latency (ms):                    513.95    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          417.61    
+Median TTFT (ms):                        431.98    
+P90 TTFT (ms):                           432.44    
+P95 TTFT (ms):                           432.67    
+P99 TTFT (ms):                           457.99    
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          1.82      
+Median TPOT (ms):                        1.81      
+P90 TPOT (ms):                           1.81      
+P95 TPOT (ms):                           1.81      
+P99 TPOT (ms):                           2.06      
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.88      
+Median ITL (ms):                         1.86      
+P90 ITL (ms):                            1.91      
+P95 ITL (ms):                            2.01      
+P99 ITL (ms):                            2.15      
+Max ITL (ms):                            3.29      
+==================================================
+SGLang smoke: 100 requests, concurrency=32, ISL/OSL=64/32
+benchmark_args=Namespace(backend='vllm-chat', base_url='http://127.0.0.1:8001', host='0.0.0.0', port=None, ready_check_timeout_sec=60, dataset_name='random', dataset_path='', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='default', served_model_name=None, tokenizer='/llm_infer_rust/../Qwen3-0.6B', num_prompts=100, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=64, random_output_len=32, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=32, output_file='/llm_infer_rust/benchmark/results/20261015-065349/sglang-smoke.jsonl', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=False, seed=42, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, flush_cache_timeout=60.0, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag='c32-i64-o32', header=None)
+Waiting up to 60s for http://127.0.0.1:8001/v1/models to become ready...
+Server ready in 0.0s.
+Fail to load tokenizer config with error=default is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `hf auth login` or by passing `token=<your_token>`
+
+WARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.
+Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.
+
+Namespace(backend='vllm-chat', base_url='http://127.0.0.1:8001', host='0.0.0.0', port=30000, ready_check_timeout_sec=60, dataset_name='random', dataset_path='', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='default', served_model_name=None, tokenizer='/llm_infer_rust/../Qwen3-0.6B', num_prompts=100, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=64, random_output_len=32, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=32, output_file='/llm_infer_rust/benchmark/results/20261015-065349/sglang-smoke.jsonl', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=False, seed=42, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, flush_cache_timeout=60.0, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag='c32-i64-o32', header=None)
+
+#Input tokens: 6400
+#Output tokens: 3200
+Starting warmup with 1 sequences...
+Warmup completed with 1 sequences. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 vllm-chat 
+Traffic request rate:                    inf       
+Max request concurrency:                 32        
+Successful requests:                     100       
+Benchmark duration (s):                  6.14      
+Total input tokens:                      6400      
+Total input text tokens:                 6400      
+Total generated tokens:                  3200      
+Total generated tokens (retokenized):    3100      
+Request throughput (req/s):              16.28     
+Input token throughput (tok/s):          1041.97   
+Output token throughput (tok/s):         520.98    
+Peak output token throughput (tok/s):    510.00    
+Peak concurrent requests:                49        
+Total token throughput (tok/s):          1562.95   
+Concurrency:                             27.02     
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1659.33   
+Median E2E Latency (ms):                 1951.92   
+P90 E2E Latency (ms):                    1954.37   
+P95 E2E Latency (ms):                    1954.87   
+P99 E2E Latency (ms):                    1961.91   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1603.20   
+Median TTFT (ms):                        1896.01   
+P90 TTFT (ms):                           1898.37   
+P95 TTFT (ms):                           1898.89   
+P99 TTFT (ms):                           1906.02   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          1.81      
+Median TPOT (ms):                        1.81      
+P90 TPOT (ms):                           1.81      
+P95 TPOT (ms):                           1.81      
+P99 TPOT (ms):                           1.94      
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.87      
+Median ITL (ms):                         1.86      
+P90 ITL (ms):                            1.90      
+P95 ITL (ms):                            1.95      
+P99 ITL (ms):                            2.12      
+Max ITL (ms):                            3.47      
+==================================================

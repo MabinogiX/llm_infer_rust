@@ -25,7 +25,7 @@ Rust 在整个 decode+prefill catalog 捕获之前 reset allocator peak；原版
 ## 复现
 
 ```sh
-cd /sjtu/yaosikai/llm_infer_rust
+cd /llm_infer_rust
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/benchmark-shared-graph-pool.py \
   --output-dir benchmark/results/shared-pool-stage4-2026-10-10 \
   --rounds 3 --modes sglang rust-stage2 rust eager sglang-serial --resume

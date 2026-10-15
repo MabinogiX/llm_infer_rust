@@ -71,7 +71,7 @@ CPU 130 项（129 lib + 1 integration）、CUDA 23 项（22 lib + 1 integration�
 原始目录：`benchmark/results/overlap-read-boundary-2026-10-12/`；服务二进制 SHA-256：`3fcb1387ad270241deaa534858e41b5171bb7eb764f8dee9cb1bbb84c215488c`。实现、文档、日志和结果本地/远端同步；不新增 HTTP 专项测试计数。
 
 ```sh
-cd /sjtu/yaosikai/llm_infer_rust
+cd /llm_infer_rust
 .venv/bin/python scripts/benchmark-shared-graph-pool.py \
   --rounds 3 --modes rust-no-metadata rust-serial rust \
   --output-dir benchmark/results/overlap-read-boundary-2026-10-12 --resume

@@ -1,6 +1,6 @@
 # Qwen3 decode 性能优化结果
 
-日期：2026-10-07。远程项目：`sglang-test:/sjtu/yaosikai/llm_infer_rust`。
+日期：2026-10-07。远程项目：`sglang-test:/llm_infer_rust`。
 
 已完成 FlashInfer workspace 复用、decode KV 映射增量更新、残差加法与 RMSNorm 融合。本地源码和远程项目均已更新，远程 release 二进制已重新构建。
 

@@ -71,7 +71,7 @@ CPU 139 项通过（1 项 ignored）、CUDA 23 项（22 lib + 1 integration）�
 原始结果目录：`benchmark/results/overlap-retirement-2026-10-12/`。二进制 SHA-256：`e50e7a288a37be3424252226e0fdae251d2c022f2c3d1e69f15b7b9ac6f15cd1`。实现、文档、日志和结果已同步本地/远端；不新增 HTTP 专项测试计数。
 
 ```sh
-cd /sjtu/yaosikai/llm_infer_rust
+cd /llm_infer_rust
 .venv/bin/python scripts/benchmark-shared-graph-pool.py \
   --rounds 3 --modes rust-serial rust \
   --output-dir benchmark/results/overlap-retirement-2026-10-12 --resume
