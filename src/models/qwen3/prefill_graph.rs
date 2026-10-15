@@ -388,6 +388,7 @@ mod cuda_tests {
                     .to_device(device);
                     let metadata = AttentionMetadata {
                         forward_mode: phase,
+                        decode_host: None,
                         write_loc: Some(Tensor::from_slice(&writes).to_device(device)),
                         block_table: Some(
                             Tensor::from_slice(&table)
@@ -544,6 +545,7 @@ mod cuda_tests {
                     }
                     let metadata = AttentionMetadata {
                         forward_mode: BatchPhase::Prefill,
+                        decode_host: None,
                         write_loc: Some(Tensor::from_slice(&writes).to_device(device)),
                         cu_seqlens_q: Some(Tensor::from_slice(&cumulative).to_device(device)),
                         prefix_lens: Some(

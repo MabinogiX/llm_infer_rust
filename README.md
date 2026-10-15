@@ -51,6 +51,10 @@ Linux CUDA 环境中，模型权重和 KV cache 绑定后会捕获 decode CUDA G
 
 FlashInfer decode 图的实现、前置条件与测量结果见 [CUDA Graph 验证记录](docs/cuda-graph-decode.md)。
 
+FlashInfer captured decode 使用调度器持有的 CPU 序列长度快照规划，在固定 GPU 缓冲中生成分页索引，避免逐步 `masked_select` 和规划用的 GPU→CPU 回传。Pinned 规划缓冲通过上传完成事件保护，GPU workspace 更新与图执行在同一执行 stream 上有序提交。页表行使用版本号，只在内容变化时复制到图私有缓冲；请求换行、补齐行覆盖和无版本快照的 fallback 都会使对应副本失效。没有 CPU 快照的调用仍可使用原规划路径。
+
+FutureMap 的 scatter 索引也保留在 GPU，仅在槽位序列变化时刷新，避免采样后重复上传索引所引入的阻塞 H2D。实现、缓冲生命周期与交替 A/B 结果见 [decode 性能优化记录](docs/decode-performance-optimizations.md)。
+
 Qwen3 的 CUDA BF16/FP16 prefill 在启动时捕获全部配置的分段图，按整批未缓存 token 总数分桶。`--prefill-cuda-graph-max-tokens N` 设置最大桶（默认 2048），设为 `0` 独立禁用 prefill graph；`--cuda-graph-bs 0` 只禁用 decode graph。图从大桶到小桶捕获，完成后服务才开始监听；请求期间不捕获、不淘汰图，超限或缺失的桶使用 eager。启动耗时和显存需求随捕获桶增加，可调低 token 上限。CPU、float32 和逐步同步 profiling 使用 eager prefill。实现和验证见 [Prefill 分段图验证记录](docs/cuda-graph-prefill.md)。
 
 ### FlashInfer 分页 decode 与 prefill
@@ -77,6 +81,12 @@ CUDA 非贪心采样在构建包含 FlashInfer 时，使用与原版 SGLang 相�
 诊断请求延迟时，在启动命令前设置 `SGLANG_PROFILE_STEPS=1`。日志会按请求 UID 和输出 token 序号打印 `request step timing`，包含批次准备、模型前向、采样和 KV 状态更新的微秒耗时；`model forward timing` 汇总规划、各 decoder 层、RoPE、归一化、MLP 和 attention backend 等耗时。非流式请求还会打印入口及输出处理耗时。诊断模式会在阶段边界同步 CUDA，可能降低吞吐；正常运行时不设置该变量。
 
 Linux GPU 部署时，`VENV_DIR` 指向的环境需要安装与 `tch` 兼容的 CUDA 版 PyTorch；CPU 版 PyTorch 即使机器有 GPU，也会让 `auto` 选择 CPU。`./scripts/run-server.sh --device cuda` 可用于明确检查 CUDA 是否可用。模型权重加载后，服务通过该环境的 PyTorch 查询剩余显存，再按 `--memory-ratio` 分配 GPU KV cache。
+
+`--memory-ratio` 默认 `0.9`，表示模型权重与 KV 池的总显存预算占 GPU 总显存的比例。KV 预算为 `总显存 × memory-ratio − 当前已用显存`，按完整 page 向下取整，并包含保留的 sink page。CUDA KV 池在启动时预分配，不受 `--max-running-req` 或 `--max-seq-len` 限制；这两个参数分别限制活跃请求数和单请求长度，已完成请求的前缀仍可保留在共享 radix cache 中。CPU 保留最多 512 MiB 且受并发容量限制的分配策略。
+
+启动日志 `allocated KV cache pool` 会显示预算、实际分配字节数、可用页数及 token 容量。CUDA Graph、激活和后端 workspace 会额外占用显存，因此 `nvidia-smi` 最终占用可能高于 `memory-ratio`；应为这些开销保留空间，必要时降低该参数。例如 `--memory-ratio 0.8` 使用约 80% 的权重与 KV 预算，其余空间供执行时使用。更大的 KV 池主要增加并发/前缀缓存容量，不保证单请求推理更快。
+
+如需小缓存或在同一卡上运行多个实例，可显式设置 `--max-total-tokens N` 限制整个共享 KV 池的可用 token 容量（默认不限制）。该值向下取整到完整 page，至少为一个 page；它只提供上限，不会突破显存预算，也不会改变单请求长度限制。例如 `--max-total-tokens 40960` 将缓存限制在最多 40960 个 token。
 
 模型专有代码集中在 `src/models/<模型名>/`：`config.rs` 解析和校验模型强类型配置，`model.rs` 实现模型结构及持有配置的 factory，`template.rs` 处理输入模板，`output.rs` 解析输出，`definition.rs` 提供配置解析器、factory 和默认模板／parser 的注册定义。启动时，`src/server/components/builder.rs` 读取 Hugging Face `config.json` 的 `model_type` 和 `architectures`，通过 `src/models/registry.rs` 选择模型，并统一初始化 tokenizer、Engine、Scheduler 和输出解析器。不支持的模型或执行组合会在加载权重前报错。新增模型时实现配置、运行时描述及能力校验并登记，无须在模型目录中复制运行时装配；请求处理过程不切换模型。
 

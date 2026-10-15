@@ -172,6 +172,7 @@ fn compare_cached_and_full_forward(device: Device) {
     args.attention_backend = "pt".into();
     args.max_seq_len = 8;
     args.max_running_req = 2;
+    args.max_total_tokens = Some(32);
     args.page_size = 2;
     args.cuda_graph_bs = Some(0);
     args.prefill_cuda_graph_max_tokens = 0;
@@ -217,6 +218,7 @@ fn compare_cached_and_full_forward(device: Device) {
         positions.narrow(0, 0, 2),
         Some(AttentionMetadata {
             forward_mode: BatchPhase::Prefill,
+            decode_host: None,
             write_loc: Some(table.get(0).narrow(0, 0, 2)),
             cu_seqlens_q: Some(Tensor::from_slice(&[0i32, 2]).to_device(device)),
             prefix_lens: Some(Tensor::zeros([1], (Kind::Int, device))),
@@ -232,6 +234,7 @@ fn compare_cached_and_full_forward(device: Device) {
     for (phase, index) in [(BatchPhase::Decode, 2i64), (BatchPhase::Prefill, 3i64)] {
         let metadata = AttentionMetadata {
             forward_mode: phase,
+            decode_host: None,
             write_loc: Some(table.get(0).narrow(0, index, 1)),
             cu_seqlens_q: (phase == BatchPhase::Prefill)
                 .then(|| Tensor::from_slice(&[0i32, 1]).to_device(device)),

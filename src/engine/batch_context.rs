@@ -257,6 +257,7 @@ impl BatchContext {
             Tensor::from_slice(&positions).to_device(self.device),
             Some(AttentionMetadata {
                 forward_mode: BatchPhase::Prefill,
+                decode_host: None,
                 write_loc: Some(Tensor::from_slice(&write_loc).to_device(self.device)),
                 cu_seqlens_q: Some(Tensor::from_slice(&cumulative_lengths).to_device(self.device)),
                 prefix_lens: Some(Tensor::from_slice(&prefix_lens).to_device(self.device)),

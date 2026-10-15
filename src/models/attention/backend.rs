@@ -479,9 +479,18 @@ struct FlashInferGraphState {
 
 #[cfg(has_flashinfer)]
 impl DecodeGraphState for FlashInferGraphState {
-    fn prepare_replay(&self) -> Result<()> {
+    fn prepare_replay(&self, host: Option<&crate::engine::DecodeHostMetadata>) -> Result<()> {
+        let host = host.map(|host| {
+            let mut cache_seqlens = host.cache_seqlens.clone();
+            cache_seqlens.resize(self.table.size()[0] as usize, 1);
+            crate::engine::DecodeHostMetadata {
+                cache_seqlens,
+                block_table_versions: None,
+            }
+        });
         let metadata = AttentionMetadata {
             forward_mode: BatchPhase::Decode,
+            decode_host: host,
             write_loc: None,
             cu_seqlens_q: None,
             prefix_lens: None,
@@ -533,6 +542,8 @@ fn prepare_flashinfer_decode(
             page_size: i64,
             dtype_code: i64,
             graph: bool,
+            host_lengths: *const i32,
+            host_rows: i64,
         ) -> *mut c_void;
         fn sglang_flashinfer_error() -> *const std::ffi::c_char;
     }
@@ -560,6 +571,14 @@ fn prepare_flashinfer_decode(
             page_size,
             dtype_code,
             graph,
+            metadata
+                .decode_host
+                .as_ref()
+                .map_or(std::ptr::null(), |host| host.cache_seqlens.as_ptr()),
+            metadata
+                .decode_host
+                .as_ref()
+                .map_or(0, |host| host.cache_seqlens.len() as i64),
         )
     };
     if prepared.is_null() {
@@ -1524,6 +1543,7 @@ mod tests {
             for prefixes in [[0i32, 0], [1, 0]] {
                 let metadata = AttentionMetadata {
                     forward_mode: BatchPhase::Prefill,
+                    decode_host: None,
                     cu_seqlens_q: Some(Tensor::from_slice(&[0i32, 2, 3])),
                     prefix_lens: Some(Tensor::from_slice(&prefixes)),
                     req_to_token: Some(Tensor::from_slice(&[0i32, 1, 2, 3, 4, 5]).view([2, 3])),
@@ -1676,6 +1696,7 @@ mod tests {
         ] {
             let metadata = AttentionMetadata {
                 forward_mode: BatchPhase::Decode,
+                decode_host: None,
                 write_loc: None,
                 cu_seqlens_q: None,
                 prefix_lens: None,
@@ -1748,6 +1769,7 @@ mod tests {
                 let tokens = Tensor::arange(1024, (Kind::Int, device)).view([2, 512]);
                 let metadata = AttentionMetadata {
                     forward_mode: BatchPhase::Prefill,
+                    decode_host: None,
                     write_loc: None,
                     cu_seqlens_q: Some(Tensor::from_slice(&bounds).to_device(device)),
                     prefix_lens: Some(Tensor::from_slice(&prefixes).to_device(device)),
@@ -1832,6 +1854,7 @@ mod tests {
             .unwrap();
         let metadata = AttentionMetadata {
             forward_mode: BatchPhase::Decode,
+            decode_host: None,
             write_loc: None,
             cu_seqlens_q: None,
             prefix_lens: None,
@@ -1937,6 +1960,7 @@ mod tests {
         let table = Tensor::from_slice(&[0i32, 1, 2, -1, 3, -1, -1, -1, 4, 5, 6, 7]).view([3, 4]);
         let metadata = AttentionMetadata {
             forward_mode: BatchPhase::Prefill,
+            decode_host: None,
             write_loc: None,
             cu_seqlens_q: None,
             prefix_lens: None,

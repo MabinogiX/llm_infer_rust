@@ -145,11 +145,11 @@ __global__ void silu_mul_kernel(const T* gate_up, T* out,
 }
 
 // Eight BF16/FP16 values form one 16-byte global-memory transaction.
-template <typename T>
+template <typename T, int64_t FixedWidth = 0>
 __global__ void silu_mul_vector_kernel(const T* gate_up, T* out,
                                        int64_t tokens, int64_t width) {
   constexpr int kValuesPerVector = 8;
-  const int64_t vectors_per_token = width / kValuesPerVector;
+  const int64_t vectors_per_token = (FixedWidth ? FixedWidth : width) / kValuesPerVector;
   const int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= tokens * vectors_per_token) return;
   const int64_t token = index / vectors_per_token;
@@ -370,15 +370,23 @@ extern "C" const char* sglang_layers_native_silu_mul(
       reinterpret_cast<uintptr_t>(gate_up) % alignof(uint4) == 0 &&
       reinterpret_cast<uintptr_t>(out) % alignof(uint4) == 0;
   if (vectorized) {
+
     const dim3 vector_grid((tokens * (width / 8) + 127) / 128);
-    if (dtype == 0)
-      silu_mul_vector_kernel<<<vector_grid, 128, 0, cuda_stream>>>(
-          static_cast<const __nv_bfloat16*>(gate_up),
-          static_cast<__nv_bfloat16*>(out), tokens, width);
-    else
-      silu_mul_vector_kernel<<<vector_grid, 128, 0, cuda_stream>>>(
-          static_cast<const __half*>(gate_up), static_cast<__half*>(out),
-          tokens, width);
+    // Common SwiGLU widths use constant divisors for token/vector addressing.
+    // Small decode batches retain several CTAs per token on separate SMs.
+#define SILU_VECTOR(W) \
+    if (dtype == 0) silu_mul_vector_kernel<__nv_bfloat16, W><<<vector_grid, 128, 0, cuda_stream>>>( \
+        static_cast<const __nv_bfloat16*>(gate_up), static_cast<__nv_bfloat16*>(out), tokens, width); \
+    else silu_mul_vector_kernel<__half, W><<<vector_grid, 128, 0, cuda_stream>>>( \
+        static_cast<const __half*>(gate_up), static_cast<__half*>(out), tokens, width)
+    switch (width) {
+      case 2048: { SILU_VECTOR(2048); break; }
+      case 3072: { SILU_VECTOR(3072); break; }
+      case 4096: { SILU_VECTOR(4096); break; }
+      case 8192: { SILU_VECTOR(8192); break; }
+      default: { SILU_VECTOR(0); break; }
+    }
+#undef SILU_VECTOR
     return launch_error();
   }
   if (dtype == 0)

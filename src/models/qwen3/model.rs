@@ -794,6 +794,7 @@ mod tests {
 
         let first_prefill = AttentionMetadata {
             forward_mode: BatchPhase::Prefill,
+            decode_host: None,
             write_loc: Some(Tensor::from_slice(&[0i32, 1])),
             cu_seqlens_q: Some(Tensor::from_slice(&[0i32, 2])),
             prefix_lens: Some(Tensor::from_slice(&[0i32])),
@@ -817,6 +818,7 @@ mod tests {
 
         let decode = AttentionMetadata {
             forward_mode: BatchPhase::Decode,
+            decode_host: None,
             write_loc: Some(Tensor::from_slice(&[2i32])),
             cu_seqlens_q: None,
             prefix_lens: None,
@@ -840,6 +842,7 @@ mod tests {
 
         let cached_prefill = AttentionMetadata {
             forward_mode: BatchPhase::Prefill,
+            decode_host: None,
             write_loc: Some(Tensor::from_slice(&[3i32])),
             cu_seqlens_q: Some(Tensor::from_slice(&[0i32, 1])),
             prefix_lens: Some(Tensor::from_slice(&[3i32])),

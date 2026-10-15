@@ -1000,6 +1000,11 @@ mod tests {
         args.max_running_req = max_running_req;
         args.max_seq_len = max_seq_len;
         args.page_size = 2;
+        // These assertions exercise fixed batch shapes, independent of GPU auto-tuning.
+        args.chunked_prefill_size_explicit = true;
+        // Lifecycle tests need equal, small pools even when comparing two CUDA engines.
+        args.max_total_tokens =
+            Some(max_running_req * (max_seq_len / args.page_size + 1) * args.page_size);
         args.disable_cpu_gpu_overlap = disable_overlap;
         let engine = Engine::with_runtime(
             args,

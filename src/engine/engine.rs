@@ -28,7 +28,11 @@ use super::{Batch, ModelFactory, ModelRunner, ModelRunnerError, load_hf_safetens
 pub struct ServerArgs {
     pub model_path: PathBuf,
     pub tp_size: usize,
+    /// Fraction of total GPU memory budgeted for weights and KV cache together.
+    /// The remaining memory accommodates graphs, activations and workspaces.
     pub memory_ratio: f64,
+    /// Optional usable KV token capacity cap, rounded down to whole pages.
+    pub max_total_tokens: Option<usize>,
     pub max_running_req: usize,
     /// Maximum uncached tokens admitted into one prefill batch; zero means no
     /// independent token limit.
@@ -61,6 +65,7 @@ impl ServerArgs {
             model_path: model_path.into(),
             tp_size: 1,
             memory_ratio: 0.9,
+            max_total_tokens: None,
             max_running_req: 256,
             max_prefill_tokens_per_batch: 8192,
             chunked_prefill_size: 0,
@@ -503,6 +508,7 @@ fn allocation_config(
             max_running_req: server_args.max_running_req,
             max_seq_len: server_args.max_seq_len,
             memory_ratio: server_args.memory_ratio,
+            max_total_tokens: server_args.max_total_tokens,
         },
         model: KVCacheModelConfig {
             num_layers: runtime_config.num_layers,

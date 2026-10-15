@@ -52,6 +52,8 @@ pub(crate) struct FutureMap {
     slots: Vec<Option<RequestId>>,
     by_uid: HashMap<RequestId, usize>,
     output_tokens: Tensor,
+    scatter_slots: Vec<usize>,
+    scatter_index: Tensor,
 }
 
 impl FutureMap {
@@ -60,6 +62,8 @@ impl FutureMap {
             slots: vec![None; max_rows],
             by_uid: HashMap::new(),
             output_tokens: Tensor::zeros([max_rows as i64], (Kind::Int64, device)),
+            scatter_slots: Vec::new(),
+            scatter_index: Tensor::zeros([0], (Kind::Int64, device)),
         }
     }
 
@@ -71,7 +75,8 @@ impl FutureMap {
 
     /// Publish sampled IDs into stable request slots.  The copy is queued on
     /// the current execution stream, immediately after sampling, so it does
-    /// not require a CPU readback or a synchronizing event.
+    /// not require CPU readback. Stable membership also avoids index uploads;
+    /// changed slot order refreshes the immutable device index tensor.
     pub(crate) fn publish(&mut self, request_ids: &[RequestId], ids: &Tensor) -> Result<()> {
         if request_ids.len() != ids.size().first().copied().unwrap_or_default() as usize {
             return Err(SchedulerError::InvalidDecode(
@@ -85,16 +90,23 @@ impl FutureMap {
         if slots.is_empty() {
             return Ok(());
         }
-        let index_values = slots
-            .iter()
-            .map(|&slot| {
-                i64::try_from(slot).map_err(|_| {
-                    SchedulerError::InvalidDecode("future map slot exceeds i64".to_owned())
+        // A pageable H2D after sampling synchronizes the execution stream.
+        // Stable batches must reuse immutable device indices instead. Replaced
+        // tensors retire on this same stream, after their queued index_copy_.
+        if self.scatter_slots != slots {
+            let index_values = slots
+                .iter()
+                .map(|&slot| {
+                    i64::try_from(slot).map_err(|_| {
+                        SchedulerError::InvalidDecode("future map slot exceeds i64".to_owned())
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let index = Tensor::from_slice(&index_values).to_device(self.output_tokens.device());
-        let _ = self.output_tokens.index_copy_(0, &index, ids);
+                .collect::<Result<Vec<_>>>()?;
+            self.scatter_index =
+                Tensor::from_slice(&index_values).to_device(self.output_tokens.device());
+            self.scatter_slots = slots;
+        }
+        let _ = self.output_tokens.index_copy_(0, &self.scatter_index, ids);
         Ok(())
     }
 
@@ -183,6 +195,22 @@ impl FutureMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reuses_immutable_scatter_indices_until_slot_order_changes() {
+        let mut map = FutureMap::new(2, Device::Cpu);
+        map.publish(&[7, 9], &Tensor::from_slice(&[11i64, 22]))
+            .unwrap();
+        let retained_index = map.scatter_index.shallow_clone();
+        map.publish(&[7, 9], &Tensor::from_slice(&[33i64, 44]))
+            .unwrap();
+        assert_eq!(map.scatter_index.data_ptr(), retained_index.data_ptr());
+        assert_eq!(Vec::<i64>::try_from(map.output_tokens()).unwrap(), [33, 44]);
+        map.publish(&[9, 7], &Tensor::from_slice(&[55i64, 66]))
+            .unwrap();
+        assert_ne!(map.scatter_index.data_ptr(), retained_index.data_ptr());
+        assert_eq!(Vec::<i64>::try_from(map.output_tokens()).unwrap(), [66, 55]);
+    }
 
     #[test]
     fn keeps_slots_stable_when_batch_order_changes() {
