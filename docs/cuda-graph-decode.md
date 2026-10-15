@@ -1,6 +1,6 @@
 # Qwen3 FlashInfer decode CUDA Graph
 
-日期：2026-10-07。项目：`sglang-test:/sjtu/yaosikai/llm_infer_rust`。
+日期：2026-10-07。项目：`sglang-test:/llm_infer_rust`。
 
 本文记录 decode graph 接入时的实现与测量。后续已增加 prefill 分段图，参见 [Prefill CUDA Graph](cuda-graph-prefill.md)。
 

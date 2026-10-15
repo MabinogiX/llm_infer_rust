@@ -1,6 +1,6 @@
 # Qwen3 prefill 与非贪心采样优化
 
-日期：2026-10-07。项目：`sglang-test:/sjtu/yaosikai/llm_infer_rust`。
+日期：2026-10-07。项目：`sglang-test:/llm_infer_rust`。
 
 本轮在前一轮 decode 优化基础上，接入 FlashInfer ragged/paged prefill 和 GPU 概率采样。后续根据用户要求，采样已切换为原版 SGLang 当前采用的 joint top-k/top-p；下文原始性能表记录的是切换前的顺序采样版本，prefill 部分未变。此前的 release 二进制保存在远程 `/tmp/codex-prefill-sampling-before`，用于相同 GPU、相同配置的请求对照。
 

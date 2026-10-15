@@ -274,9 +274,9 @@ def binary_hashes(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--repo', type=Path, default=Path('/sjtu/yaosikai/llm_infer_rust'))
-    parser.add_argument('--sglang-repo', type=Path, default=Path('/sjtu/yaosikai/sglang'))
-    parser.add_argument('--model', type=Path, default=Path('/sjtu/yaosikai/Qwen3-0.6B'))
+    parser.add_argument('--repo', type=Path, default=Path('/llm_infer_rust'))
+    parser.add_argument('--sglang-repo', type=Path, default=Path('/sglang'))
+    parser.add_argument('--model', type=Path, default=Path('/Qwen3-0.6B'))
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--stage2-binary', type=Path, default=Path('/tmp/shared-pool-stage2-bin'))
     parser.add_argument('--baseline-binary', type=Path, default=Path('/tmp/shared-pool-stage4-before-latency-bin'))

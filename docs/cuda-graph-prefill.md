@@ -1,12 +1,12 @@
 # Qwen3 prefill 分段 CUDA Graph
 
-日期：2026-10-07。项目：`sglang-test:/sjtu/yaosikai/llm_infer_rust`。
+日期：2026-10-07。项目：`sglang-test:/llm_infer_rust`。
 
 Prefill 已增加按 token 桶复用的分段 CUDA Graph。图捕获 attention 之外的 transformer 计算，FlashInfer attention、分页规划、KV 写入和动态 logits 输出留在图外。Qwen3-0.6B 的开关对照中，短 prefill 请求中位延迟约降低 25%，六组缓存前缀用例约降低 7%–28%；长 prefill 没有一致的大幅加速。当前版本在启动时捕获全部配置桶，请求期间只回放，不再承担图捕获成本。下方性能表是上一版分段图热回放测量，启动捕获的验证单列在文末。
 
 ## 原版参考
 
-检查的是远程 `/sjtu/yaosikai/sglang` 提交 `15b256bdb`。该版本的 `PrefillCudaGraphRunner` 支持 `breakable`、`full` 和 `tc_piecewise`，CUDA 默认选择 `breakable`。其构造函数在 `prefill_cuda_graph_runner.py:606` 调用 `self.capture()`，`_capture_one_stream` 按 token 桶从大到小捕获，完成后才提供服务。Breakable 不依赖 torch.compile，在 attention 边界分段；prefill 按 aggregate token 数分桶，动态 attention 与输出尾部可以保留 eager。
+检查的是远程 `/sglang` 提交 `15b256bdb`。该版本的 `PrefillCudaGraphRunner` 支持 `breakable`、`full` 和 `tc_piecewise`，CUDA 默认选择 `breakable`。其构造函数在 `prefill_cuda_graph_runner.py:606` 调用 `self.capture()`，`_capture_one_stream` 按 token 桶从大到小捕获，完成后才提供服务。Breakable 不依赖 torch.compile，在 attention 边界分段；prefill 按 aggregate token 数分桶，动态 attention 与输出尾部可以保留 eager。
 
 主要参考文件为：
 

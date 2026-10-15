@@ -71,7 +71,7 @@ CPU 测试覆盖模式、dtype、形状和元数据拒绝，桶目录、批次�
 
 CUDA 测试覆盖通用三段程序的成功、失败、缺失、超限桶，跨段固定输出消费、padding 与保留输出，权重／缓存重绑定失效；原有 decode 动态页号／长度／padding 与数值测试增加静态表宽不匹配时的回退检查。Qwen3 分段 prefill 对照 eager logits 与 K/V，覆盖 BF16／FP16、`pt`／`fa`／FlashInfer、不同长度、多请求、缓存前缀、missing bucket 和 clear／recapture。FlashInfer 的固定输出测试同时验证返回 tensor 沿用调用方地址，且不覆盖有效 token 范围以外的存储。
 
-真实模型验收继续使用远端 `/sjtu/yaosikai/llm_infer_rust`、GPU 1 与 Qwen3-0.6B，检查 HTTP、eager／graph 和已有输出基线。最终统计及日志路径记录在路线图的本次实施记录。
+真实模型验收继续使用远端 `/llm_infer_rust`、GPU 1 与 Qwen3-0.6B，检查 HTTP、eager／graph 和已有输出基线。最终统计及日志路径记录在路线图的本次实施记录。
 
 本次没有改变内核接口或数学计算，没有引入新生产模型、跨进程执行或 speculative decoding；第二个实际模型验证仍待后续接入。未进行性能测量，不把此次重构作为推理提速证据。
 

@@ -1,6 +1,6 @@
 # Qwen3-0.6B：Rust 与 SGLang 剩余 decode 差距
 
-日期：2026-10-08。分析远程 `sglang-test:/sjtu/yaosikai/llm_infer_rust`（HEAD `694df85`）和 `/sjtu/yaosikai/sglang`（HEAD `15b256bdb`）。本次没有修改模型、依赖、启动脚本或编译二进制；只使用 GPU 1 启动临时诊断服务。
+日期：2026-10-08。分析远程 `sglang-test:/llm_infer_rust`（HEAD `694df85`）和 `/sglang`（HEAD `15b256bdb`）。本次没有修改模型、依赖、启动脚本或编译二进制；只使用 GPU 1 启动临时诊断服务。
 
 ## 用户 benchmark 的实际含义
 
