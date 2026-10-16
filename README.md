@@ -149,6 +149,8 @@ SGLANG_E2E_BASE_URL=http://127.0.0.1:8000/v1 \
 
 日志等级优先级为 `--log-level`、`RUST_LOG`、默认 `info`。例如 `RUST_LOG=sglang_rust=debug,info ./scripts/run-server.sh` 可按模块过滤。文件由后台线程写入；队列满时对产生日志的线程施加反压，而非丢弃日志。正常退出时会刷新缓冲；旧日期文件不会自动删除。
 
+调度器在实际 forward 前记录批次，`batch_size` 是 CUDA Graph padding 前的请求数，`batch_id` 是服务实例内累计发射序号。`prefill batch` 每批以 INFO 输出：包含累计 `prefill_batches`、`prefill_requests`、mixed batch 中的 `decode_requests`、本批 `prefill_tokens`、复用前缀 `cached_tokens`、运行/排队请求数，以及 chunk 请求与结束位置。`decode batch` 包含累计 `decode_batches` 和运行/排队请求数；默认仅在 batch size 变化或每 40 个 decode 批次时以 INFO 输出，其余批次以 DEBUG 输出，设置 `--log-level debug` 可查看全部批次。这些计数只读取 CPU 元数据，不同步 CUDA，也不记录 prompt 或生成文本。
+
 ## 已迁移的 KV Cache 基础模块
 
 `src/engine/kvcache/` 已包含 Rust 版本的 `BaseCacheHandle`、`CacheManager` trait、`KVCachePool` 与 `KVCacheAllocator`：

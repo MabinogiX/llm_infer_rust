@@ -44,6 +44,14 @@ struct RetiredRequest {
     fence: crate::engine::CompletionFence,
 }
 
+#[derive(Default)]
+struct BatchLogState {
+    batches: u64,
+    prefill_batches: u64,
+    decode_batches: u64,
+    last_decode_batch_size: Option<usize>,
+}
+
 pub struct Scheduler {
     engine: Engine,
     args: ServerArgs,
@@ -58,6 +66,7 @@ pub struct Scheduler {
     outstanding: Option<PendingBatch>,
     retired: VecDeque<RetiredRequest>,
     future_map: FutureMap,
+    batch_log: BatchLogState,
 }
 
 impl Scheduler {
@@ -101,6 +110,7 @@ impl Scheduler {
             outstanding: None,
             retired: VecDeque::new(),
             future_map: FutureMap::new(future_map_rows, future_map_device),
+            batch_log: BatchLogState::default(),
         })
     }
 
@@ -255,6 +265,82 @@ impl Scheduler {
         Ok(results)
     }
 
+    /// Log actual scheduler batches, before graph padding. Tensor sizes and
+    /// request metadata are host-side; logging never reads GPU tensor values.
+    fn log_batch(
+        &mut self,
+        request_ids: &[RequestId],
+        batch: &Batch,
+        mixed_decode_requests: usize,
+        chunk: Option<PrefillChunk>,
+    ) {
+        self.batch_log.batches = self.batch_log.batches.saturating_add(1);
+        let batch_id = self.batch_log.batches;
+        let batch_size = request_ids.len();
+        let running_requests = self.requests.running_len();
+        let queued_requests = self.requests.pending_len();
+        if batch.phase == BatchPhase::Decode {
+            self.batch_log.decode_batches = self.batch_log.decode_batches.saturating_add(1);
+            let decode_batches = self.batch_log.decode_batches;
+            let report = self.batch_log.last_decode_batch_size != Some(batch_size)
+                || decode_batches % 40 == 0;
+            self.batch_log.last_decode_batch_size = Some(batch_size);
+            if report {
+                tracing::info!(
+                    batch_id,
+                    batch_size,
+                    decode_batches,
+                    running_requests,
+                    queued_requests,
+                    "decode batch"
+                );
+            } else {
+                tracing::debug!(
+                    batch_id,
+                    batch_size,
+                    decode_batches,
+                    running_requests,
+                    queued_requests,
+                    "decode batch"
+                );
+            }
+            return;
+        }
+        self.batch_log.prefill_batches = self.batch_log.prefill_batches.saturating_add(1);
+        if !tracing::enabled!(tracing::Level::INFO) {
+            return;
+        }
+        let decode_requests = mixed_decode_requests;
+        let prefill_requests = batch_size - decode_requests;
+        let prefill_tokens = batch.input_ids.numel() - decode_requests;
+        let cached_tokens: usize = request_ids[..prefill_requests]
+            .iter()
+            .filter_map(|&uid| self.requests.running_request(uid))
+            .map(|request| {
+                if chunk.is_some_and(|chunk| chunk.uid == request.uid) {
+                    request.prefill_cursor
+                } else {
+                    request.cached_len
+                }
+            })
+            .sum();
+        tracing::info!(
+            batch_id,
+            batch_size,
+            prefill_batches = self.batch_log.prefill_batches,
+            prefill_requests,
+            decode_requests,
+            prefill_tokens,
+            cached_tokens,
+            running_requests,
+            queued_requests,
+            chunk_request_id = ?chunk.map(|chunk| chunk.uid),
+            chunk_end = ?chunk.map(|chunk| chunk.end),
+            chunk_final = ?chunk.map(|chunk| chunk.is_last),
+            "prefill batch"
+        );
+    }
+
     fn run_phase(
         &mut self,
         request_ids: Vec<RequestId>,
@@ -264,6 +350,7 @@ impl Scheduler {
         chunk: Option<PrefillChunk>,
         results: &mut Vec<OutputToken>,
     ) -> Result<()> {
+        self.log_batch(&request_ids, &model_batch, 0, chunk);
         let mut profiler = StepProfiler::new(self.engine.device(), schedule_us);
         let profile_requests = profiler.enabled().then(|| {
             request_ids
@@ -665,6 +752,12 @@ impl Scheduler {
         future: Option<&RelayPlan>,
         chunk: Option<PrefillChunk>,
     ) -> std::result::Result<PendingBatch, EngineError> {
+        self.log_batch(
+            &request_ids,
+            &model_batch,
+            future.map_or(0, |relay| relay.rows().count()),
+            chunk,
+        );
         let params = request_ids
             .iter()
             .map(|uid| self.requests.running_request(*uid).unwrap().sampling_params)
