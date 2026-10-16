@@ -90,10 +90,15 @@ impl Scheduler {
             args.max_seq_len,
             args.page_size,
             engine.device(),
-        )?;
+        )?
+        .with_metadata_requirements(engine.metadata_requirements(BatchPhase::Prefill));
         let requests = RequestManager::new(cache);
         let prefill = PrefillManager::new(&args, batch_context);
-        let decode = DecodeManager::new(&args, engine.device())?;
+        let decode = DecodeManager::with_metadata_requirements(
+            &args,
+            engine.device(),
+            engine.metadata_requirements(BatchPhase::Decode),
+        )?;
         let future_map_rows = args.max_running_req;
         let future_map_device = engine.device();
         Ok(Self {
@@ -200,6 +205,10 @@ impl Scheduler {
 
     /// Runs prefill followed by decode for every request still running.
     pub fn step(&mut self) -> Result<Vec<OutputToken>> {
+        self.prefill
+            .set_metadata_requirements(self.engine.metadata_requirements(BatchPhase::Prefill));
+        self.decode
+            .set_metadata_requirements(self.engine.metadata_requirements(BatchPhase::Decode));
         if cfg!(has_cuda_graph)
             && self.engine.device().is_cuda()
             && !self.args.disable_cpu_gpu_overlap
@@ -384,12 +393,7 @@ impl Scheduler {
             match logits {
                 Ok(_) => {
                     let chunk = chunk.expect("non-final chunk metadata");
-                    if let Err(error) = self.requests.publish_prefix(chunk.uid, chunk.end) {
-                        self.last_step_error = Some(EngineError::KVCache(error));
-                        self.requests.remove_batch(&[chunk.uid]);
-                    } else if let Some(request) = self.requests.running_request_mut(chunk.uid) {
-                        request.prefill_cursor = chunk.end;
-                    }
+                    self.complete_chunk(chunk, results);
                 }
                 Err(error) => {
                     self.synchronize();
@@ -614,10 +618,22 @@ impl Scheduler {
 
     fn launch_plan(
         &mut self,
-        mut plan: SchedulePlan,
+        plan: SchedulePlan,
     ) -> std::result::Result<PendingBatch, EngineError> {
-        if plan.phase == BatchPhase::Prefill {
-            if let (Some(relay), Some(offset)) = (&plan.relay, plan.relay_offset) {
+        match plan {
+            SchedulePlan::Prefill {
+                request_ids,
+                model_batch,
+                chunk,
+            } => self.launch_batch(request_ids, model_batch, None, chunk),
+            SchedulePlan::Decode { batch, relay } => self.launch_decode(batch, relay.as_ref()),
+            SchedulePlan::Mixed {
+                request_ids,
+                mut model_batch,
+                relay,
+                prefill_tokens,
+                chunk,
+            } => {
                 let slots = Tensor::from_slice(
                     &relay
                         .slots()
@@ -631,21 +647,16 @@ impl Scheduler {
                     .output_tokens()
                     .index_select(0, &slots)
                     .view([-1]);
-                let offset = i64::try_from(offset).map_err(|_| {
+                let offset = i64::try_from(prefill_tokens).map_err(|_| {
                     EngineError::InvalidArgument(
                         "mixed prefill token count exceeds i64".to_string(),
                     )
                 })?;
-                let prefill_ids = plan.model_batch.input_ids.narrow(0, 0, offset);
-                plan.model_batch.input_ids = Tensor::cat(&[prefill_ids, decode_ids], 0);
+                let prefill_ids = model_batch.input_ids.narrow(0, 0, offset);
+                model_batch.input_ids = Tensor::cat(&[prefill_ids, decode_ids], 0);
+                self.launch_batch(request_ids, model_batch, Some(&relay), chunk)
             }
         }
-        self.launch_batch(
-            plan.request_ids,
-            plan.model_batch,
-            plan.relay.as_ref(),
-            plan.chunk,
-        )
     }
 
     /// Select the next batch after an outstanding invocation. This method
@@ -903,11 +914,28 @@ impl Scheduler {
                 results,
             );
         }
-        if let Err(error) = self.requests.publish_prefix(chunk.uid, chunk.end) {
-            self.last_step_error = Some(EngineError::KVCache(error));
-            self.requests.remove_batch(&[chunk.uid]);
-        } else if let Some(request) = self.requests.running_request_mut(chunk.uid) {
-            request.prefill_cursor = chunk.end;
+        self.complete_chunk(chunk, results);
+    }
+
+    /// A middle chunk commits KV progress without publishing a sampled token.
+    /// Its request may already have been logically cancelled while in flight.
+    fn complete_chunk(&mut self, chunk: PrefillChunk, results: &mut Vec<OutputToken>) {
+        if self.requests.running_request(chunk.uid).is_none() {
+            return;
+        }
+        match self.requests.publish_prefix(chunk.uid, chunk.end) {
+            Ok(()) => {
+                self.requests
+                    .running_request_mut(chunk.uid)
+                    .unwrap()
+                    .prefill_cursor = chunk.end;
+            }
+            Err(error) => {
+                tracing::error!(uid = chunk.uid, error = %error, "chunk KV cache publish failed");
+                self.last_step_error = Some(EngineError::KVCache(error));
+                self.retire_request(chunk.uid, false);
+                results.push(self.terminal_result(chunk.uid, FinishReason::Error));
+            }
         }
     }
 
@@ -937,8 +965,8 @@ impl Scheduler {
                 }
             };
             let (next_ids, next_phase, next) = if let Some(plan) = plan {
-                let ids = plan.request_ids.clone();
-                let phase = plan.phase;
+                let ids = plan.request_ids().to_vec();
+                let phase = plan.phase();
                 (ids, phase, self.launch_plan(plan).map(Some))
             } else {
                 (Vec::new(), BatchPhase::Decode, Ok(None))
@@ -1254,6 +1282,161 @@ mod tests {
             self.inner.publish(handle, written_ids)
         }
 
+        fn release(&mut self, handle: &mut BaseCacheHandle) {
+            self.inner.release(handle);
+        }
+    }
+
+    struct CheckMetadataModel {
+        requirements: crate::engine::MetadataRequirements,
+        phases: std::rc::Rc<Cell<u8>>,
+    }
+
+    impl ModelExecutor for CheckMetadataModel {
+        fn metadata_requirements(&self, _: BatchPhase) -> crate::engine::MetadataRequirements {
+            self.requirements
+        }
+
+        fn forward(
+            &self,
+            batch: &crate::engine::ForwardBatch<'_>,
+        ) -> std::result::Result<crate::engine::ForwardOutput, ModelRunnerError> {
+            let metadata = batch.attention.unwrap();
+            assert_eq!(
+                metadata.block_table.is_some(),
+                self.requirements.block_table
+            );
+            assert_eq!(
+                metadata.req_to_token.is_some(),
+                self.requirements.req_to_token
+            );
+            let phase = match batch.phase() {
+                BatchPhase::Prefill => 1,
+                BatchPhase::Decode => 2,
+            };
+            self.phases.set(self.phases.get() | phase);
+            FixedTokenModel(3).forward(batch)
+        }
+    }
+
+    #[test]
+    fn replacing_runner_refreshes_metadata_for_existing_requests() {
+        let (mut scheduler, path) = scheduler_with_options(CacheStrategy::Radix, 2, 32);
+        let page_only = crate::engine::MetadataRequirements {
+            block_table: true,
+            req_to_token: false,
+        };
+        let token_only = crate::engine::MetadataRequirements {
+            block_table: false,
+            req_to_token: true,
+        };
+        let phases = std::rc::Rc::new(Cell::new(0));
+        let attach = |scheduler: &mut Scheduler, requirements| {
+            phases.set(0);
+            scheduler
+                .engine_mut()
+                .attach_model_runner(ModelRunner::new(
+                    Box::new(CheckMetadataModel {
+                        requirements,
+                        phases: phases.clone(),
+                    }),
+                    Device::Cpu,
+                ))
+                .unwrap();
+        };
+        // Scheduler was created without a runner and initially requires both tables.
+        attach(&mut scheduler, page_only);
+        let uid = scheduler
+            .add_request(
+                vec![1],
+                SamplingParams {
+                    max_tokens: 16,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(scheduler.step().unwrap().len(), 2);
+        assert_eq!(phases.get(), 3);
+        let pages = scheduler
+            .requests
+            .running_request(uid)
+            .unwrap()
+            .cache_handle
+            .as_ref()
+            .unwrap()
+            .page_ids
+            .clone();
+        attach(&mut scheduler, token_only);
+        scheduler
+            .add_request(
+                vec![5],
+                SamplingParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler.step().unwrap();
+        assert_eq!(
+            phases.get(),
+            3,
+            "both prefill and decode refresh their requirements"
+        );
+        assert_eq!(
+            scheduler
+                .requests
+                .running_request(uid)
+                .unwrap()
+                .cache_handle
+                .as_ref()
+                .unwrap()
+                .page_ids,
+            pages
+        );
+        attach(&mut scheduler, page_only);
+        scheduler.step().unwrap();
+        assert_eq!(phases.get(), 2);
+        assert_eq!(
+            scheduler
+                .requests
+                .running_request(uid)
+                .unwrap()
+                .cache_handle
+                .as_ref()
+                .unwrap()
+                .page_ids,
+            pages
+        );
+        assert!(scheduler.abort_request(uid));
+        assert!(scheduler.is_idle());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    struct FailChunkPublish {
+        inner: RadixCacheManager,
+    }
+    impl CacheManager for FailChunkPublish {
+        fn acquire(
+            &mut self,
+            ids: &[i64],
+            capacity: usize,
+            budget: Option<usize>,
+        ) -> crate::engine::kvcache::Result<AcquireOutcome> {
+            self.inner.acquire(ids, capacity, budget)
+        }
+        fn publish(
+            &mut self,
+            handle: &mut BaseCacheHandle,
+            ids: &[i64],
+        ) -> crate::engine::kvcache::Result<()> {
+            self.inner.publish(handle, ids)?;
+            if ids.first() == Some(&4) {
+                return Err(KVCacheError::InvalidArgument(
+                    "injected middle chunk publish failure".into(),
+                ));
+            }
+            Ok(())
+        }
         fn release(&mut self, handle: &mut BaseCacheHandle) {
             self.inner.release(handle);
         }
@@ -1947,6 +2130,136 @@ mod tests {
         assert!(outputs.iter().any(|output| output.uid == 0));
         assert!(outputs.iter().any(|output| output.uid == 1));
         fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_cancelled_outstanding_middle_chunk(device: tch::Device) {
+        let (mut scheduler, path) =
+            scheduler_with_execution(CacheStrategy::Radix, 2, 16, device, false);
+        scheduler.prefill.set_chunked_prefill_size(2);
+        scheduler
+            .engine_mut()
+            .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), device))
+            .unwrap();
+        let decode = scheduler
+            .add_request(
+                vec![1],
+                SamplingParams {
+                    max_tokens: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler.step_overlap().unwrap();
+        let chunk = scheduler
+            .add_request(
+                vec![4, 5, 6, 7, 8],
+                SamplingParams {
+                    max_tokens: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        scheduler.step_overlap().unwrap();
+        assert_eq!(
+            scheduler.outstanding.as_ref().unwrap().chunk.unwrap().uid,
+            chunk
+        );
+        assert!(scheduler.abort_request(chunk));
+        assert_eq!(scheduler.retired.len(), 1);
+        let outputs = scheduler.step_overlap().unwrap();
+        assert!(outputs.iter().all(|row| row.uid != chunk));
+        assert!(scheduler.retired.is_empty());
+        scheduler.abort_request(decode);
+        let mut discarded = Vec::new();
+        scheduler.drain_outstanding(&mut discarded);
+        assert!(scheduler.is_idle());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_middle_chunk_publish_failure(device: tch::Device) {
+        for mode in 0..3 {
+            let mixed = mode == 2;
+            let (mut scheduler, path) =
+                scheduler_with_execution(CacheStrategy::Radix, 2, 16, device, false);
+            scheduler.prefill.set_chunked_prefill_size(2);
+            scheduler
+                .engine_mut()
+                .attach_model_runner(ModelRunner::new(Box::new(FixedTokenModel(3)), device))
+                .unwrap();
+            let pool = scheduler.engine.shared_kv_cache_pool().unwrap();
+            scheduler.requests = RequestManager::new(Box::new(FailChunkPublish {
+                inner: RadixCacheManager::new(pool, 2).unwrap(),
+            }));
+            let decode = mixed.then(|| {
+                let uid = scheduler
+                    .add_request(
+                        vec![1],
+                        SamplingParams {
+                            max_tokens: 8,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                scheduler.step_overlap().unwrap();
+                uid
+            });
+            let chunk = scheduler
+                .add_request(
+                    vec![4, 5, 6, 7, 8],
+                    SamplingParams {
+                        max_tokens: 2,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let mut outputs = scheduler.step_overlap().unwrap();
+            if mixed {
+                outputs.extend(scheduler.step_overlap().unwrap());
+            }
+            let terminals = outputs
+                .iter()
+                .filter(|row| row.uid == chunk)
+                .collect::<Vec<_>>();
+            assert_eq!(terminals.len(), 1, "mixed={mixed}");
+            assert_eq!(terminals[0].finish_reason, Some(FinishReason::Error));
+            assert!(terminals[0].finished);
+            assert!(matches!(
+                scheduler.last_step_error(),
+                Some(EngineError::KVCache(_))
+            ));
+            if let Some(uid) = decode {
+                scheduler.abort_request(uid);
+            }
+            let mut discarded = Vec::new();
+            scheduler.drain_outstanding(&mut discarded);
+            assert!(discarded.iter().all(|row| row.uid != chunk));
+            assert!(scheduler.is_idle());
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn cancelled_outstanding_middle_chunk_is_ignored() {
+        exercise_cancelled_outstanding_middle_chunk(Device::Cpu);
+    }
+
+    #[cfg(has_cuda_graph)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_cancelled_outstanding_middle_chunk_is_ignored() {
+        exercise_cancelled_outstanding_middle_chunk(Device::Cuda(0));
+    }
+
+    #[test]
+    fn middle_chunk_publish_failure_emits_one_terminal() {
+        exercise_middle_chunk_publish_failure(Device::Cpu);
+    }
+
+    #[cfg(has_cuda_graph)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_middle_chunk_publish_failure_emits_one_terminal() {
+        exercise_middle_chunk_publish_failure(Device::Cuda(0));
     }
 
     #[test]

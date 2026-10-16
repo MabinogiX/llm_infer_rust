@@ -22,6 +22,23 @@ pub enum BatchPhase {
     Decode,
 }
 
+/// Cache tables needed by every reachable execution path, including eager
+/// fallback when graph admission fails. Custom models default to both tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataRequirements {
+    pub block_table: bool,
+    pub req_to_token: bool,
+}
+
+impl Default for MetadataRequirements {
+    fn default() -> Self {
+        Self {
+            block_table: true,
+            req_to_token: true,
+        }
+    }
+}
+
 /// Per-batch attention tensors passed through the model stack.
 ///
 /// The fields mirror mini-sglang's `AttentionMetadata`. Models consume the
@@ -106,6 +123,9 @@ pub trait DecodeGraphState {
 
 /// Model execution and cache-binding interface implemented by each architecture.
 pub trait ModelExecutor {
+    fn metadata_requirements(&self, _phase: BatchPhase) -> MetadataRequirements {
+        MetadataRequirements::default()
+    }
     fn set_kv_reserved_slot(&mut self, _slot: i64) {}
     /// Evaluated only after dtype/backend and full-history cache binding.
     /// Each forward mode is opt-in, with explicit shape and padding limits.
@@ -229,6 +249,10 @@ impl ModelRunner {
 
     pub fn graph_capabilities(&self) -> GraphCapabilities {
         self.model.graph_capabilities()
+    }
+
+    pub fn metadata_requirements(&self, phase: BatchPhase) -> MetadataRequirements {
+        self.model.metadata_requirements(phase)
     }
 
     /// Hands loaded Hugging Face tensors to the concrete model architecture.

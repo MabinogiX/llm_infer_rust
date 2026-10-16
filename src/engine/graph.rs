@@ -127,24 +127,25 @@ impl DecodeGraphRunner {
         let device = runner.device();
         let input_ids = Tensor::ones([rows, 1], (Kind::Int64, device));
         let positions = Tensor::zeros([rows, 1], (Kind::Int64, device));
+        let requirements = runner.metadata_requirements(BatchPhase::Decode);
         let mut metadata = AttentionMetadata {
             forward_mode: BatchPhase::Decode,
             decode_host: None,
             write_loc: Some(self.pad_locations.narrow(0, 0, rows).copy()),
             cu_seqlens_q: None,
             prefix_lens: None,
-            block_table: Some(
+            block_table: requirements.block_table.then(|| {
                 self.pad_pages
                     .narrow(0, 0, rows)
                     .unsqueeze(1)
-                    .repeat([1, args.max_seq_len.div_ceil(args.page_size) as i64]),
-            ),
-            req_to_token: Some(
+                    .repeat([1, args.max_seq_len.div_ceil(args.page_size) as i64])
+            }),
+            req_to_token: requirements.req_to_token.then(|| {
                 self.pad_locations
                     .narrow(0, 0, rows)
                     .unsqueeze(1)
-                    .repeat([1, args.max_seq_len as i64]),
-            ),
+                    .repeat([1, args.max_seq_len as i64])
+            }),
             cache_seqlens: Some(Tensor::ones([rows], (Kind::Int, device))),
             max_seqlen: Some(args.max_seq_len),
         };
@@ -263,7 +264,9 @@ impl DecodeGraphRunner {
             .copy_(&batch.positions.view([rows, 1]));
         copy_field(&graph.metadata.write_loc, &source.write_loc, rows)?;
         copy_field(&graph.metadata.cache_seqlens, &source.cache_seqlens, rows)?;
-        copy_block_table(graph, source, rows)?;
+        if graph.metadata.block_table.is_some() {
+            copy_block_table(graph, source, rows)?;
+        }
         if graph.metadata.req_to_token.is_some() {
             copy_field(&graph.metadata.req_to_token, &source.req_to_token, rows)?;
         }
@@ -296,14 +299,15 @@ impl DecodeGraphRunner {
                 .unwrap()
                 .narrow(0, start, count)
                 .fill_(1);
-            let table = graph.metadata.block_table.as_ref().unwrap();
-            table.narrow(0, start, count).copy_(
-                &self
-                    .pad_pages
-                    .narrow(0, start, count)
-                    .unsqueeze(1)
-                    .repeat([1, table.size()[1]]),
-            );
+            if let Some(table) = graph.metadata.block_table.as_ref() {
+                table.narrow(0, start, count).copy_(
+                    &self
+                        .pad_pages
+                        .narrow(0, start, count)
+                        .unsqueeze(1)
+                        .repeat([1, table.size()[1]]),
+                );
+            }
             if let Some(tokens) = graph.metadata.req_to_token.as_ref() {
                 tokens.narrow(0, start, count).copy_(
                     &self
@@ -692,6 +696,9 @@ mod tests {
     }
 
     impl ModelExecutor for DecodeModel {
+        fn metadata_requirements(&self, phase: BatchPhase) -> super::super::MetadataRequirements {
+            self.attention.metadata_requirements(phase)
+        }
         fn graph_capabilities(&self) -> super::super::GraphCapabilities {
             super::super::GraphCapabilities {
                 decode: GraphSupport::Supported(GraphLimits {
@@ -791,6 +798,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(graph.graphs.keys().copied().collect::<Vec<_>>(), [1, 2, 4]);
+        assert!(
+            graph
+                .graphs
+                .values()
+                .all(|graph| graph.metadata.req_to_token.is_none())
+        );
         assert_eq!(pool.borrow().free_count(), free);
         let mut retained = None;
         for (iteration, (rows, len)) in [

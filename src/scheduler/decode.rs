@@ -9,7 +9,7 @@ static NEXT_TABLE_VERSION: AtomicU64 = AtomicU64::new(1);
 use crate::engine::metadata_transfer::{MetadataUpload, UploadGuard};
 use crate::engine::{
     AttentionMetadata, Batch, BatchPhase, CompletionFence, DecodeHostMetadata, InputReadFence,
-    ServerArgs,
+    MetadataRequirements, ServerArgs,
 };
 
 use super::future_map::RelayPlan;
@@ -35,8 +35,8 @@ pub struct DecodeManager {
     positions_buf: Tensor,
     write_loc_buf: Tensor,
     cache_seqlens_buf: Tensor,
-    block_table_buf: Tensor,
-    req_to_token_buf: Tensor,
+    block_table_buf: Option<Tensor>,
+    req_to_token_buf: Option<Tensor>,
     row_mappings: Vec<RowMapping>,
     #[cfg(test)]
     mapped_tokens: usize,
@@ -52,6 +52,14 @@ struct RowMapping {
 
 impl DecodeManager {
     pub fn new(args: &ServerArgs, device: Device) -> Result<Self> {
+        Self::with_metadata_requirements(args, device, MetadataRequirements::default())
+    }
+
+    pub(crate) fn with_metadata_requirements(
+        args: &ServerArgs,
+        device: Device,
+        requirements: MetadataRequirements,
+    ) -> Result<Self> {
         if args.max_running_req == 0 || args.max_seq_len == 0 || args.page_size == 0 {
             return Err(SchedulerError::InvalidDecode(
                 "max_running_req, max_seq_len, and page_size must be positive".to_owned(),
@@ -79,14 +87,51 @@ impl DecodeManager {
             positions_buf: Tensor::zeros([rows, 1], (Kind::Int64, device)),
             write_loc_buf: Tensor::full([rows], -1, (Kind::Int, device)),
             cache_seqlens_buf: Tensor::zeros([rows], (Kind::Int, device)),
-            block_table_buf: Tensor::full([rows, blocks], -1, (Kind::Int, device)),
-            req_to_token_buf: Tensor::full([rows, sequence], -1, (Kind::Int, device)),
+            block_table_buf: requirements
+                .block_table
+                .then(|| Tensor::full([rows, blocks], -1, (Kind::Int, device))),
+            req_to_token_buf: requirements
+                .req_to_token
+                .then(|| Tensor::full([rows, sequence], -1, (Kind::Int, device))),
             row_mappings: (0..args.max_running_req)
                 .map(|_| RowMapping::default())
                 .collect(),
             #[cfg(test)]
             mapped_tokens: 0,
         })
+    }
+
+    /// Requirements can change after Engine mutation, once the scheduler has
+    /// drained outstanding work. Invalidate incremental mappings on any change.
+    pub(crate) fn set_metadata_requirements(&mut self, requirements: MetadataRequirements) {
+        if self.block_table_buf.is_some() == requirements.block_table
+            && self.req_to_token_buf.is_some() == requirements.req_to_token
+        {
+            return;
+        }
+        self.block_table_buf = requirements.block_table.then(|| {
+            Tensor::full(
+                [self.max_running_req as i64, self.max_blocks as i64],
+                -1,
+                (Kind::Int, self.device),
+            )
+        });
+        self.req_to_token_buf = requirements.req_to_token.then(|| {
+            Tensor::full(
+                [self.max_running_req as i64, self.max_seq_len as i64],
+                -1,
+                (Kind::Int, self.device),
+            )
+        });
+        self.row_mappings
+            .iter_mut()
+            .for_each(|row| *row = RowMapping::default());
+        // The replacement tensors were initialized on the execution stream.
+        // First pipeline use must establish a new initialization read boundary
+        // before uploading on its separate stream.
+        self.upload = None;
+        self.read_done = None;
+        self.full_done = None;
     }
 
     /// Returned tensors view reusable buffers and must be consumed before the
@@ -222,29 +267,11 @@ impl DecodeManager {
                         .position(|(old, new)| old != new)
                         .unwrap_or(previous.pages.len().min(pages.len()))
                 };
-                let page_values = pages[changed_page..]
-                    .iter()
-                    .map(|&page| to_i32(page, "page ID"))
-                    .collect::<Result<Vec<_>>>()?;
-                let start = if reset {
-                    0
-                } else {
-                    previous.len.min(changed_page * self.page_size).min(len)
-                };
-                let mut locations = Vec::with_capacity(len - start);
-                for position in start..len {
-                    locations.push(self.cache_location(
-                        pages[position / self.page_size],
-                        position % self.page_size,
-                    )?);
-                }
-                if reset {
-                    let _ = self.block_table_buf.get(row as i64).fill_(-1);
-                    let _ = self.req_to_token_buf.get(row as i64).fill_(-1);
-                } else {
-                    if pages.len() < previous.pages.len() {
-                        let _ = self
-                            .block_table_buf
+                if let Some(table) = &self.block_table_buf {
+                    if reset {
+                        let _ = table.get(row as i64).fill_(-1);
+                    } else if pages.len() < previous.pages.len() {
+                        let _ = table
                             .get(row as i64)
                             .narrow(
                                 0,
@@ -253,39 +280,59 @@ impl DecodeManager {
                             )
                             .fill_(-1);
                     }
-                    if len < previous.len {
-                        let _ = self
-                            .req_to_token_buf
+                    let page_values = pages[changed_page..]
+                        .iter()
+                        .map(|&page| to_i32(page, "page ID"))
+                        .collect::<Result<Vec<_>>>()?;
+                    if !page_values.is_empty() {
+                        copy_host(
+                            &mut table.get(row as i64).narrow(
+                                0,
+                                changed_page as i64,
+                                page_values.len() as i64,
+                            ),
+                            &Tensor::from_slice(&page_values),
+                            upload.as_ref(),
+                        )?;
+                    }
+                }
+                if let Some(table) = &self.req_to_token_buf {
+                    let start = if reset {
+                        0
+                    } else {
+                        previous.len.min(changed_page * self.page_size).min(len)
+                    };
+                    let locations = (start..len)
+                        .map(|position| {
+                            self.cache_location(
+                                pages[position / self.page_size],
+                                position % self.page_size,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if reset {
+                        let _ = table.get(row as i64).fill_(-1);
+                    } else if len < previous.len {
+                        let _ = table
                             .get(row as i64)
                             .narrow(0, len as i64, (previous.len - len) as i64)
                             .fill_(-1);
                     }
-                }
-                if !page_values.is_empty() {
-                    copy_host(
-                        &mut self.block_table_buf.get(row as i64).narrow(
-                            0,
-                            changed_page as i64,
-                            page_values.len() as i64,
-                        ),
-                        &Tensor::from_slice(&page_values),
-                        upload.as_ref(),
-                    )?;
-                }
-                if !locations.is_empty() {
-                    copy_host(
-                        &mut self.req_to_token_buf.get(row as i64).narrow(
-                            0,
-                            start as i64,
-                            locations.len() as i64,
-                        ),
-                        &Tensor::from_slice(&locations),
-                        upload.as_ref(),
-                    )?;
-                }
-                #[cfg(test)]
-                {
-                    self.mapped_tokens += locations.len();
+                    if !locations.is_empty() {
+                        copy_host(
+                            &mut table.get(row as i64).narrow(
+                                0,
+                                start as i64,
+                                locations.len() as i64,
+                            ),
+                            &Tensor::from_slice(&locations),
+                            upload.as_ref(),
+                        )?;
+                    }
+                    #[cfg(test)]
+                    {
+                        self.mapped_tokens += locations.len();
+                    }
                 }
                 let previous = &mut self.row_mappings[row];
                 if reset || previous.pages != pages {
@@ -347,8 +394,14 @@ impl DecodeManager {
                 write_loc: Some(self.write_loc_buf.narrow(0, 0, rows_i64)),
                 cu_seqlens_q: None,
                 prefix_lens: None,
-                block_table: Some(self.block_table_buf.narrow(0, 0, rows_i64)),
-                req_to_token: Some(self.req_to_token_buf.narrow(0, 0, rows_i64)),
+                block_table: self
+                    .block_table_buf
+                    .as_ref()
+                    .map(|table| table.narrow(0, 0, rows_i64)),
+                req_to_token: self
+                    .req_to_token_buf
+                    .as_ref()
+                    .map(|table| table.narrow(0, 0, rows_i64)),
                 cache_seqlens: Some(self.cache_seqlens_buf.narrow(0, 0, rows_i64)),
                 decode_host: Some(DecodeHostMetadata {
                     cache_seqlens,
@@ -471,6 +524,105 @@ mod tests {
     }
 
     #[test]
+    fn table_requirements_preserve_incremental_mappings_and_rebuild_on_change() {
+        exercise_table_requirements(Device::Cpu);
+    }
+
+    #[cfg(has_cuda_graph)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_table_requirements_preserve_upload_order_on_change() {
+        assert!(tch::Cuda::is_available());
+        exercise_table_requirements(Device::Cuda(0));
+    }
+
+    fn exercise_table_requirements(device: Device) {
+        let mut args = ServerArgs::new("unused");
+        args.max_running_req = 2;
+        args.max_seq_len = 6;
+        args.page_size = 2;
+        let mut manager = DecodeManager::new(&args, device).unwrap();
+        let mut request = running(1, vec![1, 2], vec![5, 6, 7]);
+        for requirements in [
+            MetadataRequirements {
+                block_table: true,
+                req_to_token: false,
+            },
+            MetadataRequirements {
+                block_table: false,
+                req_to_token: true,
+            },
+            MetadataRequirements::default(),
+        ] {
+            manager.set_metadata_requirements(requirements);
+            let mapped_before = manager.mapped_tokens;
+            let mut last_version = None;
+            // The same UID/pages must be fully written after a layout switch;
+            // growth only maps new tokens, while a changed page invalidates them.
+            for change in 0..3 {
+                if change == 1 {
+                    request.input_ids.push(3);
+                } else if change == 2 {
+                    request.cache_handle.as_mut().unwrap().page_ids[0] += 1;
+                }
+                let batch = manager
+                    .schedule_pipeline(std::slice::from_ref(&request))
+                    .unwrap()
+                    .unwrap();
+                let metadata = batch.model_batch.attention_metadata.as_ref().unwrap();
+                assert_eq!(metadata.block_table.is_some(), requirements.block_table);
+                assert_eq!(metadata.req_to_token.is_some(), requirements.req_to_token);
+                crate::engine::ForwardBatch::from_scheduler(&batch.model_batch)
+                    .unwrap()
+                    .validate(device)
+                    .unwrap();
+                let pages = &request.cache_handle.as_ref().unwrap().page_ids;
+                if let Some(table) = &metadata.block_table {
+                    assert_eq!(
+                        Vec::<i32>::try_from(&table.to_device(Device::Cpu).view([-1])).unwrap(),
+                        pages.iter().map(|&page| page as i32).collect::<Vec<_>>()
+                    );
+                }
+                if let Some(table) = &metadata.req_to_token {
+                    let expected = (0..6)
+                        .map(|position| {
+                            if position < request.input_ids.len() {
+                                (pages[position / 2] * 2 + position % 2) as i32
+                            } else {
+                                -1
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        Vec::<i32>::try_from(&table.to_device(Device::Cpu).view([-1])).unwrap(),
+                        expected
+                    );
+                }
+                let version = metadata
+                    .decode_host
+                    .as_ref()
+                    .unwrap()
+                    .block_table_versions
+                    .as_ref()
+                    .unwrap()[0];
+                if let Some(previous) = last_version {
+                    if change == 1 {
+                        assert_eq!(version, previous);
+                    } else {
+                        assert_ne!(version, previous);
+                    }
+                }
+                last_version = Some(version);
+            }
+            if !requirements.req_to_token {
+                assert_eq!(manager.mapped_tokens, mapped_before);
+                assert!(manager.req_to_token_buf.is_none());
+            }
+            request.input_ids.truncate(2);
+        }
+    }
+
+    #[test]
     fn empty_and_finished_requests_produce_no_batch() {
         let mut manager = manager();
         assert!(manager.schedule_decode(&[]).unwrap().is_none());
@@ -547,7 +699,7 @@ mod tests {
         assert_eq!(manager.mapped_tokens, 8);
         assert_ne!(manager.row_mappings[0].table_version, initial_version);
         assert_eq!(
-            Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
+            Vec::<i32>::try_from(&manager.req_to_token_buf.as_ref().unwrap().get(0)).unwrap(),
             vec![18, 19, 12, 13, -1, -1]
         );
         request.input_ids.truncate(1);
@@ -558,11 +710,11 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
+            Vec::<i32>::try_from(&manager.req_to_token_buf.as_ref().unwrap().get(0)).unwrap(),
             vec![18, -1, -1, -1, -1, -1]
         );
         assert_eq!(
-            Vec::<i32>::try_from(&manager.block_table_buf.get(0)).unwrap(),
+            Vec::<i32>::try_from(&manager.block_table_buf.as_ref().unwrap().get(0)).unwrap(),
             vec![9, -1, -1]
         );
     }
@@ -576,17 +728,17 @@ mod tests {
         b = running(2, vec![3, 4, 5], vec![6, 7]);
         drop(manager.schedule_decode(std::slice::from_ref(&b)).unwrap());
         assert_eq!(
-            Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
+            Vec::<i32>::try_from(&manager.req_to_token_buf.as_ref().unwrap().get(0)).unwrap(),
             vec![12, 13, 14, -1, -1, -1]
         );
         let c = running(3, vec![9], vec![6]);
         drop(manager.schedule_decode(&[c, b]).unwrap());
         assert_eq!(
-            Vec::<i32>::try_from(&manager.req_to_token_buf.get(0)).unwrap(),
+            Vec::<i32>::try_from(&manager.req_to_token_buf.as_ref().unwrap().get(0)).unwrap(),
             vec![12, -1, -1, -1, -1, -1]
         );
         assert_eq!(
-            Vec::<i32>::try_from(&manager.req_to_token_buf.get(1)).unwrap(),
+            Vec::<i32>::try_from(&manager.req_to_token_buf.as_ref().unwrap().get(1)).unwrap(),
             vec![12, 13, 14, -1, -1, -1]
         );
     }
