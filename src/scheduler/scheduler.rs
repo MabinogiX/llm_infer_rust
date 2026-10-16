@@ -292,7 +292,7 @@ impl Scheduler {
                 .collect::<Vec<_>>()
         });
         let logits = profiler.measure(StepStage::Forward, || self.engine.forward(&model_batch));
-        if chunk.is_some_and(|chunk| !chunk.is_last) {
+        if chunk.is_some_and(|chunk| !chunk.is_last) && request_ids.len() == 1 {
             let forward_ok = logits.is_ok();
             match logits {
                 Ok(_) => {
@@ -334,7 +334,31 @@ impl Scheduler {
             self.synchronize();
         }
         profiler.measure(StepStage::Publish, || {
-            self.complete(request_ids, None, phase, sampled, results);
+            if let Some(chunk) = chunk.filter(|chunk| !chunk.is_last) {
+                match sampled {
+                    Ok(tokens) => {
+                        // Full short rows still publish their first token when
+                        // the same forward ends in an unfinished long row.
+                        let inputs = request_ids
+                            .iter()
+                            .map(|&uid| self.completion_input(uid))
+                            .collect();
+                        self.complete_mixed_chunk_rows(
+                            request_ids,
+                            inputs,
+                            tokens,
+                            phase,
+                            chunk,
+                            results,
+                        );
+                    }
+                    Err(error) => {
+                        self.complete(request_ids, None, phase, Err(error), results);
+                    }
+                }
+            } else {
+                self.complete(request_ids, None, phase, sampled, results);
+            }
         });
         profiler.log(phase, profile_requests.as_deref().unwrap_or(&[]), success);
         Ok(())
@@ -1657,6 +1681,89 @@ mod tests {
             vec![6, 7]
         );
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chunked_prefill_completes_short_rows_beside_an_unfinished_chunk() {
+        exercise_chunked_prefill_admission(Device::Cpu);
+    }
+
+    #[cfg(has_cuda_graph)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_chunked_prefill_completes_short_rows_beside_an_unfinished_chunk() {
+        assert!(tch::Cuda::is_available());
+        exercise_chunked_prefill_admission(Device::Cuda(0));
+    }
+
+    fn exercise_chunked_prefill_admission(device: Device) {
+        for overlap in [false, true] {
+            let (mut scheduler, path) =
+                scheduler_with_execution(CacheStrategy::Radix, 3, 16, device, false);
+            scheduler.prefill.set_chunked_prefill_size(4);
+            scheduler
+                .engine_mut()
+                .attach_model_runner(ModelRunner::new(
+                    Box::new(RelayTokenModel::default()),
+                    device,
+                ))
+                .unwrap();
+            for prompt in [vec![0, 1, 2], vec![3, 4, 5, 6, 7, 8, 9], vec![10]] {
+                scheduler
+                    .add_request(
+                        prompt,
+                        SamplingParams {
+                            max_tokens: 2,
+                            ignore_eos: true,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            let mut outputs = if overlap {
+                scheduler.step_overlap().unwrap()
+            } else {
+                scheduler.step_serial().unwrap()
+            };
+            assert_eq!(outputs.len(), 1);
+            assert_eq!((outputs[0].uid, outputs[0].token_id), (0, 3));
+            assert_eq!(
+                scheduler
+                    .requests
+                    .running_request(1)
+                    .unwrap()
+                    .prefill_cursor,
+                1
+            );
+            for _ in 0..16 {
+                if scheduler.is_idle() {
+                    break;
+                }
+                outputs.extend(if overlap {
+                    scheduler.step_overlap().unwrap()
+                } else {
+                    scheduler.step_serial().unwrap()
+                });
+                assert!(scheduler.last_step_error().is_none());
+            }
+            assert!(scheduler.is_idle());
+            for (uid, expected) in [(0, vec![3, 4]), (1, vec![1, 2]), (2, vec![2, 3])] {
+                let row = outputs
+                    .iter()
+                    .filter(|output| output.uid == uid)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    row.iter().map(|output| output.token_id).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(row.iter().filter(|output| output.finished).count(), 1);
+                assert_eq!(
+                    row.last().unwrap().finish_reason,
+                    Some(FinishReason::Length)
+                );
+            }
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[test]

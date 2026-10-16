@@ -156,6 +156,12 @@ impl PrefillManager {
         mut total_tokens: usize,
         allow_chunk: bool,
     ) -> Result<Option<PrefillSelection>> {
+        // Chunk size is an aggregate prefill-token budget, not a limit on
+        // request count. Cached prefixes do not consume either token budget.
+        let token_limit = [self.max_prefill_tokens_per_batch, self.chunked_prefill_size]
+            .into_iter()
+            .filter(|limit| *limit > 0)
+            .min();
         while requests.running_len() < self.max_running_req {
             let Some(request) = requests.pending_front() else {
                 break;
@@ -166,21 +172,26 @@ impl PrefillManager {
                 continue;
             }
 
+            let remaining = token_limit.map(|limit| limit.saturating_sub(total_tokens));
+            if remaining == Some(0) {
+                break;
+            }
+
             let capacity_tokens = request
                 .input_ids
                 .len()
                 .saturating_add(request.sampling_params.max_tokens.saturating_sub(1))
                 .min(self.max_seq_len);
             let prompt_len = request.input_ids.len();
-            let budget = if (selected.is_empty() && total_tokens == 0)
-                || self.max_prefill_tokens_per_batch == 0
+            // A new chunk may use just the remaining budget. When finishing
+            // an existing chunk, only admit whole requests: selection tracks
+            // at most one chunk's completion boundary.
+            let budget = if (allow_chunk && self.chunked_prefill_size > 0)
+                || (selected.is_empty() && total_tokens == 0)
             {
                 None
             } else {
-                Some(
-                    self.max_prefill_tokens_per_batch
-                        .saturating_sub(total_tokens),
-                )
+                remaining
             };
             let handle = match requests.acquire_pending(capacity_tokens, budget)? {
                 AcquireOutcome::Ready(handle) => handle,
@@ -203,12 +214,7 @@ impl PrefillManager {
             request.cache_handle = Some(handle);
             request.status = SequenceStatus::Running;
             let chunk_len = if allow_chunk && self.chunked_prefill_size > 0 {
-                let budget_limit = if self.max_prefill_tokens_per_batch == 0 {
-                    uncached
-                } else {
-                    self.max_prefill_tokens_per_batch
-                };
-                uncached.min(self.chunked_prefill_size).min(budget_limit)
+                uncached.min(remaining.expect("chunking has a positive token budget"))
             } else {
                 uncached
             };
@@ -225,13 +231,6 @@ impl PrefillManager {
                     request_ids: std::mem::take(selected),
                     token_count: total_tokens,
                     chunk,
-                }));
-            }
-            if allow_chunk && self.chunked_prefill_size > 0 {
-                return Ok(Some(PrefillSelection {
-                    request_ids: std::mem::take(selected),
-                    token_count: total_tokens,
-                    chunk: None,
                 }));
             }
         }
@@ -424,6 +423,93 @@ mod tests {
     }
 
     #[test]
+    fn chunked_prefill_batches_short_requests() {
+        let (_pool, mut manager) = manager(16, 4, 16);
+        manager.prefill.set_chunked_prefill_size(8);
+        manager.prefill.max_prefill_tokens_per_batch = 0;
+        for uid in 0..4 {
+            manager.add_request(request(uid, vec![uid as i64 + 1; 2], 1));
+        }
+        let batch = manager.schedule_prefill().unwrap().unwrap();
+        assert_eq!(batch.request_ids, vec![0, 1, 2, 3]);
+        assert_eq!(batch.model_batch.input_ids.size(), vec![8]);
+        assert!(batch.chunk.is_none());
+        assert_eq!(manager.pending_len(), 0);
+    }
+
+    #[test]
+    fn chunked_prefill_uses_remaining_batch_budget_for_long_request() {
+        let (_pool, mut manager) = manager(16, 4, 16);
+        manager.prefill.set_chunked_prefill_size(8);
+        manager.prefill.max_prefill_tokens_per_batch = 6;
+        manager.add_request(request(0, vec![1, 2], 1));
+        manager.add_request(request(1, vec![3; 9], 1));
+        manager.add_request(request(2, vec![4, 5], 1));
+        let batch = manager.schedule_prefill().unwrap().unwrap();
+        assert_eq!(batch.request_ids, vec![0, 1]);
+        assert_eq!(batch.model_batch.input_ids.size(), vec![6]);
+        let chunk = batch.chunk.unwrap();
+        assert_eq!((chunk.uid, chunk.end, chunk.is_last), (1, 4, false));
+        assert_eq!(manager.pending_ids(), vec![2]);
+    }
+
+    #[test]
+    fn chunked_prefill_budget_counts_uncached_tokens() {
+        let (_pool, mut manager) = manager(16, 3, 16);
+        manager.add_request(request(0, vec![1, 2, 3, 4], 1));
+        manager.schedule_prefill().unwrap().unwrap();
+        manager.publish(0).unwrap();
+        manager.remove_batch(&[0]);
+        manager.prefill.set_chunked_prefill_size(4);
+        manager.add_request(request(1, vec![1, 2, 3, 4, 5, 6], 1));
+        manager.add_request(request(2, vec![7, 8], 1));
+        manager.add_request(request(3, vec![9], 1));
+        let batch = manager.schedule_prefill().unwrap().unwrap();
+        assert_eq!(batch.request_ids, vec![1, 2]);
+        assert_eq!(batch.model_batch.input_ids.size(), vec![4]);
+        assert_eq!(manager.running_request(1).unwrap().cached_len, 4);
+        assert!(batch.chunk.is_none());
+        assert_eq!(manager.pending_ids(), vec![3]);
+    }
+
+    #[test]
+    fn final_chunk_only_admits_short_requests_within_remaining_budget() {
+        let (_pool, mut manager) = manager(24, 4, 16);
+        manager.prefill.set_chunked_prefill_size(4);
+        manager.add_request(request(0, vec![1; 6], 1));
+        let first = manager.schedule_prefill().unwrap().unwrap();
+        assert_eq!(first.chunk.unwrap().end, 4);
+        manager.requests.publish_prefix(0, 4).unwrap();
+        manager.running_request_mut(0).unwrap().prefill_cursor = 4;
+        manager.add_request(request(1, vec![2, 3], 1));
+        manager.add_request(request(2, vec![4], 1));
+        let batch = manager.schedule_prefill().unwrap().unwrap();
+        assert_eq!(batch.request_ids, vec![0, 1]);
+        assert_eq!(batch.model_batch.input_ids.size(), vec![4]);
+        let chunk = batch.chunk.unwrap();
+        assert_eq!((chunk.uid, chunk.end, chunk.is_last), (0, 6, true));
+        assert_eq!(manager.pending_ids(), vec![2]);
+    }
+
+    #[test]
+    fn final_chunk_defers_a_second_unfinished_request() {
+        let (_pool, mut manager) = manager(24, 3, 16);
+        manager.prefill.set_chunked_prefill_size(4);
+        manager.add_request(request(0, vec![1; 5], 1));
+        manager.schedule_prefill().unwrap().unwrap();
+        manager.requests.publish_prefix(0, 4).unwrap();
+        manager.running_request_mut(0).unwrap().prefill_cursor = 4;
+        manager.add_request(request(1, vec![2; 7], 1));
+        manager.add_request(request(2, vec![3], 1));
+        let batch = manager.schedule_prefill().unwrap().unwrap();
+        assert_eq!(batch.request_ids, vec![0]);
+        assert_eq!(batch.model_batch.input_ids.size(), vec![1]);
+        assert!(batch.chunk.unwrap().is_last);
+        assert_eq!(manager.pending_ids(), vec![1, 2]);
+        assert_eq!(manager.running_len(), 1);
+    }
+
+    #[test]
     fn respects_running_limit_and_keeps_fifo_request_pending() {
         let (_pool, mut manager) = manager(6, 1, 4);
         manager.add_request(request(0, vec![1, 2], 1));
@@ -532,6 +618,7 @@ mod tests {
         args.max_running_req = 2;
         args.max_seq_len = 4;
         args.page_size = page_size;
+        args.chunked_prefill_size = 4;
         // The narrower context rejects two selected requests after acquire.
         let context = BatchContext::new(1, 4, page_size, Device::Cpu).unwrap();
         let mut manager = TestManager {

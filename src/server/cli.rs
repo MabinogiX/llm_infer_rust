@@ -19,7 +19,7 @@ Options:\n\
   --max-total-tokens N      Optional KV pool token cap (rounded down to whole pages)\n\
   --max-running-req N       Maximum active requests (default 256)\n\
   --max-prefill-tokens-per-batch N  Maximum uncached prefill tokens per batch (0 disables)\n\
-  --chunked-prefill-size N  Maximum tokens per request chunk (-1/0 disables; omitted auto-selects)\n\
+  --chunked-prefill-size N  Prefill token budget with long-request chunking (-1/0 disables; omitted auto-selects)\n\
   --enable-consecutive-prefill-overlap  Prefer throughput over consecutive-prefill TTFT\n\
   --cuda-graph-bs N         Maximum CUDA decode graph batch (0 disables)\n\
   --prefill-cuda-graph-max-tokens N  Maximum prefill graph tokens (default 2048; 0 disables)\n\
