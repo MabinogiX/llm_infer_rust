@@ -37,7 +37,8 @@ pub struct ServerArgs {
     /// Maximum uncached tokens admitted into one prefill batch; zero means no
     /// independent token limit.
     pub max_prefill_tokens_per_batch: usize,
-    /// Maximum tokens processed for one request in a prefill chunk; zero disables chunking.
+    /// Aggregate uncached prefill-token budget with long-request chunking;
+    /// zero disables chunking and this additional batch limit.
     pub chunked_prefill_size: usize,
     /// Whether chunked_prefill_size was explicitly supplied by the user.
     pub chunked_prefill_size_explicit: bool,

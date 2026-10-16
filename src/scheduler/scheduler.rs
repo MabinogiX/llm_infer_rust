@@ -44,6 +44,14 @@ struct RetiredRequest {
     fence: crate::engine::CompletionFence,
 }
 
+#[derive(Default)]
+struct BatchLogState {
+    batches: u64,
+    prefill_batches: u64,
+    decode_batches: u64,
+    last_decode_batch_size: Option<usize>,
+}
+
 pub struct Scheduler {
     engine: Engine,
     args: ServerArgs,
@@ -58,6 +66,7 @@ pub struct Scheduler {
     outstanding: Option<PendingBatch>,
     retired: VecDeque<RetiredRequest>,
     future_map: FutureMap,
+    batch_log: BatchLogState,
 }
 
 impl Scheduler {
@@ -101,6 +110,7 @@ impl Scheduler {
             outstanding: None,
             retired: VecDeque::new(),
             future_map: FutureMap::new(future_map_rows, future_map_device),
+            batch_log: BatchLogState::default(),
         })
     }
 
@@ -255,6 +265,82 @@ impl Scheduler {
         Ok(results)
     }
 
+    /// Log actual scheduler batches, before graph padding. Tensor sizes and
+    /// request metadata are host-side; logging never reads GPU tensor values.
+    fn log_batch(
+        &mut self,
+        request_ids: &[RequestId],
+        batch: &Batch,
+        mixed_decode_requests: usize,
+        chunk: Option<PrefillChunk>,
+    ) {
+        self.batch_log.batches = self.batch_log.batches.saturating_add(1);
+        let batch_id = self.batch_log.batches;
+        let batch_size = request_ids.len();
+        let running_requests = self.requests.running_len();
+        let queued_requests = self.requests.pending_len();
+        if batch.phase == BatchPhase::Decode {
+            self.batch_log.decode_batches = self.batch_log.decode_batches.saturating_add(1);
+            let decode_batches = self.batch_log.decode_batches;
+            let report = self.batch_log.last_decode_batch_size != Some(batch_size)
+                || decode_batches % 40 == 0;
+            self.batch_log.last_decode_batch_size = Some(batch_size);
+            if report {
+                tracing::info!(
+                    batch_id,
+                    batch_size,
+                    decode_batches,
+                    running_requests,
+                    queued_requests,
+                    "decode batch"
+                );
+            } else {
+                tracing::debug!(
+                    batch_id,
+                    batch_size,
+                    decode_batches,
+                    running_requests,
+                    queued_requests,
+                    "decode batch"
+                );
+            }
+            return;
+        }
+        self.batch_log.prefill_batches = self.batch_log.prefill_batches.saturating_add(1);
+        if !tracing::enabled!(tracing::Level::INFO) {
+            return;
+        }
+        let decode_requests = mixed_decode_requests;
+        let prefill_requests = batch_size - decode_requests;
+        let prefill_tokens = batch.input_ids.numel() - decode_requests;
+        let cached_tokens: usize = request_ids[..prefill_requests]
+            .iter()
+            .filter_map(|&uid| self.requests.running_request(uid))
+            .map(|request| {
+                if chunk.is_some_and(|chunk| chunk.uid == request.uid) {
+                    request.prefill_cursor
+                } else {
+                    request.cached_len
+                }
+            })
+            .sum();
+        tracing::info!(
+            batch_id,
+            batch_size,
+            prefill_batches = self.batch_log.prefill_batches,
+            prefill_requests,
+            decode_requests,
+            prefill_tokens,
+            cached_tokens,
+            running_requests,
+            queued_requests,
+            chunk_request_id = ?chunk.map(|chunk| chunk.uid),
+            chunk_end = ?chunk.map(|chunk| chunk.end),
+            chunk_final = ?chunk.map(|chunk| chunk.is_last),
+            "prefill batch"
+        );
+    }
+
     fn run_phase(
         &mut self,
         request_ids: Vec<RequestId>,
@@ -264,6 +350,7 @@ impl Scheduler {
         chunk: Option<PrefillChunk>,
         results: &mut Vec<OutputToken>,
     ) -> Result<()> {
+        self.log_batch(&request_ids, &model_batch, 0, chunk);
         let mut profiler = StepProfiler::new(self.engine.device(), schedule_us);
         let profile_requests = profiler.enabled().then(|| {
             request_ids
@@ -292,7 +379,7 @@ impl Scheduler {
                 .collect::<Vec<_>>()
         });
         let logits = profiler.measure(StepStage::Forward, || self.engine.forward(&model_batch));
-        if chunk.is_some_and(|chunk| !chunk.is_last) {
+        if chunk.is_some_and(|chunk| !chunk.is_last) && request_ids.len() == 1 {
             let forward_ok = logits.is_ok();
             match logits {
                 Ok(_) => {
@@ -334,7 +421,31 @@ impl Scheduler {
             self.synchronize();
         }
         profiler.measure(StepStage::Publish, || {
-            self.complete(request_ids, None, phase, sampled, results);
+            if let Some(chunk) = chunk.filter(|chunk| !chunk.is_last) {
+                match sampled {
+                    Ok(tokens) => {
+                        // Full short rows still publish their first token when
+                        // the same forward ends in an unfinished long row.
+                        let inputs = request_ids
+                            .iter()
+                            .map(|&uid| self.completion_input(uid))
+                            .collect();
+                        self.complete_mixed_chunk_rows(
+                            request_ids,
+                            inputs,
+                            tokens,
+                            phase,
+                            chunk,
+                            results,
+                        );
+                    }
+                    Err(error) => {
+                        self.complete(request_ids, None, phase, Err(error), results);
+                    }
+                }
+            } else {
+                self.complete(request_ids, None, phase, sampled, results);
+            }
         });
         profiler.log(phase, profile_requests.as_deref().unwrap_or(&[]), success);
         Ok(())
@@ -641,6 +752,12 @@ impl Scheduler {
         future: Option<&RelayPlan>,
         chunk: Option<PrefillChunk>,
     ) -> std::result::Result<PendingBatch, EngineError> {
+        self.log_batch(
+            &request_ids,
+            &model_batch,
+            future.map_or(0, |relay| relay.rows().count()),
+            chunk,
+        );
         let params = request_ids
             .iter()
             .map(|uid| self.requests.running_request(*uid).unwrap().sampling_params)
@@ -1657,6 +1774,89 @@ mod tests {
             vec![6, 7]
         );
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chunked_prefill_completes_short_rows_beside_an_unfinished_chunk() {
+        exercise_chunked_prefill_admission(Device::Cpu);
+    }
+
+    #[cfg(has_cuda_graph)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_chunked_prefill_completes_short_rows_beside_an_unfinished_chunk() {
+        assert!(tch::Cuda::is_available());
+        exercise_chunked_prefill_admission(Device::Cuda(0));
+    }
+
+    fn exercise_chunked_prefill_admission(device: Device) {
+        for overlap in [false, true] {
+            let (mut scheduler, path) =
+                scheduler_with_execution(CacheStrategy::Radix, 3, 16, device, false);
+            scheduler.prefill.set_chunked_prefill_size(4);
+            scheduler
+                .engine_mut()
+                .attach_model_runner(ModelRunner::new(
+                    Box::new(RelayTokenModel::default()),
+                    device,
+                ))
+                .unwrap();
+            for prompt in [vec![0, 1, 2], vec![3, 4, 5, 6, 7, 8, 9], vec![10]] {
+                scheduler
+                    .add_request(
+                        prompt,
+                        SamplingParams {
+                            max_tokens: 2,
+                            ignore_eos: true,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            let mut outputs = if overlap {
+                scheduler.step_overlap().unwrap()
+            } else {
+                scheduler.step_serial().unwrap()
+            };
+            assert_eq!(outputs.len(), 1);
+            assert_eq!((outputs[0].uid, outputs[0].token_id), (0, 3));
+            assert_eq!(
+                scheduler
+                    .requests
+                    .running_request(1)
+                    .unwrap()
+                    .prefill_cursor,
+                1
+            );
+            for _ in 0..16 {
+                if scheduler.is_idle() {
+                    break;
+                }
+                outputs.extend(if overlap {
+                    scheduler.step_overlap().unwrap()
+                } else {
+                    scheduler.step_serial().unwrap()
+                });
+                assert!(scheduler.last_step_error().is_none());
+            }
+            assert!(scheduler.is_idle());
+            for (uid, expected) in [(0, vec![3, 4]), (1, vec![1, 2]), (2, vec![2, 3])] {
+                let row = outputs
+                    .iter()
+                    .filter(|output| output.uid == uid)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    row.iter().map(|output| output.token_id).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(row.iter().filter(|output| output.finished).count(), 1);
+                assert_eq!(
+                    row.last().unwrap().finish_reason,
+                    Some(FinishReason::Length)
+                );
+            }
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[test]
