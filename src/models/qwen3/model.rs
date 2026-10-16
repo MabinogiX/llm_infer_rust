@@ -266,6 +266,9 @@ impl Qwen3ForCausalLM {
 }
 
 impl ModelExecutor for Qwen3ForCausalLM {
+    fn metadata_requirements(&self, phase: BatchPhase) -> crate::engine::MetadataRequirements {
+        self.attention.metadata_requirements(phase)
+    }
     fn graph_capabilities(&self) -> crate::engine::GraphCapabilities {
         use crate::engine::{GraphCapabilities, GraphLimits, GraphPadding, GraphSupport};
         let reason = if !matches!(self.device, Device::Cuda(_)) {
@@ -725,144 +728,176 @@ mod tests {
 
     #[test]
     fn paged_decode_and_cached_prefix_prefill_match_full_forward() {
-        let mut model = Qwen3ForCausalLM::new(config(), Kind::Float, Device::Cpu).unwrap();
-        // Zero-initialized parameters only checked shapes and could not detect
-        // missing KV writes. Use nonuniform deterministic weights and compare
-        // each cached step to the full causal forward.
-        for weight in [&mut model.embed_tokens, &mut model.lm_head] {
-            weight.copy_(
-                &(Tensor::arange(weight.numel() as i64, (Kind::Float, Device::Cpu))
-                    .sin()
-                    .view(weight.size().as_slice())
-                    * 0.1),
-            );
-        }
-        let _ = model.norm.fill_(1.0);
-        for layer in &mut model.layers {
-            for weight in [
-                &mut layer.input_layernorm,
-                &mut layer.q_norm,
-                &mut layer.k_norm,
-                &mut layer.post_attention_layernorm,
-            ] {
-                let _ = weight.fill_(1.0);
-            }
-            for weight in [
-                &mut layer.qkv_proj.weight,
-                &mut layer.o_proj,
-                &mut layer.mlp.gate_up_proj,
-                &mut layer.mlp.down_proj,
-            ] {
-                weight.copy_(
-                    &(Tensor::arange(weight.numel() as i64, (Kind::Float, Device::Cpu))
-                        .cos()
-                        .view(weight.size().as_slice())
-                        * 0.2),
-                );
-            }
-        }
-        let full = model
-            .forward_impl(
-                &Tensor::from_slice(&[1i64, 2, 3, 4]),
-                &Tensor::from_slice(&[0i64, 1, 2, 3]),
-                None,
-                None,
+        use crate::engine::kvcache::BaseCacheHandle;
+        use crate::engine::{
+            Batch, BatchContext, BatchRequest, ForwardBatch, MixedDecodeRequest, SamplingParams,
+            ServerArgs,
+        };
+        use crate::scheduler::{DecodeManager, Request, SequenceStatus};
+
+        for backend in ["pt", "fa"] {
+            let mut model = Qwen3ForCausalLM::new_with_attention_backend(
+                config(),
+                Kind::Float,
+                Device::Cpu,
+                backend,
             )
             .unwrap();
-        assert!(full.abs().max().double_value(&[]) > 0.01);
-        let check = |actual: Tensor, start, rows| {
-            assert_eq!(actual.size(), vec![rows, 8]);
-            let error = (actual - full.narrow(0, start, rows))
-                .abs()
-                .max()
-                .double_value(&[]);
-            assert!(error < 1e-5, "start={start}, error={error}");
-        };
-        let k_cache = Tensor::zeros([1, 2, 2, 1, 2], (Kind::Float, Device::Cpu));
-        let v_cache = Tensor::zeros([1, 2, 2, 1, 2], (Kind::Float, Device::Cpu));
-        model
-            .bind_state_cache(crate::engine::kvcache::ModelKvCache {
-                page_size: k_cache.size()[2] as usize,
-                layers: (0..k_cache.size()[0])
-                    .map(|i| crate::engine::kvcache::LayerKvCache {
-                        k: k_cache.get(i),
-                        v: v_cache.get(i),
-                    })
-                    .collect(),
-            })
+            // Zero-initialized parameters only checked shapes and could not detect
+            // missing KV writes. Use nonuniform deterministic weights and compare
+            // each cached step to the full causal forward.
+            for weight in [&mut model.embed_tokens, &mut model.lm_head] {
+                weight.copy_(
+                    &(Tensor::arange(weight.numel() as i64, (Kind::Float, Device::Cpu))
+                        .sin()
+                        .view(weight.size().as_slice())
+                        * 0.1),
+                );
+            }
+            let _ = model.norm.fill_(1.0);
+            for layer in &mut model.layers {
+                for weight in [
+                    &mut layer.input_layernorm,
+                    &mut layer.q_norm,
+                    &mut layer.k_norm,
+                    &mut layer.post_attention_layernorm,
+                ] {
+                    let _ = weight.fill_(1.0);
+                }
+                for weight in [
+                    &mut layer.qkv_proj.weight,
+                    &mut layer.o_proj,
+                    &mut layer.mlp.gate_up_proj,
+                    &mut layer.mlp.down_proj,
+                ] {
+                    weight.copy_(
+                        &(Tensor::arange(weight.numel() as i64, (Kind::Float, Device::Cpu))
+                            .cos()
+                            .view(weight.size().as_slice())
+                            * 0.2),
+                    );
+                }
+            }
+            let full = model
+                .forward_impl(
+                    &Tensor::from_slice(&[1i64, 2, 3, 4]),
+                    &Tensor::from_slice(&[0i64, 1, 2, 3]),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(full.abs().max().double_value(&[]) > 0.01);
+            let check = |actual: Tensor, start, rows| {
+                assert_eq!(actual.size(), vec![rows, 8]);
+                let error = (actual - full.narrow(0, start, rows))
+                    .abs()
+                    .max()
+                    .double_value(&[]);
+                assert!(error < 1e-5, "start={start}, error={error}");
+            };
+            let k_cache = Tensor::zeros([1, 4, 2, 1, 2], (Kind::Float, Device::Cpu));
+            let v_cache = Tensor::zeros([1, 4, 2, 1, 2], (Kind::Float, Device::Cpu));
+            model
+                .bind_state_cache(crate::engine::kvcache::ModelKvCache {
+                    page_size: k_cache.size()[2] as usize,
+                    layers: (0..k_cache.size()[0])
+                        .map(|i| crate::engine::kvcache::LayerKvCache {
+                            k: k_cache.get(i),
+                            v: v_cache.get(i),
+                        })
+                        .collect(),
+                })
+                .unwrap();
+
+            let context = BatchContext::new(2, 4, 2, Device::Cpu)
+                .unwrap()
+                .with_metadata_requirements(model.metadata_requirements(BatchPhase::Prefill));
+            let run = |batch: &Batch| {
+                let metadata = batch.attention_metadata.as_ref().unwrap();
+                // These real backends need only token tables, even on eager fallback.
+                assert!(metadata.block_table.is_none(), "backend={backend}");
+                assert!(metadata.req_to_token.is_some(), "backend={backend}");
+                let forward = ForwardBatch::from_scheduler(batch).unwrap();
+                forward.validate(Device::Cpu).unwrap();
+                model.forward(&forward).unwrap().logits
+            };
+            let prefill = |cached_len, end_len| {
+                context
+                    .prepare_prefill(&[BatchRequest {
+                        input_ids: vec![1, 2, 3, 4],
+                        cached_len,
+                        end_len: Some(end_len),
+                        page_ids: vec![0, 1],
+                    }])
+                    .unwrap()
+            };
+
+            check(run(&prefill(0, 2)), 1, 1);
+            let mut args = ServerArgs::new("unused-model-path");
+            args.max_running_req = 2;
+            args.max_seq_len = 4;
+            args.page_size = 2;
+            let mut decode = DecodeManager::with_metadata_requirements(
+                &args,
+                Device::Cpu,
+                model.metadata_requirements(BatchPhase::Decode),
+            )
             .unwrap();
+            let request = Request {
+                uid: 0,
+                input_ids: vec![1, 2, 3],
+                sampling_params: SamplingParams::default(),
+                cached_len: 0,
+                prefill_cursor: 2,
+                output_len: 1,
+                cache_handle: Some(BaseCacheHandle {
+                    page_ids: vec![0, 1],
+                    ..Default::default()
+                }),
+                status: SequenceStatus::Running,
+            };
+            let batch = decode.schedule_decode(&[request]).unwrap().unwrap();
+            check(run(&batch.model_batch), 2, 1);
+            check(run(&prefill(3, 4)), 3, 1);
 
-        let first_prefill = AttentionMetadata {
-            forward_mode: BatchPhase::Prefill,
-            decode_host: None,
-            write_loc: Some(Tensor::from_slice(&[0i32, 1])),
-            cu_seqlens_q: Some(Tensor::from_slice(&[0i32, 2])),
-            prefix_lens: Some(Tensor::from_slice(&[0i32])),
-            block_table: None,
-            req_to_token: Some(Tensor::from_slice(&[0i32, 1, 2, 3]).view([1, 4])),
-            cache_seqlens: None,
-            max_seqlen: Some(2),
-        };
-        check(
-            model
-                .forward_impl(
-                    &Tensor::from_slice(&[1i64, 2]),
-                    &Tensor::from_slice(&[0i64, 1]),
-                    Some(&first_prefill),
-                    None,
-                )
-                .unwrap(),
-            0,
-            2,
-        );
+            // Rebuild the same sequence as three chunks, then as one cold prefill.
+            // Each prefix is written by the preceding invocation, not a fixture.
+            let _ = k_cache.shallow_clone().zero_();
+            let _ = v_cache.shallow_clone().zero_();
+            check(run(&prefill(0, 1)), 0, 1);
+            check(run(&prefill(1, 3)), 2, 1);
+            check(run(&prefill(3, 4)), 3, 1);
+            let _ = k_cache.shallow_clone().zero_();
+            let _ = v_cache.shallow_clone().zero_();
+            check(run(&prefill(0, 4)), 3, 1);
 
-        let decode = AttentionMetadata {
-            forward_mode: BatchPhase::Decode,
-            decode_host: None,
-            write_loc: Some(Tensor::from_slice(&[2i32])),
-            cu_seqlens_q: None,
-            prefix_lens: None,
-            block_table: None,
-            req_to_token: Some(Tensor::from_slice(&[0i32, 1, 2, 3]).view([1, 4])),
-            cache_seqlens: Some(Tensor::from_slice(&[3i32])),
-            max_seqlen: Some(3),
-        };
-        check(
-            model
-                .forward_impl(
-                    &Tensor::from_slice(&[3i64]),
-                    &Tensor::from_slice(&[2i64]),
-                    Some(&decode),
-                    None,
+            // Seed a separate request, then mix a middle chunk with its decode.
+            let second = context
+                .prepare_prefill(&[BatchRequest {
+                    input_ids: vec![1, 2, 3],
+                    cached_len: 0,
+                    end_len: None,
+                    page_ids: vec![2, 3],
+                }])
+                .unwrap();
+            check(run(&second), 2, 1);
+            let mixed = context
+                .prepare_mixed_prefill(
+                    &[BatchRequest {
+                        input_ids: vec![1, 2, 3, 4],
+                        cached_len: 1,
+                        end_len: Some(3),
+                        page_ids: vec![0, 1],
+                    }],
+                    &[MixedDecodeRequest {
+                        input_id: 4,
+                        position: 3,
+                        page_ids: vec![2, 3],
+                    }],
                 )
-                .unwrap(),
-            2,
-            1,
-        );
-
-        let cached_prefill = AttentionMetadata {
-            forward_mode: BatchPhase::Prefill,
-            decode_host: None,
-            write_loc: Some(Tensor::from_slice(&[3i32])),
-            cu_seqlens_q: Some(Tensor::from_slice(&[0i32, 1])),
-            prefix_lens: Some(Tensor::from_slice(&[3i32])),
-            block_table: None,
-            req_to_token: Some(Tensor::from_slice(&[0i32, 1, 2, 3]).view([1, 4])),
-            cache_seqlens: None,
-            max_seqlen: Some(4),
-        };
-        check(
-            model
-                .forward_impl(
-                    &Tensor::from_slice(&[4i64]),
-                    &Tensor::from_slice(&[3i64]),
-                    Some(&cached_prefill),
-                    None,
-                )
-                .unwrap(),
-            3,
-            1,
-        );
+                .unwrap();
+            check(run(&mixed), 2, 2);
+        }
     }
 
     #[test]

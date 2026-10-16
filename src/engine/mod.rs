@@ -10,6 +10,7 @@ mod model_runner;
 mod sampling;
 pub(crate) mod segmented_graph;
 
+pub(crate) use batch_context::BatchRequestRef;
 pub use batch_context::{BatchContext, BatchContextError, BatchRequest, MixedDecodeRequest};
 pub use engine::{
     Engine, EngineError, Result, RuntimeModelConfig, ServerArgs, validate_max_seq_len,
@@ -18,8 +19,8 @@ pub use engine::{
 pub(crate) use metadata_transfer::InputReadFence;
 pub use model_loader::{ModelFactory, ModelLoadError, ModelWeights, load_hf_safetensors};
 pub use model_runner::{
-    AttentionMetadata, Batch, BatchPhase, DecodeGraphState, DecodeHostMetadata, ModelExecutor,
-    ModelRunner, ModelRunnerError,
+    AttentionMetadata, Batch, BatchPhase, DecodeGraphState, DecodeHostMetadata,
+    MetadataRequirements, ModelExecutor, ModelRunner, ModelRunnerError,
 };
 pub(crate) use sampling::{CompletionFence, PendingSample};
 pub use sampling::{Sampler, SamplingError, SamplingParams};

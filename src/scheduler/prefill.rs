@@ -1,7 +1,7 @@
 //! Pending queue, KV allocation, and prefill batch selection.
 
 use crate::engine::kvcache::AcquireOutcome;
-use crate::engine::{Batch, BatchContext, BatchRequest, MixedDecodeRequest, ServerArgs};
+use crate::engine::{Batch, BatchContext, BatchRequestRef, MixedDecodeRequest, ServerArgs};
 
 use super::{RequestId, Result, SequenceStatus, request_manager::RequestManager};
 
@@ -41,6 +41,13 @@ impl PrefillManager {
             max_prefill_tokens_per_batch: args.max_prefill_tokens_per_batch,
             chunked_prefill_size: args.chunked_prefill_size,
         }
+    }
+
+    pub(crate) fn set_metadata_requirements(
+        &mut self,
+        requirements: crate::engine::MetadataRequirements,
+    ) {
+        self.batch_context = self.batch_context.with_metadata_requirements(requirements);
     }
 
     #[cfg(test)]
@@ -135,7 +142,7 @@ impl PrefillManager {
                     .batch_request(uid)
                     .expect("scheduled prefill request is running");
                 let chunk = chunk.filter(|chunk| chunk.uid == uid);
-                BatchRequest {
+                BatchRequestRef {
                     cached_len: chunk.map_or(request.cached_len, |_| {
                         requests.running_request(uid).unwrap().prefill_cursor
                     }),
@@ -146,7 +153,7 @@ impl PrefillManager {
             .collect::<Vec<_>>();
         Ok(self
             .batch_context
-            .prepare_mixed_prefill(&prefills, decode_rows)?)
+            .prepare_mixed_prefill_borrowed(&prefills, decode_rows)?)
     }
 
     fn select_requests(
@@ -293,20 +300,21 @@ impl PrefillManager {
                     .running_request(*uid)
                     .expect("selected request is running");
                 let chunk = selection.chunk.filter(|chunk| chunk.uid == *uid);
-                BatchRequest {
-                    input_ids: request.input_ids.clone(),
+                BatchRequestRef {
+                    input_ids: &request.input_ids,
                     cached_len: chunk.map_or(request.cached_len, |_| request.prefill_cursor),
                     end_len: chunk.map(|chunk| chunk.end),
-                    page_ids: request
+                    page_ids: &request
                         .cache_handle
                         .as_ref()
                         .expect("selected request has a handle")
-                        .page_ids
-                        .clone(),
+                        .page_ids,
                 }
             })
             .collect::<Vec<_>>();
-        let model_batch = self.batch_context.prepare_prefill(&batch_requests)?;
+        let model_batch = self
+            .batch_context
+            .prepare_mixed_prefill_borrowed(&batch_requests, &[])?;
         for uid in selection.request_ids.iter().copied() {
             let request = requests
                 .running_request(uid)

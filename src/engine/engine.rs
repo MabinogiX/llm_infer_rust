@@ -384,6 +384,17 @@ impl Engine {
             .ok_or(EngineError::ModelRunnerNotAttached)
     }
 
+    pub(crate) fn metadata_requirements(
+        &self,
+        phase: super::BatchPhase,
+    ) -> super::MetadataRequirements {
+        self.model_runner
+            .as_ref()
+            .map_or_else(super::MetadataRequirements::default, |runner| {
+                runner.metadata_requirements(phase)
+            })
+    }
+
     /// Creates the selected Rust model and binds it to this Engine.
     pub fn build_model(&mut self, factory: &dyn ModelFactory) -> Result<()> {
         self.ensure_live()?;

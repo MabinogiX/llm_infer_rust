@@ -8,7 +8,9 @@ use std::{
 };
 use tch::{Device, Kind, Tensor};
 
-use crate::engine::{AttentionMetadata, BatchPhase, DecodeGraphState, ModelRunnerError};
+use crate::engine::{
+    AttentionMetadata, BatchPhase, DecodeGraphState, MetadataRequirements, ModelRunnerError,
+};
 
 use super::BaseAttention;
 
@@ -143,6 +145,10 @@ impl Attention {
         self.backend.supports_cuda_graph()
     }
 
+    pub fn metadata_requirements(&self, phase: BatchPhase) -> MetadataRequirements {
+        self.backend.metadata_requirements(phase)
+    }
+
     pub fn prepare_decode_graph(
         &self,
         metadata: &AttentionMetadata,
@@ -254,6 +260,12 @@ enum BackendPlan {
 
 /// Internal seam for the three existing attention implementations.
 trait AttentionBackend {
+    fn metadata_requirements(&self, _phase: BatchPhase) -> MetadataRequirements {
+        MetadataRequirements {
+            block_table: false,
+            req_to_token: true,
+        }
+    }
     fn supports_cuda_graph(&self) -> bool {
         false
     }
@@ -312,6 +324,12 @@ struct FlashInferAttentionBackend {
 }
 
 impl AttentionBackend for FlashInferAttentionBackend {
+    fn metadata_requirements(&self, _phase: BatchPhase) -> MetadataRequirements {
+        MetadataRequirements {
+            block_table: true,
+            req_to_token: false,
+        }
+    }
     fn supports_cuda_graph(&self) -> bool {
         cfg!(has_flashinfer)
     }
