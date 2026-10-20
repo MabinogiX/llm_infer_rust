@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use crate::engine::BatchRequestRef;
 use crate::engine::kvcache::{AcquireOutcome, CacheManager};
 
-use super::{Request, RequestId, Result, SequenceStatus};
+use super::{Request, RequestId, Result};
 
 pub(crate) struct RequestManager {
     pending: VecDeque<Request>,
@@ -208,9 +208,7 @@ impl RequestManager {
 
     pub(crate) fn restore_waiting(&mut self, mut request: Request) {
         self.release_handle(&mut request);
-        request.cached_len = 0;
-        request.prefill_cursor = 0;
-        request.status = SequenceStatus::Waiting;
+        request.restore_waiting();
         self.push_pending_front(request);
     }
 }

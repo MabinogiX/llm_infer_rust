@@ -130,7 +130,7 @@ impl FutureMap {
             .zip(inputs.iter().copied())
             .collect::<HashMap<_, _>>();
         let mut rows = Vec::with_capacity(running.len());
-        for request in running.iter().filter(|request| !request.is_finished()) {
+        for request in running.iter().filter(|request| request.is_decoding()) {
             let Some(&input) = previous.get(&request.uid) else {
                 continue;
             };
@@ -235,20 +235,18 @@ mod tests {
                 input_ids: vec![1],
                 sampling_params: Default::default(),
                 cached_len: 0,
-                prefill_cursor: 1,
                 output_len: 0,
                 cache_handle: None,
-                status: super::super::SequenceStatus::Running,
+                status: super::super::SequenceStatus::Decoding,
             },
             Request {
                 uid: 7,
                 input_ids: vec![1],
                 sampling_params: Default::default(),
                 cached_len: 0,
-                prefill_cursor: 1,
                 output_len: 0,
                 cache_handle: None,
-                status: super::super::SequenceStatus::Running,
+                status: super::super::SequenceStatus::Decoding,
             },
         ];
         let plan = map.plan(&[7, 9], &inputs, &running).unwrap();
@@ -258,6 +256,39 @@ mod tests {
         assert_eq!(row_7.uid, 7);
         assert_ne!(row_9.slot, row_7.slot);
         assert_eq!(row_9.input.written_len, 6);
+    }
+
+    #[test]
+    fn relay_excludes_prefilling_requests_even_with_a_published_slot() {
+        let mut map = FutureMap::new(1, Device::Cpu);
+        map.publish(&[7], &Tensor::from_slice(&[11_i64])).unwrap();
+        let input = CompletionInput {
+            written_len: 2,
+            length_finished: false,
+            ignore_eos: true,
+        };
+        let mut request = Request {
+            uid: 7,
+            input_ids: vec![1, 2],
+            sampling_params: Default::default(),
+            cached_len: 0,
+            output_len: 0,
+            cache_handle: None,
+            status: super::super::SequenceStatus::Prefilling { cursor: 2 },
+        };
+        assert!(
+            map.plan(&[7], &[input], std::slice::from_ref(&request))
+                .unwrap()
+                .row(7)
+                .is_none()
+        );
+        request.finish_prefill();
+        assert!(
+            map.plan(&[7], &[input], &[request])
+                .unwrap()
+                .row(7)
+                .is_some()
+        );
     }
 
     #[test]
@@ -274,10 +305,9 @@ mod tests {
             input_ids: vec![1],
             sampling_params: Default::default(),
             cached_len: 0,
-            prefill_cursor: 1,
             output_len: 0,
             cache_handle: None,
-            status: super::super::SequenceStatus::Running,
+            status: super::super::SequenceStatus::Decoding,
         }]);
         map.publish(&[11], &Tensor::from_slice(&[33_i64])).unwrap();
         assert!(map.by_uid.contains_key(&11));

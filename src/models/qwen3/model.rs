@@ -848,13 +848,12 @@ mod tests {
                 input_ids: vec![1, 2, 3],
                 sampling_params: SamplingParams::default(),
                 cached_len: 0,
-                prefill_cursor: 2,
                 output_len: 1,
                 cache_handle: Some(BaseCacheHandle {
                     page_ids: vec![0, 1],
                     ..Default::default()
                 }),
-                status: SequenceStatus::Running,
+                status: SequenceStatus::Decoding,
             };
             let batch = decode.schedule_decode(&[request]).unwrap().unwrap();
             check(run(&batch.model_batch), 2, 1);
