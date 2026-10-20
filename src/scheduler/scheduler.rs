@@ -174,7 +174,6 @@ impl Scheduler {
                 input_ids,
                 sampling_params: sampling_params.normalized(),
                 cached_len: 0,
-                prefill_cursor: 0,
                 output_len: 0,
                 cache_handle: None,
                 status: SequenceStatus::Waiting,
@@ -327,7 +326,9 @@ impl Scheduler {
             .filter_map(|&uid| self.requests.running_request(uid))
             .map(|request| {
                 if chunk.is_some_and(|chunk| chunk.uid == request.uid) {
-                    request.prefill_cursor
+                    request
+                        .prefill_cursor()
+                        .expect("分块请求必须处于 prefill 阶段")
                 } else {
                     request.cached_len
                 }
@@ -392,12 +393,11 @@ impl Scheduler {
             let forward_ok = logits.is_ok();
             match logits {
                 Ok(_) => {
-                    let chunk = chunk.expect("non-final chunk metadata");
-                    self.complete_chunk(chunk, results);
+                    self.complete_batch(request_ids, None, phase, chunk, Ok(Vec::new()), results);
                 }
                 Err(error) => {
                     self.synchronize();
-                    self.complete(request_ids, None, BatchPhase::Prefill, Err(error), results);
+                    self.complete_batch(request_ids, None, phase, chunk, Err(error), results);
                 }
             }
             profiler.log(
@@ -425,31 +425,7 @@ impl Scheduler {
             self.synchronize();
         }
         profiler.measure(StepStage::Publish, || {
-            if let Some(chunk) = chunk.filter(|chunk| !chunk.is_last) {
-                match sampled {
-                    Ok(tokens) => {
-                        // Full short rows still publish their first token when
-                        // the same forward ends in an unfinished long row.
-                        let inputs = request_ids
-                            .iter()
-                            .map(|&uid| self.completion_input(uid))
-                            .collect();
-                        self.complete_mixed_chunk_rows(
-                            request_ids,
-                            inputs,
-                            tokens,
-                            phase,
-                            chunk,
-                            results,
-                        );
-                    }
-                    Err(error) => {
-                        self.complete(request_ids, None, phase, Err(error), results);
-                    }
-                }
-            } else {
-                self.complete(request_ids, None, phase, sampled, results);
-            }
+            self.complete_batch(request_ids, None, phase, chunk, sampled, results);
         });
         profiler.log(phase, profile_requests.as_deref().unwrap_or(&[]), success);
         Ok(())
@@ -476,6 +452,10 @@ impl Scheduler {
                         .as_ref()
                         .map(|inputs| inputs[row])
                         .unwrap_or_else(|| self.completion_input(uid));
+                    let request = self.requests.running_request_mut(uid).unwrap();
+                    if phase == BatchPhase::Prefill && request.prefill_cursor().is_some() {
+                        request.finish_prefill();
+                    }
                     let reason = self.finish_reason(input, token_id);
                     if reason.is_some() && self.resource_fence(uid).is_some() {
                         self.requests.mark_written(uid, input.written_len);
@@ -492,11 +472,6 @@ impl Scheduler {
                         });
                         continue;
                     }
-                    if phase == BatchPhase::Prefill {
-                        if let Some(request) = self.requests.running_request_mut(uid) {
-                            request.prefill_cursor = request.input_ids.len();
-                        }
-                    }
                     if phase == BatchPhase::Prefill || reason.is_some() {
                         if let Err(error) = self.requests.publish(uid) {
                             tracing::error!(uid, error = %error, "KV cache publish failed");
@@ -510,7 +485,7 @@ impl Scheduler {
                     let request = self.requests.running_request_mut(uid).unwrap();
                     request.append_token(token_id);
                     if reason.is_some() {
-                        request.status = SequenceStatus::Finished;
+                        request.finish();
                         finished.push(uid);
                     }
                     results.push(OutputToken {
@@ -547,7 +522,7 @@ impl Scheduler {
             .requests
             .retire(uid)
             .expect("retired request is running");
-        request.status = SequenceStatus::Finished;
+        request.finish();
         if let Some(fence) = fence {
             self.retired.push_back(RetiredRequest {
                 request,
@@ -872,18 +847,36 @@ impl Scheduler {
         if let Some(pending) = self.outstanding.take() {
             let chunk = pending.chunk;
             let (phase, ids, inputs, tokens) = Self::read_pending(pending);
-            if let Some(chunk) = chunk.filter(|chunk| !chunk.is_last) {
-                match tokens {
-                    Ok(tokens) => {
-                        self.complete_mixed_chunk_rows(ids, inputs, tokens, phase, chunk, results)
-                    }
-                    Err(error) => self.complete(ids, Some(inputs), phase, Err(error), results),
-                }
-            } else {
-                self.complete(ids, Some(inputs), phase, tokens, results);
-            }
+            self.complete_batch(ids, Some(inputs), phase, chunk, tokens, results);
         }
         self.reap_retired(false);
+    }
+
+    // 串行与 overlap 共用完成分派；中间块仅提交 KV，其他行正常产出 token。
+    fn complete_batch(
+        &mut self,
+        request_ids: Vec<RequestId>,
+        inputs: Option<Vec<CompletionInput>>,
+        phase: BatchPhase,
+        chunk: Option<PrefillChunk>,
+        sampled: std::result::Result<Vec<i64>, EngineError>,
+        results: &mut Vec<OutputToken>,
+    ) {
+        match (chunk.filter(|chunk| !chunk.is_last), sampled) {
+            (Some(chunk), Ok(_)) if request_ids.len() == 1 => {
+                self.complete_chunk(chunk, results);
+            }
+            (Some(chunk), Ok(tokens)) => {
+                let inputs = inputs.unwrap_or_else(|| {
+                    request_ids
+                        .iter()
+                        .map(|&uid| self.completion_input(uid))
+                        .collect()
+                });
+                self.complete_mixed_chunk_rows(request_ids, inputs, tokens, phase, chunk, results);
+            }
+            (_, sampled) => self.complete(request_ids, inputs, phase, sampled, results),
+        }
     }
 
     fn complete_mixed_chunk_rows(
@@ -928,7 +921,7 @@ impl Scheduler {
                 self.requests
                     .running_request_mut(chunk.uid)
                     .unwrap()
-                    .prefill_cursor = chunk.end;
+                    .advance_prefill(chunk.end);
             }
             Err(error) => {
                 tracing::error!(uid = chunk.uid, error = %error, "chunk KV cache publish failed");
@@ -2008,8 +2001,8 @@ mod tests {
                     .requests
                     .running_request(1)
                     .unwrap()
-                    .prefill_cursor,
-                1
+                    .prefill_cursor(),
+                Some(1)
             );
             for _ in 0..16 {
                 if scheduler.is_idle() {
@@ -2038,6 +2031,85 @@ mod tests {
                     Some(FinishReason::Length)
                 );
             }
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn prefill_transitions_to_decode_only_after_final_completion() {
+        exercise_prefill_state_transitions(Device::Cpu);
+    }
+
+    #[cfg(has_cuda_graph)]
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn cuda_prefill_transitions_to_decode_only_after_final_completion() {
+        assert!(tch::Cuda::is_available());
+        exercise_prefill_state_transitions(Device::Cuda(0));
+    }
+
+    fn exercise_prefill_state_transitions(device: Device) {
+        for overlap in [false, true] {
+            let (mut scheduler, path) =
+                scheduler_with_execution(CacheStrategy::Radix, 1, 16, device, false);
+            scheduler.prefill.set_chunked_prefill_size(2);
+            scheduler
+                .engine_mut()
+                .attach_model_runner(ModelRunner::new(
+                    Box::new(RelayTokenModel::default()),
+                    device,
+                ))
+                .unwrap();
+            let uid = scheduler
+                .add_request(
+                    vec![1, 2, 3, 4, 5],
+                    SamplingParams {
+                        max_tokens: 4,
+                        ignore_eos: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let mut outputs = Vec::new();
+            // 两个中间块分别提交到 2 和 4，均不允许 decode 或输出 token。
+            for cursor in [2, 4] {
+                outputs.extend(if overlap {
+                    scheduler.step_overlap().unwrap()
+                } else {
+                    scheduler.step_serial().unwrap()
+                });
+                scheduler.drain_outstanding(&mut outputs);
+                assert!(outputs.is_empty());
+                assert_eq!(
+                    scheduler.requests.running_request(uid).unwrap().status,
+                    SequenceStatus::Prefilling { cursor }
+                );
+                assert!(
+                    scheduler
+                        .decode
+                        .schedule_decode(scheduler.requests.running_requests())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            outputs.extend(if overlap {
+                scheduler.step_overlap().unwrap()
+            } else {
+                scheduler.step_serial().unwrap()
+            });
+            scheduler.drain_outstanding(&mut outputs);
+            assert!(!outputs.is_empty());
+            let request = scheduler.requests.running_request(uid).unwrap();
+            assert_eq!(request.status, SequenceStatus::Decoding);
+            assert_eq!(request.prefill_cursor(), None);
+            assert!(
+                scheduler
+                    .decode
+                    .schedule_decode(scheduler.requests.running_requests())
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(scheduler.abort_request(uid));
             fs::remove_dir_all(path).unwrap();
         }
     }

@@ -173,7 +173,7 @@ impl DecodeManager {
     ) -> Result<Option<DecodeBatch>> {
         let active: Vec<_> = running
             .iter()
-            .filter(|request| !request.is_finished())
+            .filter(|request| request.is_decoding())
             .filter(|request| future.is_none_or(|(plan, _)| plan.row(request.uid).is_some()))
             .collect();
         if active.is_empty() {
@@ -466,19 +466,17 @@ mod tests {
     }
 
     fn running(uid: RequestId, input_ids: Vec<i64>, pages: Vec<usize>) -> Request {
-        let prompt_len = input_ids.len();
         Request {
             uid,
             input_ids,
             sampling_params: SamplingParams::default(),
             cached_len: 0,
-            prefill_cursor: prompt_len,
             output_len: 1,
             cache_handle: Some(BaseCacheHandle {
                 page_ids: pages,
                 ..Default::default()
             }),
-            status: SequenceStatus::Running,
+            status: SequenceStatus::Decoding,
         }
     }
 
@@ -627,8 +625,45 @@ mod tests {
         let mut manager = manager();
         assert!(manager.schedule_decode(&[]).unwrap().is_none());
         let mut request = running(1, vec![2], vec![0]);
-        request.status = SequenceStatus::Finished;
+        request.finish();
         assert!(manager.schedule_decode(&[request]).unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_admits_only_decoding_requests_in_serial_and_pipeline() {
+        let mut manager = manager();
+        let mut requests = Vec::new();
+        for (uid, status) in [
+            SequenceStatus::Waiting,
+            SequenceStatus::Prefilling { cursor: 0 },
+            // 即使游标已到 prompt 尾部，仍需等待最后一次 forward 完成。
+            SequenceStatus::Prefilling { cursor: 2 },
+            SequenceStatus::Finished,
+            SequenceStatus::Decoding,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = running(uid as u64, vec![1, 2], vec![0]);
+            request.status = status;
+            if !request.is_decoding() {
+                request.output_len = 0;
+            }
+            requests.push(request);
+        }
+        for pipeline in [false, true] {
+            let batch = if pipeline {
+                manager.schedule_pipeline(&requests)
+            } else {
+                manager.schedule_decode(&requests)
+            }
+            .unwrap()
+            .unwrap();
+            assert_eq!(batch.request_ids, vec![4]);
+        }
+        requests.pop();
+        assert!(manager.schedule_decode(&requests).unwrap().is_none());
+        assert!(manager.schedule_pipeline(&requests).unwrap().is_none());
     }
 
     #[test]

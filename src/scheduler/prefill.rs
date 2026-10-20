@@ -3,7 +3,7 @@
 use crate::engine::kvcache::AcquireOutcome;
 use crate::engine::{Batch, BatchContext, BatchRequestRef, MixedDecodeRequest, ServerArgs};
 
-use super::{RequestId, Result, SequenceStatus, request_manager::RequestManager};
+use super::{RequestId, Result, request_manager::RequestManager};
 
 pub struct PrefillBatch {
     pub request_ids: Vec<RequestId>,
@@ -144,7 +144,11 @@ impl PrefillManager {
                 let chunk = chunk.filter(|chunk| chunk.uid == uid);
                 BatchRequestRef {
                     cached_len: chunk.map_or(request.cached_len, |_| {
-                        requests.running_request(uid).unwrap().prefill_cursor
+                        requests
+                            .running_request(uid)
+                            .unwrap()
+                            .prefill_cursor()
+                            .expect("分块请求必须处于 prefill 阶段")
                     }),
                     end_len: chunk.map(|chunk| chunk.end),
                     ..request
@@ -216,10 +220,7 @@ impl PrefillManager {
                 )
             })?;
             let mut request = requests.pop_pending().expect("front exists");
-            request.cached_len = matched_len;
-            request.prefill_cursor = matched_len;
-            request.cache_handle = Some(handle);
-            request.status = SequenceStatus::Running;
+            request.begin_prefill(handle);
             let chunk_len = if allow_chunk && self.chunked_prefill_size > 0 {
                 uncached.min(remaining.expect("chunking has a positive token budget"))
             } else {
@@ -261,23 +262,27 @@ impl PrefillManager {
             return Ok(None);
         };
         let Some(request) = requests.running_requests().iter().find(|request| {
-            request.prefill_cursor < request.input_ids.len().saturating_sub(request.output_len)
+            request
+                .prefill_cursor()
+                .is_some_and(|cursor| cursor < request.prompt_len())
         }) else {
             return Ok(None);
         };
-        let prompt_len = request.input_ids.len().saturating_sub(request.output_len);
+        let prompt_len = request.prompt_len();
+        let cursor = request
+            .prefill_cursor()
+            .expect("续块请求必须处于 prefill 阶段");
         let budget_limit = if self.max_prefill_tokens_per_batch == 0 {
             chunk_size
         } else {
             self.max_prefill_tokens_per_batch
         };
-        let end = request
-            .prefill_cursor
+        let end = cursor
             .saturating_add(chunk_size.min(budget_limit))
             .min(prompt_len);
         let selection = PrefillSelection {
             request_ids: vec![request.uid],
-            token_count: end - request.prefill_cursor,
+            token_count: end - cursor,
             chunk: Some(PrefillChunk {
                 uid: request.uid,
                 end,
@@ -302,7 +307,11 @@ impl PrefillManager {
                 let chunk = selection.chunk.filter(|chunk| chunk.uid == *uid);
                 BatchRequestRef {
                     input_ids: &request.input_ids,
-                    cached_len: chunk.map_or(request.cached_len, |_| request.prefill_cursor),
+                    cached_len: chunk.map_or(request.cached_len, |_| {
+                        request
+                            .prefill_cursor()
+                            .expect("分块请求必须处于 prefill 阶段")
+                    }),
                     end_len: chunk.map(|chunk| chunk.end),
                     page_ids: &request
                         .cache_handle
@@ -423,7 +432,6 @@ mod tests {
                 ..Default::default()
             },
             cached_len: 0,
-            prefill_cursor: 0,
             output_len: 0,
             cache_handle: None,
             status: SequenceStatus::Waiting,
@@ -488,7 +496,7 @@ mod tests {
         let first = manager.schedule_prefill().unwrap().unwrap();
         assert_eq!(first.chunk.unwrap().end, 4);
         manager.requests.publish_prefix(0, 4).unwrap();
-        manager.running_request_mut(0).unwrap().prefill_cursor = 4;
+        manager.running_request_mut(0).unwrap().advance_prefill(4);
         manager.add_request(request(1, vec![2, 3], 1));
         manager.add_request(request(2, vec![4], 1));
         let batch = manager.schedule_prefill().unwrap().unwrap();
@@ -506,7 +514,7 @@ mod tests {
         manager.add_request(request(0, vec![1; 5], 1));
         manager.schedule_prefill().unwrap().unwrap();
         manager.requests.publish_prefix(0, 4).unwrap();
-        manager.running_request_mut(0).unwrap().prefill_cursor = 4;
+        manager.running_request_mut(0).unwrap().advance_prefill(4);
         manager.add_request(request(1, vec![2; 7], 1));
         manager.add_request(request(2, vec![3], 1));
         let batch = manager.schedule_prefill().unwrap().unwrap();
@@ -639,5 +647,17 @@ mod tests {
         assert_eq!(manager.running_len(), 0);
         assert_eq!(pool.borrow().free_count(), 4);
         assert_eq!(manager.pending_ids(), vec![0, 1]);
+        let request = manager.requests.pending_front().unwrap();
+        assert_eq!(request.status, SequenceStatus::Waiting);
+        assert_eq!(request.prefill_cursor(), None);
+        assert!(request.cache_handle.is_none());
+        // 回退后仍能正常重新准入，且从初始游标开始。
+        manager.prefill.max_running_req = 1;
+        let batch = manager.schedule_prefill().unwrap().unwrap();
+        assert_eq!(batch.request_ids, vec![0]);
+        assert_eq!(
+            manager.running_request(0).unwrap().prefill_cursor(),
+            Some(0)
+        );
     }
 }
