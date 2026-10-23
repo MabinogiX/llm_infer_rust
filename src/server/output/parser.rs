@@ -3,6 +3,7 @@ use serde_json::Value;
 /// A parser belongs to one generation request. Its deltas and final message
 /// must describe the same output even when markers cross token boundaries.
 pub trait ChatOutputParser: Send {
+    fn set_prompt(&mut self, _prompt: &str) {}
     fn push(&mut self, text: &str) -> Vec<Value>;
     fn finish(&mut self) -> Vec<Value>;
     fn message(&self) -> Value;

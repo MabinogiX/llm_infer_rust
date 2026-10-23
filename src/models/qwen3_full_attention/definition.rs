@@ -10,6 +10,7 @@ use crate::models::registry::{ModelDefinition, ModelRegistration};
 
 pub(crate) const REGISTRATION: ModelRegistration = ModelRegistration {
     model_type: "qwen3",
+    recurrent_state: false,
     architecture: "Qwen3ForCausalLM",
     parse,
     template_probe: Some(matches_chat_template),

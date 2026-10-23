@@ -82,8 +82,14 @@ impl Scheduler {
         let args = engine.server_args().clone();
         let pool = engine.shared_kv_cache_pool()?;
         let cache: Box<dyn CacheManager> = match cache_strategy {
-            CacheStrategy::Radix => Box::new(RadixCacheManager::new(pool.clone(), args.page_size)?),
-            CacheStrategy::Naive => Box::new(NaiveCacheManager::new(pool.clone())),
+            CacheStrategy::Radix => Box::new(
+                RadixCacheManager::new(pool.clone(), args.page_size)?
+                    .with_recurrent_state(engine.recurrent_state_pool()),
+            ),
+            CacheStrategy::Naive => Box::new(
+                NaiveCacheManager::new(pool.clone())
+                    .with_recurrent_state(engine.recurrent_state_pool()),
+            ),
         };
         let batch_context = BatchContext::new(
             args.max_running_req,
@@ -687,6 +693,15 @@ impl Scheduler {
                     };
                     let mut request_ids = selection.request_ids.clone();
                     request_ids.extend(relay.rows().map(|row| row.uid));
+                    let mut mixed = mixed;
+                    mixed.attention_metadata.as_mut().unwrap().state_slots = request_ids
+                        .iter()
+                        .map(|uid| {
+                            self.requests
+                                .running_request(*uid)
+                                .and_then(|r| r.cache_handle.as_ref()?.state_slot)
+                        })
+                        .collect();
                     return Ok(Some(SchedulePlan::mixed(
                         request_ids,
                         mixed,
@@ -930,6 +945,11 @@ impl Scheduler {
                 results.push(self.terminal_result(chunk.uid, FinishReason::Error));
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_overlap_for_test(&mut self) -> Result<Vec<OutputToken>> {
+        self.step_overlap()
     }
 
     fn step_overlap(&mut self) -> Result<Vec<OutputToken>> {

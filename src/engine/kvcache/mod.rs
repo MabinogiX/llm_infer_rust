@@ -8,6 +8,12 @@ mod error;
 mod naive;
 mod pool;
 mod radix;
+mod recurrent;
+mod recurrent_sizing;
+pub use recurrent::{
+    CheckpointId, LinearState, RecurrentStatePool, RequestState, SharedRecurrentPool, StateSlotId,
+};
+pub use recurrent_sizing::{RecurrentCacheOptions, RecurrentCachePlan};
 mod spec;
 
 pub use allocator::{

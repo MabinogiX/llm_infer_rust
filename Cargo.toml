@@ -7,7 +7,7 @@ edition = "2024"
 axum = "0.8"
 futures-util = "0.3"
 axum-valid = { version = "0.25", features = ["validator", "into_json"] }
-minijinja = "2"
+minijinja = { version = "2", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }

@@ -257,10 +257,72 @@ fn choose_chat_template_renderer(
         return Ok(ChatTemplateRenderer::Custom(render));
     }
     let mut environment = Environment::new();
+    environment.add_filter(
+        "tojson",
+        |value: minijinja::Value| -> std::result::Result<String, minijinja::Error> {
+            let mut serializer =
+                serde_json::Serializer::with_formatter(Vec::new(), TemplateJsonFormatter);
+            value.serialize(&mut serializer).map_err(|e| {
+                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+            })?;
+            Ok(String::from_utf8(serializer.into_inner()).expect("JSON 必须是 UTF-8"))
+        },
+    );
+    environment.add_function(
+        "raise_exception",
+        |message: String| -> std::result::Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                message,
+            ))
+        },
+    );
+    environment.set_unknown_method_callback(|_state, value, method, args| {
+        if let Some(text) = value.as_str() {
+            let (needle,): (&str,) = minijinja::value::from_args(args)?;
+            match method {
+                "startswith" => return Ok(minijinja::Value::from(text.starts_with(needle))),
+                "endswith" => return Ok(minijinja::Value::from(text.ends_with(needle))),
+                _ => {}
+            }
+        }
+        Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod))
+    });
     environment
         .add_template_owned("chat".to_owned(), template_source)
         .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?;
     Ok(ChatTemplateRenderer::Generic(environment))
+}
+
+// 与 Transformers 的 tojson 保持相同的插入顺序、Unicode 和分隔符。
+struct TemplateJsonFormatter;
+impl serde_json::ser::Formatter for TemplateJsonFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
 }
 
 fn render_generic_chat_template(
@@ -269,11 +331,28 @@ fn render_generic_chat_template(
     options: ChatTemplateOptions<'_>,
 ) -> Result<String> {
     let mut template_context = options.kwargs.cloned().unwrap_or_default();
-    template_context.insert(
-        "messages".to_owned(),
-        serde_json::to_value(messages)
-            .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?,
-    );
+    let mut message_values = serde_json::to_value(messages)
+        .map_err(|error| TokenizerWorkerError::RenderChatTemplate(error.to_string()))?;
+    // OpenAI 历史消息将函数参数编码为 JSON 字符串；Jinja 模板按对象遍历。
+    for message in message_values.as_array_mut().unwrap() {
+        if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for call in calls {
+                let function = if call.get("function").is_some() {
+                    &mut call["function"]
+                } else {
+                    call
+                };
+                if let Some(arguments) = function.get_mut("arguments") {
+                    if let Some(text) = arguments.as_str() {
+                        if let Ok(value @ Value::Object(_)) = serde_json::from_str(text) {
+                            *arguments = value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    template_context.insert("messages".to_owned(), message_values);
     template_context.insert("tools".to_owned(), Value::Array(options.tools.to_vec()));
     template_context.insert(
         "add_generation_prompt".to_owned(),
@@ -439,5 +518,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rendered, "ready: lookup");
+    }
+}
+
+#[cfg(test)]
+mod qwen38_template_tests {
+    use super::*;
+    #[test]
+    fn checkpoint_template_renders_thinking_options_and_tools() {
+        let source = include_str!("../tests/fixtures/qwen3_8_chat_template.jinja");
+        let renderer =
+            choose_chat_template_renderer(Some(source.into()), ChatTemplateKind::Generic).unwrap();
+        let ChatTemplateRenderer::Generic(env) = renderer else {
+            panic!("需要实际检查点模板")
+        };
+        let messages = [ChatMessage::new("user", "你好")];
+        let tools = [
+            serde_json::json!({"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}),
+        ];
+        let tool_prompt = render_generic_chat_template(
+            &env,
+            &messages,
+            ChatTemplateOptions {
+                tools: &tools,
+                add_generation_prompt: true,
+                enable_thinking: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(tool_prompt.contains(r#"{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}"#));
+        let mut assistant = ChatMessage::new("assistant", "");
+        assistant.tool_calls = Some(vec![
+            serde_json::json!({"function":{"name":"weather","arguments":"{\"city\":\"北京\"}"}}),
+        ]);
+        let history = [
+            messages[0].clone(),
+            assistant,
+            ChatMessage::new("tool", "晴天"),
+        ];
+        let rendered = render_generic_chat_template(
+            &env,
+            &history,
+            ChatTemplateOptions {
+                tools: &tools,
+                enable_thinking: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(rendered.contains("<parameter=city>\n北京\n</parameter>"));
+        assert!(rendered.contains("<tool_response>\n晴天\n</tool_response>"));
+        for thinking in [true, false] {
+            let rendered = render_generic_chat_template(
+                &env,
+                &messages,
+                ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: Some(thinking),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(rendered.contains("你好<|im_end|>"));
+            assert!(rendered.ends_with(if thinking {
+                "<think>\n"
+            } else {
+                "<think>\n\n</think>\n\n"
+            }));
+        }
     }
 }

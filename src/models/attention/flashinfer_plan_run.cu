@@ -34,6 +34,7 @@ __global__ void pack_decode_metadata(
 }
 
 struct NativePlan {
+  uint32_t head_dim = 128;
   flashinfer::DecodePlanInfo info{};
   flashinfer::PrefillPlanInfo prefill_info{};
   void* float_workspace = nullptr;
@@ -71,13 +72,13 @@ struct NativePlan {
   }
 };
 
-template <typename T, uint32_t GroupSize>
+template <typename T, uint32_t GroupSize, uint32_t HeadDim>
 cudaError_t make_plan(NativePlan& plan, const int32_t* indptr_host,
                       uint32_t batch_size, uint32_t num_q_heads,
                       uint32_t page_size, bool graph, cudaStream_t stream) {
   using Params = flashinfer::BatchDecodeParams<T, T, T, int32_t>;
   auto estimate = flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-      GroupSize, 128, flashinfer::PosEncodingMode::kNone, Variant, Params>;
+      GroupSize, HeadDim, flashinfer::PosEncodingMode::kNone, Variant, Params>;
   bool split_kv = false;
   uint32_t max_grid_size = 0, max_pages = 0, new_batch_size = 0, grid_y = 0;
   auto status = estimate(split_kv, max_grid_size, max_pages, new_batch_size,
@@ -91,7 +92,7 @@ cudaError_t make_plan(NativePlan& plan, const int32_t* indptr_host,
       : std::max<size_t>(new_batch_size, batch_size);
   const size_t int_bytes = padded * 17 + 128;
   const size_t float_bytes = split_kv
-      ? size_t(num_q_heads) * padded * (128 * sizeof(float) + sizeof(float)) + 64
+      ? size_t(num_q_heads) * padded * (HeadDim * sizeof(float) + sizeof(float)) + 64
       : 1;
   // A captured graph holds these addresses. Reject growth rather than silently
   // freeing a workspace referenced by its kernels.
@@ -103,7 +104,7 @@ cudaError_t make_plan(NativePlan& plan, const int32_t* indptr_host,
       (status = plan.reserve(plan.pinned_int_workspace, plan.pinned_capacity, int_bytes, true)) != cudaSuccess) {
     return status;
   }
-  return flashinfer::DecodePlan<128, flashinfer::PosEncodingMode::kNone,
+  return flashinfer::DecodePlan<HeadDim, flashinfer::PosEncodingMode::kNone,
                                 Variant, Params>(
       plan.float_workspace, plan.float_capacity, plan.int_workspace,
       plan.pinned_int_workspace, plan.int_capacity, plan.info,
@@ -111,20 +112,20 @@ cudaError_t make_plan(NativePlan& plan, const int32_t* indptr_host,
       page_size, graph, stream, estimate);
 }
 
-template <typename T>
+template <typename T, uint32_t HeadDim>
 cudaError_t dispatch_plan(NativePlan& plan, const int32_t* indptr_host,
                           uint32_t batch_size, uint32_t num_q_heads,
                           uint32_t num_kv_heads, uint32_t page_size, bool graph,
                           cudaStream_t stream) {
   cudaError_t status = cudaErrorInvalidValue;
   DISPATCH_GQA_GROUP_SIZE(num_q_heads / num_kv_heads, GROUP_SIZE, {
-    status = make_plan<T, GROUP_SIZE>(plan, indptr_host, batch_size,
+    status = make_plan<T, GROUP_SIZE, HeadDim>(plan, indptr_host, batch_size,
                                       num_q_heads, page_size, graph, stream);
   });
   return status;
 }
 
-template <typename T>
+template <typename T, uint32_t HeadDim>
 cudaError_t run(const NativePlan& plan, const void* query,
                 const void* key_cache, const void* value_cache,
                 const int32_t* page_indices, const int32_t* page_indptr,
@@ -134,7 +135,7 @@ cudaError_t run(const NativePlan& plan, const void* query,
   using namespace flashinfer;
   using Params = BatchDecodeParams<T, T, T, int32_t>;
   paged_kv_t<T, int32_t> paged_kv(
-      num_kv_heads, page_size, 128, batch_size, QKVLayout::kNHD,
+      num_kv_heads, page_size, HeadDim, batch_size, QKVLayout::kNHD,
       reinterpret_cast<T*>(const_cast<void*>(key_cache)),
       reinterpret_cast<T*>(const_cast<void*>(value_cache)),
       const_cast<int32_t*>(page_indices), const_cast<int32_t*>(page_indptr),
@@ -145,10 +146,10 @@ cudaError_t run(const NativePlan& plan, const void* query,
   params.o = reinterpret_cast<T*>(output);
   params.num_qo_heads = num_q_heads;
   params.padded_batch_size = plan.info.padded_batch_size;
-  params.q_stride_n = num_q_heads * 128;
-  params.q_stride_h = 128;
+  params.q_stride_n = num_q_heads * HeadDim;
+  params.q_stride_h = HeadDim;
   params.window_left = -1;
-  params.sm_scale = 1.f / std::sqrt(128.f);
+  params.sm_scale = 1.f / std::sqrt(float(HeadDim));
   params.request_indices = GetPtrFromBaseOffset<int32_t>(
       plan.int_workspace, plan.info.request_indices_offset);
   params.kv_tile_indices = GetPtrFromBaseOffset<int32_t>(
@@ -167,7 +168,7 @@ cudaError_t run(const NativePlan& plan, const void* query,
     tmp_v = GetPtrFromBaseOffset<T>(plan.float_workspace, plan.info.v_offset);
     tmp_s = GetPtrFromBaseOffset<float>(plan.float_workspace, plan.info.s_offset);
   }
-  return BatchDecodeWithPagedKVCacheDispatched<128, PosEncodingMode::kNone,
+  return BatchDecodeWithPagedKVCacheDispatched<HeadDim, PosEncodingMode::kNone,
                                                Variant>(params, tmp_v, tmp_s,
                                                         false, stream);
 }
@@ -185,19 +186,18 @@ extern "C" const char* sglang_flashinfer_pack_decode_metadata(
 
 extern "C" void* sglang_flashinfer_native_plan(
     void* existing, const int32_t* indptr_host, int32_t batch_size, int32_t num_q_heads,
-    int32_t num_kv_heads, int32_t page_size, int32_t dtype_code, bool graph,
+    int32_t num_kv_heads, int32_t head_dim, int32_t page_size, int32_t dtype_code, bool graph,
     void* stream, const char** error) {
   try {
     auto created = existing ? nullptr : std::make_unique<NativePlan>();
     auto* plan = existing ? static_cast<NativePlan*>(existing) : created.get();
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    cudaError_t status = dtype_code == 0
-        ? dispatch_plan<__nv_bfloat16>(*plan, indptr_host, batch_size,
-                                      num_q_heads, num_kv_heads, page_size, graph,
-                                      cuda_stream)
-        : dispatch_plan<__half>(*plan, indptr_host, batch_size,
-                                num_q_heads, num_kv_heads, page_size, graph,
-                                cuda_stream);
+    plan->head_dim = head_dim;
+#define PLAN(T,D) dispatch_plan<T,D>(*plan,indptr_host,batch_size,num_q_heads,num_kv_heads,page_size,graph,cuda_stream)
+    cudaError_t status = head_dim == 256
+        ? (dtype_code == 0 ? PLAN(__nv_bfloat16,256) : PLAN(__half,256))
+        : (dtype_code == 0 ? PLAN(__nv_bfloat16,128) : PLAN(__half,128));
+#undef PLAN
     if (status != cudaSuccess) {
       *error = cudaGetErrorString(status);
       return nullptr;
@@ -227,32 +227,29 @@ extern "C" const char* sglang_flashinfer_native_run(
     int32_t page_size, int32_t dtype_code, void* stream) {
   const auto& native = *static_cast<const NativePlan*>(plan);
   auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-  const cudaError_t status = dtype_code == 0
-      ? run<__nv_bfloat16>(native, query, key_cache, value_cache,
-                           page_indices, page_indptr, page_last_len, output,
-                           batch_size, num_q_heads, num_kv_heads, page_size,
-                           cuda_stream)
-      : run<__half>(native, query, key_cache, value_cache,
-                    page_indices, page_indptr, page_last_len, output,
-                    batch_size, num_q_heads, num_kv_heads, page_size,
-                    cuda_stream);
+#define DECODE(T,D) run<T,D>(native,query,key_cache,value_cache,page_indices,page_indptr,page_last_len,output,batch_size,num_q_heads,num_kv_heads,page_size,cuda_stream)
+  const cudaError_t status = native.head_dim == 256
+      ? (dtype_code == 0 ? DECODE(__nv_bfloat16,256) : DECODE(__half,256))
+      : (dtype_code == 0 ? DECODE(__nv_bfloat16,128) : DECODE(__half,128));
+#undef DECODE
   return status == cudaSuccess ? nullptr : cudaGetErrorString(status);
 }
 
 // Plan once per forward; all decoder layers share the same workspaces.
 extern "C" void* sglang_flashinfer_native_prefill_plan(
     void* existing, int32_t* q_host, int32_t* kv_host, int32_t rows,
-    int32_t batch, int32_t q_heads, int32_t kv_heads, int32_t page_size,
+    int32_t batch, int32_t q_heads, int32_t kv_heads, int32_t head_dim, int32_t page_size,
     void* stream, const char** error) {
   try {
     using namespace flashinfer;
     auto created = existing ? nullptr : std::make_unique<NativePlan>();
     auto* plan = existing ? static_cast<NativePlan*>(existing) : created.get();
+    plan->head_dim = head_dim;
     size_t float_bytes = 0, int_bytes = 0;
     // Use the planner's official sizing pass rather than duplicating its layout.
     // 0.6.18 requires uniform_q_len; -1 denotes heterogeneous query lengths.
     auto status = PrefillPlanWorkspaceSize<int32_t>(float_bytes, int_bytes,
-        q_host, kv_host, rows, batch, q_heads, kv_heads, 128, 128, page_size,
+        q_host, kv_host, rows, batch, q_heads, kv_heads, head_dim, head_dim, page_size,
         false, 2, -1, -1, false, 0, -1, reinterpret_cast<cudaStream_t>(stream));
     if (status != cudaSuccess) { *error = cudaGetErrorString(status); return nullptr; }
     if ((status = plan->reserve(plan->float_workspace, plan->float_capacity, float_bytes, false)) != cudaSuccess ||
@@ -263,7 +260,7 @@ extern "C" void* sglang_flashinfer_native_prefill_plan(
     status = PrefillPlan<int32_t>(plan->float_workspace, plan->float_capacity,
         plan->int_workspace, plan->pinned_int_workspace, plan->int_capacity,
         plan->prefill_info, q_host, kv_host, rows, batch, q_heads, kv_heads,
-        128, 128, page_size, false, 2, -1, -1, false, 0, -1,
+        head_dim, head_dim, page_size, false, 2, -1, -1, false, 0, -1,
         reinterpret_cast<cudaStream_t>(stream));
     if (status != cudaSuccess) { *error = cudaGetErrorString(status); return nullptr; }
     return existing ? existing : created.release();
@@ -274,7 +271,7 @@ extern "C" void* sglang_flashinfer_native_prefill_plan(
 }
 
 namespace {
-template <typename T, bool Paged>
+template <typename T, bool Paged, uint32_t HeadDim>
 cudaError_t run_prefill(const NativePlan& plan, void* q, void* k, void* v,
     int32_t* q_indptr, int32_t* kv_indptr, int32_t* indices, int32_t* last_len,
     void* output, int32_t batch, int32_t q_heads, int32_t kv_heads,
@@ -289,16 +286,16 @@ cudaError_t run_prefill(const NativePlan& plan, void* q, void* k, void* v,
   params.q_indptr = q_indptr;
   params.num_qo_heads = q_heads;
   params.group_size = uint_fastdiv(q_heads / kv_heads);
-  params.q_stride_n = q_stride; params.q_stride_h = 128;
-  params.window_left = -1; params.sm_scale = 1.f / std::sqrt(128.f);
+  params.q_stride_n = q_stride; params.q_stride_h = HeadDim;
+  params.window_left = -1; params.sm_scale = 1.f / std::sqrt(float(HeadDim));
   if constexpr (Paged) {
-    params.paged_kv = paged_kv_t<T,int32_t>(kv_heads, page_size, 128, batch,
+    params.paged_kv = paged_kv_t<T,int32_t>(kv_heads, page_size, HeadDim, batch,
         QKVLayout::kNHD, static_cast<T*>(k), static_cast<T*>(v), indices, kv_indptr, last_len);
   } else {
     params.k = static_cast<T*>(k); params.v = static_cast<T*>(v);
     params.kv_indptr = kv_indptr; params.num_kv_heads = kv_heads;
-    params.k_stride_n = k_stride; params.k_stride_h = 128;
-    params.v_stride_n = v_stride; params.v_stride_h = 128;
+    params.k_stride_n = k_stride; params.k_stride_h = HeadDim;
+    params.v_stride_n = v_stride; params.v_stride_h = HeadDim;
   }
   const auto& info = plan.prefill_info;
   params.request_indices = GetPtrFromBaseOffset<int32_t>(plan.int_workspace, info.request_indices_offset);
@@ -317,10 +314,10 @@ cudaError_t run_prefill(const NativePlan& plan, void* q, void* k, void* v,
   cudaError_t status = cudaErrorInvalidValue;
   DISPATCH_CTA_TILE_Q(info.cta_tile_q, CTA_TILE_Q, {
     if constexpr (Paged) {
-      status = BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q,128,128,
+      status = BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q,HeadDim,HeadDim,
           PosEncodingMode::kNone,false,MaskMode::kCausal,Variant>(params,tmp_v,tmp_s,false,stream);
     } else {
-      status = BatchPrefillWithRaggedKVCacheDispatched<CTA_TILE_Q,128,128,
+      status = BatchPrefillWithRaggedKVCacheDispatched<CTA_TILE_Q,HeadDim,HeadDim,
           PosEncodingMode::kNone,false,MaskMode::kCausal,Variant>(params,tmp_v,tmp_s,false,stream);
     }
   });
@@ -336,9 +333,10 @@ extern "C" const char* sglang_flashinfer_native_prefill_run(
     int32_t dtype, bool paged, void* stream) {
   const auto& native = *static_cast<const NativePlan*>(plan);
   cudaError_t status;
-#define RUN(T, PAGED) run_prefill<T, PAGED>(native,q,k,v,q_indptr,kv_indptr,indices,last_len,output,batch,q_heads,kv_heads,page_size,q_stride,k_stride,v_stride,reinterpret_cast<cudaStream_t>(stream))
-  if (dtype == 0) status = paged ? RUN(__nv_bfloat16,true) : RUN(__nv_bfloat16,false);
-  else status = paged ? RUN(__half,true) : RUN(__half,false);
+#define RUN(T, PAGED, D) run_prefill<T, PAGED, D>(native,q,k,v,q_indptr,kv_indptr,indices,last_len,output,batch,q_heads,kv_heads,page_size,q_stride,k_stride,v_stride,reinterpret_cast<cudaStream_t>(stream))
+#define PREFILL(D) (dtype == 0 ? (paged ? RUN(__nv_bfloat16,true,D) : RUN(__nv_bfloat16,false,D)) : (paged ? RUN(__half,true,D) : RUN(__half,false,D)))
+  status = native.head_dim == 256 ? PREFILL(256) : PREFILL(128);
+#undef PREFILL
 #undef RUN
   return status == cudaSuccess ? nullptr : cudaGetErrorString(status);
 }

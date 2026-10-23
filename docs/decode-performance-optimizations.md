@@ -32,7 +32,7 @@ Qwen3 decoder 采用独立 residual 流，MLP 输出的残差加法延迟到下�
 
 残差和先舍入到 BF16/FP16，再进入 FP32 RMS reduction，保持原实现的计算顺序。28 层 Qwen3 0.6B 不再单独启动原来的 56 次 residual-add kernel。CPU 路径保留普通张量计算。
 
-涉及文件：`src/models/qwen3/model.rs`、`ops.rs`、`fused_ops_bridge.cpp`、`fused_ops.cu`。
+涉及文件：`src/models/qwen3_full_attention/model.rs`、`ops.rs`、`fused_ops_bridge.cpp`、`fused_ops.cu`。
 
 ### 多请求 QKV 布局修复
 

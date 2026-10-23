@@ -15,7 +15,10 @@ Options:\n\
   --host IP                 Bind address (default 127.0.0.1)\n\
   --port PORT               Bind port (default 8000)\n\
   --tp-size N               Tensor parallel size (only 1 is supported)\n\
-  --memory-ratio R          GPU memory fraction for weights + KV cache (default 0.9)\n\
+  --memory-ratio R          GPU memory fraction for weights + cache pools (default 0.9)\n\
+  --mamba-full-memory-ratio R  Linear state / full KV memory ratio (default 0.9)\n\
+  --max-mamba-cache-size N   Upper bound on total linear state slots\n\
+  --recurrent-checkpoint-slots N  Checkpoint cap (auto by default; 0 disables)\n\
   --max-total-tokens N      Optional KV pool token cap (rounded down to whole pages)\n\
   --max-running-req N       Maximum active requests (default 256)\n\
   --max-prefill-tokens-per-batch N  Maximum uncached prefill tokens per batch (0 disables)\n\
@@ -54,6 +57,15 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             "--port" => port = parse_value(&value()?, &flag)?,
             "--tp-size" => engine.tp_size = parse_value(&value()?, &flag)?,
             "--memory-ratio" => engine.memory_ratio = parse_value(&value()?, &flag)?,
+            "--mamba-full-memory-ratio" => {
+                engine.mamba_full_memory_ratio = parse_value(&value()?, &flag)?
+            }
+            "--max-mamba-cache-size" => {
+                engine.max_mamba_cache_size = Some(parse_value(&value()?, &flag)?)
+            }
+            "--recurrent-checkpoint-slots" => {
+                engine.recurrent_checkpoint_slots = Some(parse_value(&value()?, &flag)?)
+            }
             "--max-total-tokens" => engine.max_total_tokens = Some(parse_value(&value()?, &flag)?),
             "--max-running-req" => engine.max_running_req = parse_value(&value()?, &flag)?,
             "--max-prefill-tokens-per-batch" => {
@@ -107,6 +119,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServeArgs, S
             _ => return Err(format!("未知参数: {flag}")),
         }
     }
+    engine
+        .recurrent_cache_options()
+        .map_err(|e| e.to_string())?;
     engine.model_path = model_path.ok_or("必须指定 --model-path".to_owned())?;
     if engine.tp_size != 1 {
         return Err("当前不支持 tp_size > 1".to_owned());
@@ -125,6 +140,71 @@ fn parse_value<T: std::str::FromStr>(text: &str, flag: &str) -> Result<T, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_and_validates_linear_cache_budget_options() {
+        let args = parse_args(
+            [
+                "--model-path",
+                "/tmp/model",
+                "--mamba-full-memory-ratio",
+                "0.5",
+                "--max-mamba-cache-size",
+                "100",
+                "--recurrent-checkpoint-slots",
+                "20",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(args.engine.mamba_full_memory_ratio, 0.5);
+        assert_eq!(args.engine.max_mamba_cache_size, Some(100));
+        assert_eq!(
+            args.engine
+                .recurrent_cache_options()
+                .unwrap()
+                .max_checkpoints,
+            Some(20)
+        );
+        for ratio in ["0", "-1", "NaN", "inf"] {
+            assert!(
+                parse_args(
+                    [
+                        "--model-path",
+                        "/tmp/model",
+                        "--mamba-full-memory-ratio",
+                        ratio
+                    ]
+                    .map(str::to_owned)
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            parse_args(
+                ["--model-path", "/tmp/model", "--max-mamba-cache-size", "0"].map(str::to_owned)
+            )
+            .is_err()
+        );
+        let disabled = parse_args(
+            [
+                "--model-path",
+                "/tmp/model",
+                "--recurrent-checkpoint-slots",
+                "0",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            disabled
+                .engine
+                .recurrent_cache_options()
+                .unwrap()
+                .max_checkpoints,
+            Some(0)
+        );
+    }
 
     #[test]
     fn parses_model_server_address_and_device() {

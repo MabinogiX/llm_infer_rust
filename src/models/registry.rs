@@ -9,7 +9,7 @@ use crate::{
     tokenizer::ChatTemplateRenderFn,
 };
 
-use super::qwen3;
+use super::{qwen3_full_attention, qwen3_hybrid_attention};
 
 pub(crate) struct ModelDefinition {
     pub runtime: RuntimeModelConfig,
@@ -17,6 +17,7 @@ pub(crate) struct ModelDefinition {
 }
 
 pub(crate) struct ModelRegistration {
+    pub recurrent_state: bool,
     pub model_type: &'static str,
     pub architecture: &'static str,
     pub parse: fn(&Value, Kind) -> Result<ModelDefinition, String>,
@@ -25,7 +26,10 @@ pub(crate) struct ModelRegistration {
     pub output_parser_constructor: ChatOutputParserConstructor,
 }
 
-const MODELS: &[ModelRegistration] = &[qwen3::REGISTRATION];
+const MODELS: &[ModelRegistration] = &[
+    qwen3_full_attention::REGISTRATION,
+    qwen3_hybrid_attention::REGISTRATION,
+];
 
 pub(crate) fn model_registration(
     model_type: &str,

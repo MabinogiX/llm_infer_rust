@@ -139,6 +139,7 @@ async fn chat_completions_inner(
             &frontend,
             handle,
             ApiKind::Chat,
+            Some(&prompt),
             request.model,
             prompt_tokens,
             started_at,
@@ -156,6 +157,7 @@ async fn chat_completions_inner(
     })?;
     let output = profiler.measure(RequestStage::Format, || {
         let mut output = frontend.new_chat_output_parser(uid);
+        output.set_prompt(&prompt);
         output.push(&text);
         output.finish();
         output
@@ -226,6 +228,7 @@ async fn completions_inner(
             &frontend,
             handle,
             ApiKind::Completion,
+            None,
             request.model,
             prompt_tokens,
             started_at,
@@ -307,13 +310,19 @@ fn stream_response(
     frontend: &FrontendManager,
     handle: RequestHandle,
     kind: ApiKind,
+    prompt: Option<&str>,
     model: String,
     prompt_tokens: usize,
     started_at: Instant,
 ) -> Response {
     let tokenizer = frontend.shared_tokenizer();
-    let output_parser =
-        matches!(kind, ApiKind::Chat).then(|| frontend.new_chat_output_parser(handle.uid()));
+    let output_parser = matches!(kind, ApiKind::Chat).then(|| {
+        let mut parser = frontend.new_chat_output_parser(handle.uid());
+        if let Some(prompt) = prompt {
+            parser.set_prompt(prompt);
+        }
+        parser
+    });
     Sse::new(streaming::response_stream(
         handle,
         tokenizer,

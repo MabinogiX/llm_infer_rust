@@ -185,7 +185,7 @@ CPU 调度与 GPU 执行 overlap 放在状态和批次所有权明确之后实�
 
 本次确认注册与配置分离的设计合理，并完成以下调整：
 
-- `models/registry.rs` 注册配置解析器、模型 factory 和现有模板／输出 parser 的默认选择；不再接收 `ServeArgs` 或返回 `ServeComponents`。Qwen3 的定义移到 `models/qwen3/definition.rs`，模型模块不再创建 Engine、Scheduler 或 tokenizer。
+- `models/registry.rs` 注册配置解析器、模型 factory 和现有模板／输出 parser 的默认选择；不再接收 `ServeArgs` 或返回 `ServeComponents`。Qwen3 的定义移到 `models/qwen3_full_attention/definition.rs`，模型模块不再创建 Engine、Scheduler 或 tokenizer。
 - `Qwen3Config` 保存计算字段并在启动时强类型解析、校验。通用 `ModelArgs` 移除，`RuntimeModelConfig` 只保存当前分页 KV 几何、词表、上下文上限及已解析的 checkpoint dtype。`ModelFactory` 持有模型专属配置，通过 `validate_runtime` 校验实际执行组合，再通过 `create` 构造模型。
 - `server/components/builder.rs` 统一选择定义、解析配置、校验执行组合和 EOS、初始化 tokenizer、加载 Engine 并创建 Scheduler。权重加载、剩余显存缓存分配和 graph capture 的原有顺序仍由 Engine 执行。模型配置不再由 Engine 或 Scheduler 重读。
 - 未知 architecture、非法维度／dtype／backend／并行配置，以及未支持的 RoPE scaling、量化、projection bias、滑窗、非 SiLU 激活和逐层 attention 类型，在 tokenizer／权重加载之前失败。停用滑窗时保留其窗口元数据，普通 HF 元数据允许存在；这不是对任意未知计算扩展的兼容承诺。
@@ -319,7 +319,7 @@ Captured decode graph 完成 private input/metadata snapshot 后允许复用 sch
 Rust：
 
 - [模型注册](../src/models/registry.rs)与[启动组装](../src/server/components/builder.rs)。
-- [Qwen3 定义](../src/models/qwen3/definition.rs)、[强类型配置](../src/models/qwen3/config.rs)、[模型与权重绑定](../src/models/qwen3/model.rs)、[共享 layers](../src/layers/mod.rs)、[prefill graph](../src/models/qwen3/prefill_graph.rs)。
+- [Qwen3 定义](../src/models/qwen3_full_attention/definition.rs)、[强类型配置](../src/models/qwen3_full_attention/config.rs)、[模型与权重绑定](../src/models/qwen3_full_attention/model.rs)、[共享 layers](../src/layers/mod.rs)、[prefill graph](../src/models/qwen3_full_attention/prefill_graph.rs)。
 - [Engine／RuntimeModelConfig](../src/engine/engine.rs)、[ModelExecutor／ModelRunner](../src/engine/model_runner.rs)、[checkpoint reader](../src/engine/model_loader.rs)、[KVCachePool](../src/engine/kvcache/pool.rs)。
 - [AttentionSpec／backend](../src/models/attention/backend.rs)、[HTTP](../src/server/api.rs)、[请求 schema](../src/server/schemas.rs)、[FrontendManager／detokenizer](../src/server/manager.rs)、[输出 parser](../src/server/output/parser.rs)。
 - [Scheduler／EOS](../src/scheduler/scheduler.rs)、[prefill 调度](../src/scheduler/prefill.rs)、[tokenizer／模板](../src/tokenizer.rs)。

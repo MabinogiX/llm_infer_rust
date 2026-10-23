@@ -150,8 +150,19 @@ impl KVCacheAllocator {
     }
 
     pub fn allocate(&self, kind: Kind, device: Device, tp_size: usize) -> Result<KVCachePool> {
-        let spec = self.spec.per_rank(tp_size)?;
         let available = self.available_memory(device)?;
+        self.allocate_with_budget(kind, device, tp_size, available)
+    }
+
+    /// 使用已扣除线性状态的预算；CPU fallback 同样不能重复花费这笔空间。
+    pub fn allocate_with_budget(
+        &self,
+        kind: Kind,
+        device: Device,
+        tp_size: usize,
+        available: usize,
+    ) -> Result<KVCachePool> {
+        let spec = self.spec.per_rank(tp_size)?;
         let itemsize = kind.elt_size_in_bytes();
         let mut num_pages = self.num_pages_for_spec(available, &spec, itemsize)?;
         let server = self.config.server;
@@ -255,6 +266,21 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn explicit_remaining_budget_is_not_replaced_by_cpu_fallback() {
+        let allocator = allocator();
+        let bytes = allocator.spec.bytes_per_page(16, 4).unwrap();
+        let pool = allocator
+            .allocate_with_budget(Kind::Float, Device::Cpu, 1, bytes * 4)
+            .unwrap();
+        assert_eq!(pool.layout.num_pages, 3); // 第四页为 sink，不能重用 512 MiB fallback。
+        assert!(
+            allocator
+                .allocate_with_budget(Kind::Float, Device::Cpu, 1, bytes)
+                .is_err()
+        );
     }
 
     #[test]

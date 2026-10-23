@@ -58,15 +58,21 @@ pub fn build_components(args: &ServeArgs) -> Result<ServeComponents, ServeError>
     let template = registration
         .template_renderer
         .map(ChatTemplateKind::Custom)
-        .unwrap_or(ChatTemplateKind::Auto);
+        .unwrap_or(ChatTemplateKind::Generic);
     let tokenizer = TokenizerWorker::new_with_chat_template_kind(
         &args.engine.model_path,
         args.engine.trust_remote_code,
         template,
     )
     .map_err(ServeError::Tokenizer)?;
+    let engine_args = args.engine.clone();
+    if registration.recurrent_state {
+        tracing::info!(
+            "混合模型使用独立循环状态、eager 执行及联合前缀检查点缓存，支持 CPU/GPU overlap"
+        );
+    }
     let engine = Engine::load_for_serving(
-        args.engine.clone(),
+        engine_args,
         definition.runtime,
         0,
         definition.factory.as_ref(),
@@ -86,6 +92,7 @@ fn read_model_config(path: &Path) -> Result<serde_json::Value, ServeError> {
 }
 
 fn checkpoint_kind(raw: &serde_json::Value) -> Result<tch::Kind, String> {
+    let raw = raw.get("text_config").unwrap_or(raw);
     match raw
         .get("torch_dtype")
         .filter(|value| !value.is_null())

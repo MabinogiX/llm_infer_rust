@@ -128,9 +128,9 @@ impl Attention {
                     "FlashInfer requires CUDA and bfloat16 or float16",
                 ));
             }
-            if spec.head_dim != 128 {
+            if !matches!(spec.head_dim, 128 | 256) {
                 return Err(model_error(
-                    "native FlashInfer decode currently requires head_dim=128",
+                    "native FlashInfer decode currently requires head_dim=128 or 256",
                 ));
             }
         }
@@ -507,6 +507,7 @@ impl DecodeGraphState for FlashInferGraphState {
             }
         });
         let metadata = AttentionMetadata {
+            state_slots: None,
             forward_mode: BatchPhase::Decode,
             decode_host: host,
             write_loc: None,
@@ -699,6 +700,7 @@ fn prepare_flashinfer_prefill(
             prefixes_host: *mut i32,
             q_heads: i64,
             kv_heads: i64,
+            head_dim: i64,
             page_size: i64,
             dtype: i64,
         ) -> *mut c_void;
@@ -734,6 +736,7 @@ fn prepare_flashinfer_prefill(
             prefixes_host.as_mut_ptr(),
             spec.num_heads,
             spec.num_kv_heads,
+            spec.head_dim,
             page_size,
             if spec.kind == Kind::BFloat16 { 0 } else { 1 },
         )
@@ -1560,6 +1563,7 @@ mod tests {
         for backend in ["pt", "fa"] {
             for prefixes in [[0i32, 0], [1, 0]] {
                 let metadata = AttentionMetadata {
+                    state_slots: None,
                     forward_mode: BatchPhase::Prefill,
                     decode_host: None,
                     cu_seqlens_q: Some(Tensor::from_slice(&[0i32, 2, 3])),
@@ -1703,7 +1707,7 @@ mod tests {
         assert!(!q.is_contiguous());
         let mut previous_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut warmed_allocations = 0;
-        for (rows, len) in [
+        for (iteration, (rows, len)) in [
             (2i64, 256i32),
             (1, 1),
             (2, 16),
@@ -1711,10 +1715,19 @@ mod tests {
             (2, 128),
             (2, 255),
             (2, 256),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let metadata = AttentionMetadata {
+                state_slots: None,
                 forward_mode: BatchPhase::Decode,
-                decode_host: None,
+                // Exercise eager host planning, resized rows, and transitions
+                // to/from the compatibility path without a CPU shadow.
+                decode_host: (iteration != 2).then(|| crate::engine::DecodeHostMetadata {
+                    cache_seqlens: vec![len, len - len / 2][..rows as usize].to_vec(),
+                    block_table_versions: None,
+                }),
                 write_loc: None,
                 cu_seqlens_q: None,
                 prefix_lens: None,
@@ -1786,6 +1799,7 @@ mod tests {
                 let table = Tensor::arange(64, (Kind::Int, device)).view([2, 32]);
                 let tokens = Tensor::arange(1024, (Kind::Int, device)).view([2, 512]);
                 let metadata = AttentionMetadata {
+                    state_slots: None,
                     forward_mode: BatchPhase::Prefill,
                     decode_host: None,
                     write_loc: None,
@@ -1871,6 +1885,7 @@ mod tests {
             )
             .unwrap();
         let metadata = AttentionMetadata {
+            state_slots: None,
             forward_mode: BatchPhase::Decode,
             decode_host: None,
             write_loc: None,
@@ -1977,6 +1992,7 @@ mod tests {
         let q = Tensor::from_slice(&[1f32, 0., 0., 1., 1., 1., 2., 1., 1., 2.]).view([5, 1, 2]);
         let table = Tensor::from_slice(&[0i32, 1, 2, -1, 3, -1, -1, -1, 4, 5, 6, 7]).view([3, 4]);
         let metadata = AttentionMetadata {
+            state_slots: None,
             forward_mode: BatchPhase::Prefill,
             decode_host: None,
             write_loc: None,
@@ -2022,5 +2038,88 @@ mod tests {
             difference < 1e-5,
             "batched cached prefill difference: {difference}"
         );
+    }
+}
+
+#[cfg(all(test, has_flashinfer))]
+mod qwen38_cuda_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires CUDA; run scripts/run-rust-tests.sh cuda"]
+    fn flashinfer_256_dim_gqa6_prefill_cached_extend_and_decode_match_sdpa() {
+        let device = Device::Cuda(0);
+        for kind in [Kind::BFloat16, Kind::Half] {
+            let spec = AttentionSpec {
+                num_heads: 24,
+                num_kv_heads: 4,
+                head_dim: 256,
+                kind,
+                device,
+            };
+            let mut native = Attention::new("flashinfer", spec).unwrap();
+            native.bind_cache_layout(16);
+            let mut reference = Attention::new("fa", spec).unwrap();
+            reference.bind_cache_layout(16);
+            let mut cache = BaseAttention::default();
+            cache
+                .bind_kv_cache(
+                    Tensor::randn([8, 16, 4, 256], (kind, device)),
+                    Tensor::randn([8, 16, 4, 256], (kind, device)),
+                )
+                .unwrap();
+            for (prefix, n, decode) in [(0i32, 5i32, false), (3, 5, false), (7, 1, true)] {
+                let q = Tensor::randn([n as i64, 24, 256], (kind, device));
+                let k = Tensor::randn([n as i64, 4, 256], (kind, device));
+                let v = Tensor::randn_like(&k);
+                let metadata = AttentionMetadata {
+                    state_slots: None,
+                    forward_mode: if decode {
+                        BatchPhase::Decode
+                    } else {
+                        BatchPhase::Prefill
+                    },
+                    decode_host: None,
+                    write_loc: Some(Tensor::arange_start(
+                        (16 + prefix) as i64,
+                        (16 + prefix + n) as i64,
+                        (Kind::Int, device),
+                    )),
+                    cu_seqlens_q: (!decode).then(|| Tensor::from_slice(&[0, n]).to_device(device)),
+                    prefix_lens: (!decode).then(|| Tensor::from_slice(&[prefix]).to_device(device)),
+                    block_table: Some(
+                        Tensor::from_slice(&[1i32, 2])
+                            .view([1, 2])
+                            .to_device(device),
+                    ),
+                    req_to_token: Some(
+                        Tensor::arange_start(16, 48, (Kind::Int, device)).view([1, 32]),
+                    ),
+                    cache_seqlens: decode
+                        .then(|| Tensor::from_slice(&[prefix + n]).to_device(device)),
+                    max_seqlen: Some((prefix + n) as usize),
+                };
+                cache
+                    .write_kv(&k, &v, metadata.write_loc.as_ref(), metadata.forward_mode)
+                    .unwrap();
+                let actual = native
+                    .prepare(Some(&metadata), n as usize)
+                    .unwrap()
+                    .forward(&q, &k, &v, &cache)
+                    .unwrap();
+                let expected = reference
+                    .prepare(Some(&metadata), n as usize)
+                    .unwrap()
+                    .forward(&q, &k, &v, &cache)
+                    .unwrap();
+                let error = (actual.to_kind(Kind::Float) - expected.to_kind(Kind::Float))
+                    .abs()
+                    .max()
+                    .double_value(&[]);
+                assert!(
+                    error <= 0.03125,
+                    "prefix={prefix}, decode={decode}, error={error}"
+                );
+            }
+        }
     }
 }

@@ -129,6 +129,7 @@ impl DecodeGraphRunner {
         let positions = Tensor::zeros([rows, 1], (Kind::Int64, device));
         let requirements = runner.metadata_requirements(BatchPhase::Decode);
         let mut metadata = AttentionMetadata {
+            state_slots: None,
             forward_mode: BatchPhase::Decode,
             decode_host: None,
             write_loc: Some(self.pad_locations.narrow(0, 0, rows).copy()),
@@ -840,6 +841,7 @@ mod tests {
                     .view([rows, 1])
                     - 1,
                 Some(AttentionMetadata {
+                    state_slots: None,
                     forward_mode: BatchPhase::Decode,
                     write_loc: Some(Tensor::from_slice(&locations).to_device(device)),
                     cache_seqlens: Some(Tensor::from_slice(&lengths).to_device(device)),

@@ -1,6 +1,6 @@
 # mini-sglang Rust 服务
 
-Rust 版本的 mini-sglang 推理服务。目前支持本地 dense Qwen3 模型、CPU/CUDA float32 eager 执行，以及 OpenAI 风格的文本与聊天生成接口。
+Rust 版本的 mini-sglang 推理服务。支持本地 dense Qwen3，以及采用 Qwen3.5 混合架构的 Qwen3.8-27B 文本推理；提供 CPU/CUDA 执行和 OpenAI 风格的文本与聊天接口。Qwen3.8 的启动、缓存策略和验证方式见 [模型支持说明](docs/qwen3_8-support.md)。
 
 后续 dense、MoE 及不同状态缓存模型的接入计划见 [多模型架构优化与分阶段实施方案](docs/multi-model-architecture-roadmap-2026-10-08.md)。
 
@@ -221,7 +221,7 @@ Qwen3 聊天模板支持请求中的 `tools` 完整 JSON 定义、消息的 `too
 
 聊天响应会把模型生成的 `<think>...</think>` 解析为 `reasoning_content`，把完整且合法的 `<tool_call>...</tool_call>` JSON 解析为 `tool_calls`。纯工具调用的 `content` 为 `null`；正常停止且包含工具调用时，`finish_reason` 为 `tool_calls`。SSE 将思考、正文和完整工具调用分别放在 `delta` 中，工具调用的 `function.arguments` 是 JSON 字符串。未闭合或无效的工具调用标签保留为正文。`/v1/completions` 继续返回原始生成文本。
 
-`src/server/output/` 定义通用的 `ChatOutputParser` 接口；Qwen3 实现位于 `src/models/qwen3/output.rs`，保存单个请求的解析状态。服务启动时在 `build_components` 中选择一次解析器构造函数；每个请求调用这个固定函数创建独立状态，因此并发流不会混用尚未闭合的标签。新增模型时，在其模型目录中实现解析器并接入组件组装，API 和 SSE 路径无需改动。
+`src/server/output/` 定义通用的 `ChatOutputParser` 接口；Qwen3 实现位于 `src/models/qwen3_full_attention/output.rs`，保存单个请求的解析状态。服务启动时在 `build_components` 中选择一次解析器构造函数；每个请求调用这个固定函数创建独立状态，因此并发流不会混用尚未闭合的标签。新增模型时，在其模型目录中实现解析器并接入组件组装，API 和 SSE 路径无需改动。
 
 ```rust
 use sglang_rust::tokenizer::{ChatMessage, TokenizerWorker};

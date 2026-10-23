@@ -850,6 +850,7 @@ mod tests {
                 cached_len: 0,
                 output_len: 1,
                 cache_handle: Some(BaseCacheHandle {
+                    state_slot: None,
                     page_ids: vec![0, 1],
                     ..Default::default()
                 }),

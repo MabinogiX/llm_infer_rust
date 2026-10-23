@@ -137,6 +137,12 @@ impl<'a> ForwardBatch<'a> {
                 rows
             }
         };
+        if let Some(slots) = &meta.state_slots {
+            let unique: std::collections::HashSet<_> = slots.iter().copied().collect();
+            if slots.len() != rows || unique.len() != rows {
+                return Err(invalid("循环状态槽必须与请求一一对应且互不重复"));
+            }
+        }
         if meta.block_table.is_none() && meta.req_to_token.is_none() {
             return Err(invalid("cached forward requires a page or token table"));
         }
@@ -205,6 +211,7 @@ mod tests {
             Tensor::ones([2, 1], (Kind::Int64, Device::Cpu)),
             Tensor::zeros([2, 1], (Kind::Int64, Device::Cpu)),
             Some(AttentionMetadata {
+                state_slots: None,
                 forward_mode: BatchPhase::Decode,
                 decode_host: None,
                 write_loc: Some(Tensor::from_slice(&[2i32, 4])),
@@ -293,6 +300,7 @@ mod tests {
             Tensor::ones([3], (Kind::Int64, Device::Cpu)),
             Tensor::zeros([3], (Kind::Int64, Device::Cpu)),
             Some(AttentionMetadata {
+                state_slots: None,
                 forward_mode: BatchPhase::Prefill,
                 decode_host: None,
                 write_loc: Some(Tensor::from_slice(&[2i32, 3, 4])),
@@ -317,5 +325,46 @@ mod tests {
                 .validate(Device::Cpu)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod recurrent_slot_tests {
+    use super::*;
+    use crate::engine::kvcache::{RecurrentStatePool, RequestState};
+    #[test]
+    fn duplicate_or_wrong_count_state_slots_fail_before_forward() {
+        let mut pool = RecurrentStatePool::new(2, 0, || RequestState {
+            position: 0,
+            layers: Vec::new(),
+        });
+        let a = pool.alloc_request().unwrap();
+        let b = pool.alloc_request().unwrap();
+        let make = |slots| crate::engine::AttentionMetadata {
+            state_slots: Some(slots),
+            forward_mode: BatchPhase::Decode,
+            decode_host: None,
+            write_loc: Some(Tensor::from_slice(&[2i32, 4])),
+            cu_seqlens_q: None,
+            prefix_lens: None,
+            block_table: Some(Tensor::ones([2, 1], (Kind::Int, Device::Cpu))),
+            req_to_token: None,
+            cache_seqlens: Some(Tensor::from_slice(&[1i32, 1])),
+            max_seqlen: Some(1),
+        };
+        for (slots, valid) in [(vec![a, b], true), (vec![a, a], false), (vec![a], false)] {
+            let batch = Batch::decode(
+                Tensor::from_slice(&[1i64, 2]),
+                Tensor::from_slice(&[0i64, 0]),
+                Some(make(slots)),
+            );
+            assert_eq!(
+                ForwardBatch::from_scheduler(&batch)
+                    .unwrap()
+                    .validate(Device::Cpu)
+                    .is_ok(),
+                valid
+            );
+        }
     }
 }

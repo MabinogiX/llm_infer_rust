@@ -321,9 +321,18 @@ impl PrefillManager {
                 }
             })
             .collect::<Vec<_>>();
-        let model_batch = self
+        let mut model_batch = self
             .batch_context
             .prepare_mixed_prefill_borrowed(&batch_requests, &[])?;
+        model_batch.attention_metadata.as_mut().unwrap().state_slots = selection
+            .request_ids
+            .iter()
+            .map(|uid| {
+                requests
+                    .running_request(*uid)
+                    .and_then(|r| r.cache_handle.as_ref()?.state_slot)
+            })
+            .collect();
         for uid in selection.request_ids.iter().copied() {
             let request = requests
                 .running_request(uid)

@@ -45,6 +45,8 @@ impl Default for MetadataRequirements {
 /// page-table fields to perform eager paged-KV reads and writes.
 #[derive(Debug)]
 pub struct AttentionMetadata {
+    /// 请求独占的循环状态槽；与 KV 页表独立。
+    pub state_slots: Option<Vec<super::kvcache::StateSlotId>>,
     pub forward_mode: BatchPhase,
     /// Scheduler-owned immutable host snapshot. Lengths agree with cache_seqlens.
     /// Omit for callers without a host shadow; backends retain their fallback.
@@ -123,6 +125,17 @@ pub trait DecodeGraphState {
 
 /// Model execution and cache-binding interface implemented by each architecture.
 pub trait ModelExecutor {
+    fn recurrent_state_pool(&self) -> Option<super::kvcache::SharedRecurrentPool> {
+        None
+    }
+    /// 单个完整循环状态的物理字节数；纯全注意力模型返回 None。
+    fn recurrent_state_bytes(&self) -> Result<Option<usize>> {
+        Ok(None)
+    }
+    /// 分配按共同预算规划的 current、历史状态及检查点槽。
+    fn reserve_request_states(&mut self, _capacity: usize, _checkpoints: usize) -> Result<()> {
+        Ok(())
+    }
     fn metadata_requirements(&self, _phase: BatchPhase) -> MetadataRequirements {
         MetadataRequirements::default()
     }
@@ -418,6 +431,20 @@ impl ModelRunner {
             }
         }
         no_grad(|| self.model.forward(&forward)).map(|output| (output, None))
+    }
+
+    pub(crate) fn recurrent_state_pool(&self) -> Option<super::kvcache::SharedRecurrentPool> {
+        self.model.recurrent_state_pool()
+    }
+    pub(crate) fn recurrent_state_bytes(&self) -> Result<Option<usize>> {
+        self.model.recurrent_state_bytes()
+    }
+    pub(crate) fn reserve_request_states(
+        &mut self,
+        capacity: usize,
+        checkpoints: usize,
+    ) -> Result<()> {
+        self.model.reserve_request_states(capacity, checkpoints)
     }
 
     pub fn clear_graphs(&mut self) {

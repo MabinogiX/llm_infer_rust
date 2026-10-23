@@ -217,6 +217,7 @@ fn compare_cached_and_full_forward(device: Device) {
         ids.narrow(0, 0, 2),
         positions.narrow(0, 0, 2),
         Some(AttentionMetadata {
+            state_slots: None,
             forward_mode: BatchPhase::Prefill,
             decode_host: None,
             write_loc: Some(table.get(0).narrow(0, 0, 2)),
@@ -233,6 +234,7 @@ fn compare_cached_and_full_forward(device: Device) {
     assert!((first - full.narrow(0, 1, 1)).abs().max().double_value(&[]) < 1e-5);
     for (phase, index) in [(BatchPhase::Decode, 2i64), (BatchPhase::Prefill, 3i64)] {
         let metadata = AttentionMetadata {
+            state_slots: None,
             forward_mode: phase,
             decode_host: None,
             write_loc: Some(table.get(0).narrow(0, index, 1)),

@@ -15,7 +15,7 @@ use tch::{Cuda, Device, Kind, Tensor};
 
 use super::kvcache::{
     KVCacheAllocationConfig, KVCacheAllocator, KVCacheError, KVCacheModelConfig, KVCachePool,
-    KVCacheServerConfig, ModelCacheSpec,
+    KVCacheServerConfig, ModelCacheSpec, RecurrentCacheOptions, RecurrentCachePlan,
 };
 use super::sampling::{Sampler, SamplingError, SamplingParams};
 use super::{Batch, ModelFactory, ModelRunner, ModelRunnerError, load_hf_safetensors};
@@ -28,9 +28,15 @@ use super::{Batch, ModelFactory, ModelRunner, ModelRunnerError, load_hf_safetens
 pub struct ServerArgs {
     pub model_path: PathBuf,
     pub tp_size: usize,
-    /// Fraction of total GPU memory budgeted for weights and KV cache together.
+    /// Fraction of total GPU memory budgeted for weights and cache pools together.
     /// The remaining memory accommodates graphs, activations and workspaces.
     pub memory_ratio: f64,
+    /// 线性状态池与全注意力 KV 的预算比例。
+    pub mamba_full_memory_ratio: f64,
+    /// 总线性状态槽上限，包括 current、待发布历史和 radix 状态。
+    pub max_mamba_cache_size: Option<usize>,
+    /// 历史 checkpoint 数量上限；None 自动，0 关闭。
+    pub recurrent_checkpoint_slots: Option<usize>,
     /// Optional usable KV token capacity cap, rounded down to whole pages.
     pub max_total_tokens: Option<usize>,
     pub max_running_req: usize,
@@ -66,6 +72,9 @@ impl ServerArgs {
             model_path: model_path.into(),
             tp_size: 1,
             memory_ratio: 0.9,
+            mamba_full_memory_ratio: 0.9,
+            max_mamba_cache_size: None,
+            recurrent_checkpoint_slots: None,
             max_total_tokens: None,
             max_running_req: 256,
             max_prefill_tokens_per_batch: 8192,
@@ -83,6 +92,31 @@ impl ServerArgs {
             attention_backend: "fa".to_owned(),
             trust_remote_code: false,
         }
+    }
+    pub fn recurrent_cache_options(&self) -> Result<RecurrentCacheOptions> {
+        let max_checkpoints = match self.recurrent_checkpoint_slots {
+            Some(cap) => Some(cap),
+            None => match std::env::var("SGLANG_RECURRENT_CHECKPOINT_SLOTS") {
+                Ok(text) => Some(text.parse().map_err(|_| {
+                    EngineError::InvalidArgument(
+                        "SGLANG_RECURRENT_CHECKPOINT_SLOTS 必须为非负整数".into(),
+                    )
+                })?),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(_) => {
+                    return Err(EngineError::InvalidArgument(
+                        "SGLANG_RECURRENT_CHECKPOINT_SLOTS 不是有效文本".into(),
+                    ));
+                }
+            },
+        };
+        let options = RecurrentCacheOptions {
+            memory_ratio: self.mamba_full_memory_ratio,
+            max_slots: self.max_mamba_cache_size,
+            max_checkpoints,
+        };
+        options.validate()?;
+        Ok(options)
     }
 }
 
@@ -237,10 +271,56 @@ impl Engine {
             EngineError::InvalidArgument(format!("Hugging Face 权重加载失败: {error}"))
         })?;
         runner.load_weights(weights)?;
-
         let spec = factory.cache_spec(runtime_config)?;
-        let mut engine =
-            Self::with_cache_spec(server_args, runtime_config, tp_rank, kind, device, spec)?;
+        let mut kv_budget = None;
+        if let Some(bytes_per_state) = runner.recurrent_state_bytes()? {
+            let allocator = KVCacheAllocator::with_spec(
+                allocation_config(&server_args, runtime_config),
+                spec.clone(),
+            )?;
+            let budget = allocator.available_memory(device)?;
+            let min_kv = spec
+                .per_rank(server_args.tp_size)?
+                .bytes_per_page(server_args.page_size, kind.elt_size_in_bytes())?
+                .checked_mul(2)
+                .ok_or_else(|| EngineError::InvalidArgument("KV 最低预算溢出".into()))?;
+            let plan = RecurrentCachePlan::new(
+                budget,
+                bytes_per_state,
+                server_args.max_running_req,
+                min_kv,
+                server_args.recurrent_cache_options()?,
+                device == Device::Cpu,
+            )?;
+            runner.reserve_request_states(server_args.max_running_req, plan.checkpoint_slots)?;
+            // CUDA allocator 可能按更大块预留，实测余额只能进一步收紧计划，不能重复花预算。
+            let actual_kv_budget = if matches!(device, Device::Cuda(_)) {
+                plan.kv_budget_bytes
+                    .min(allocator.available_memory(device)?)
+            } else {
+                plan.kv_budget_bytes
+            };
+            tracing::info!(
+                cache_budget_bytes = budget,
+                bytes_per_state,
+                mamba_full_memory_ratio = server_args.mamba_full_memory_ratio,
+                state_slots = plan.state_slots,
+                checkpoint_slots = plan.checkpoint_slots,
+                state_bytes = plan.state_bytes,
+                kv_budget_bytes = actual_kv_budget,
+                "按共同显存预算规划线性状态与 KV"
+            );
+            kv_budget = Some(actual_kv_budget);
+        }
+        let mut engine = Self::with_cache_spec_budget(
+            server_args,
+            runtime_config,
+            tp_rank,
+            kind,
+            device,
+            spec,
+            kv_budget,
+        )?;
         engine.attach_model_runner(runner)?;
         engine.capture_graphs()?;
         tracing::info!(?device, ?kind, "model loaded for inference");
@@ -254,6 +334,7 @@ impl Engine {
         tp_rank: usize,
         factory: &dyn ModelFactory,
     ) -> Result<(Kind, Device)> {
+        server_args.recurrent_cache_options()?;
         validate_model_path(&server_args.model_path)?;
         validate_parallelism(server_args.tp_size, tp_rank)?;
         if server_args.tp_size > 1 {
@@ -288,13 +369,34 @@ impl Engine {
     }
 
     pub fn with_cache_spec(
-        mut server_args: ServerArgs,
+        server_args: ServerArgs,
         runtime_config: RuntimeModelConfig,
         tp_rank: usize,
         kind: Kind,
         device: Device,
         spec: ModelCacheSpec,
     ) -> Result<Self> {
+        Self::with_cache_spec_budget(
+            server_args,
+            runtime_config,
+            tp_rank,
+            kind,
+            device,
+            spec,
+            None,
+        )
+    }
+
+    fn with_cache_spec_budget(
+        mut server_args: ServerArgs,
+        runtime_config: RuntimeModelConfig,
+        tp_rank: usize,
+        kind: Kind,
+        device: Device,
+        spec: ModelCacheSpec,
+        budget: Option<usize>,
+    ) -> Result<Self> {
+        server_args.recurrent_cache_options()?;
         resolve_chunked_prefill_size(&mut server_args, device);
         validate_model_path(&server_args.model_path)?;
         validate_parallelism(server_args.tp_size, tp_rank)?;
@@ -304,7 +406,12 @@ impl Engine {
         validate_max_seq_len(&server_args, runtime_config)?;
         let allocator =
             KVCacheAllocator::with_spec(allocation_config(&server_args, runtime_config), spec)?;
-        let kv_cache_pool = allocator.allocate(kind, device, server_args.tp_size)?;
+        let kv_cache_pool = match budget {
+            Some(bytes) => {
+                allocator.allocate_with_budget(kind, device, server_args.tp_size, bytes)?
+            }
+            None => allocator.allocate(kind, device, server_args.tp_size)?,
+        };
 
         Ok(Self {
             server_args,
@@ -375,6 +482,12 @@ impl Engine {
         model_runner.set_kv_reserved_slot(0);
         self.model_runner = Some(model_runner);
         Ok(())
+    }
+
+    pub(crate) fn recurrent_state_pool(&self) -> Option<super::kvcache::SharedRecurrentPool> {
+        self.model_runner
+            .as_ref()
+            .and_then(ModelRunner::recurrent_state_pool)
     }
 
     pub fn model_runner(&self) -> Result<&ModelRunner> {
@@ -722,7 +835,7 @@ mod tests {
 
     #[test]
     fn rejects_factory_runtime_mismatches_before_loading_or_binding() {
-        use crate::models::{Qwen3Factory, qwen3::Qwen3Config};
+        use crate::models::{Qwen3Factory, qwen3_full_attention::Qwen3Config};
 
         let path = model_dir();
         let factory = Qwen3Factory {

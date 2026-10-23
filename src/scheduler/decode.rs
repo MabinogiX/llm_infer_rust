@@ -206,6 +206,10 @@ impl DecodeManager {
         } else {
             None
         };
+        let state_slots = active
+            .iter()
+            .map(|r| r.cache_handle.as_ref().and_then(|h| h.state_slot))
+            .collect();
         let rows = active.len();
         let mut request_ids = Vec::with_capacity(rows);
         let mut input_ids = Vec::with_capacity(rows);
@@ -390,6 +394,7 @@ impl DecodeManager {
             self.input_ids_buf.narrow(0, 0, rows_i64),
             self.positions_buf.narrow(0, 0, rows_i64),
             Some(AttentionMetadata {
+                state_slots,
                 forward_mode: BatchPhase::Decode,
                 write_loc: Some(self.write_loc_buf.narrow(0, 0, rows_i64)),
                 cu_seqlens_q: None,
@@ -473,6 +478,7 @@ mod tests {
             cached_len: 0,
             output_len: 1,
             cache_handle: Some(BaseCacheHandle {
+                state_slot: None,
                 page_ids: pages,
                 ..Default::default()
             }),

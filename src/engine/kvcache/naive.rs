@@ -6,14 +6,24 @@ use super::{AcquireOutcome, BaseCacheHandle, CacheManager, KVCacheError, KVCache
 
 pub struct NaiveCacheManager {
     pool: Rc<RefCell<KVCachePool>>,
+    state_pool: Option<super::SharedRecurrentPool>,
 }
 
 impl NaiveCacheManager {
     pub fn new(pool: Rc<RefCell<KVCachePool>>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            state_pool: None,
+        }
     }
 }
 
+impl NaiveCacheManager {
+    pub fn with_recurrent_state(mut self, pool: Option<super::SharedRecurrentPool>) -> Self {
+        self.state_pool = pool;
+        self
+    }
+}
 impl CacheManager for NaiveCacheManager {
     fn acquire(
         &mut self,
@@ -37,7 +47,16 @@ impl CacheManager for NaiveCacheManager {
         if pages > self.pool.borrow().free_count() {
             return Ok(AcquireOutcome::DeferredMemory);
         }
-        Ok(AcquireOutcome::Ready(self.pool.borrow_mut().alloc(pages)?))
+        let mut handle = self.pool.borrow_mut().alloc(pages)?;
+        if let Some(pool) = &self.state_pool {
+            let slot = pool.borrow_mut().alloc_request();
+            let Some(slot) = slot else {
+                self.pool.borrow_mut().free(&mut handle);
+                return Ok(AcquireOutcome::DeferredMemory);
+            };
+            handle.state_slot = Some(slot);
+        }
+        Ok(AcquireOutcome::Ready(handle))
     }
 
     fn publish(&mut self, handle: &mut BaseCacheHandle, written_ids: &[i64]) -> Result<()> {
@@ -53,6 +72,14 @@ impl CacheManager for NaiveCacheManager {
     }
 
     fn release(&mut self, handle: &mut BaseCacheHandle) {
+        if let Some(slot) = handle.state_slot.take() {
+            self.state_pool
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .free_request(slot)
+                .expect("请求状态槽所有权错误");
+        }
         self.pool.borrow_mut().free(handle);
     }
 }

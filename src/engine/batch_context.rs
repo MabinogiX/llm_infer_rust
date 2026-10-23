@@ -257,6 +257,7 @@ impl BatchContext {
             Tensor::from_slice(&input_ids).to_device(self.device),
             Tensor::from_slice(&positions).to_device(self.device),
             Some(AttentionMetadata {
+                state_slots: None,
                 forward_mode: BatchPhase::Prefill,
                 decode_host: None,
                 write_loc: Some(Tensor::from_slice(&write_loc).to_device(self.device)),

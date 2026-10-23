@@ -12,6 +12,7 @@ pub(crate) enum PageOwner {
 /// A request's unique KV page table and its exact page ownership.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BaseCacheHandle {
+    pub state_slot: Option<super::StateSlotId>,
     pub page_ids: Vec<usize>,
     pub cached_len: usize,
     pub(crate) owners: Vec<PageOwner>,
@@ -281,6 +282,7 @@ impl KVCachePool {
             .map(|_| self.free_pages.pop().expect("checked free page count"))
             .collect();
         Ok(BaseCacheHandle {
+            state_slot: None,
             page_ids,
             owners: vec![PageOwner::Private; num_pages],
             ..Default::default()

@@ -30,8 +30,8 @@ Attention 输出复制到下一段的固定缓冲区，残差缓冲区也独立�
 
 接口和代码主要位于：
 
-- `src/models/qwen3/prefill_graph.rs`：桶选择、启动捕获、分段回放、GPU 回归测试。
-- `src/models/qwen3/model.rs`：共享层算子和 prefill graph 分流。
+- `src/models/qwen3_full_attention/prefill_graph.rs`：桶选择、启动捕获、分段回放、GPU 回归测试。
+- `src/models/qwen3_full_attention/model.rs`：共享层算子和 prefill graph 分流。
 - `src/engine/graph.rs`：通用原生分段捕获封装，既有 decode graph 保留。
 - `src/engine/model_runner.rs`：`configure_prefill_graph`、`capture_prefill_graphs`、配置和清理生命周期。
 - `src/engine/engine.rs`、`src/server/cli.rs`、`src/main.rs`：参数、解析和启动日志。

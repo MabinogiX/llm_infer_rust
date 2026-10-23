@@ -34,12 +34,20 @@ pub(super) fn load_eos_token_ids(
     } else {
         (
             &model_path,
-            model_config.get("eos_token_id").ok_or_else(|| {
-                invalid(
-                    &model_path,
-                    "missing eos_token_id; use explicit null or [] for a model without EOS".into(),
-                )
-            })?,
+            model_config
+                .get("eos_token_id")
+                .or_else(|| {
+                    model_config
+                        .get("text_config")
+                        .and_then(|text| text.get("eos_token_id"))
+                })
+                .ok_or_else(|| {
+                    invalid(
+                        &model_path,
+                        "missing eos_token_id; use explicit null or [] for a model without EOS"
+                            .into(),
+                    )
+                })?,
         )
     };
     let mut ids = BTreeSet::new();
